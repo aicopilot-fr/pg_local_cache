@@ -1,0 +1,12 @@
+*.bc
+*.o
+*.so
+compile_commands.json
+core
+log/
+output_iso/
+regression.diffs
+regression.out
+results/
+tmp_check/
+tmp_check_iso/
