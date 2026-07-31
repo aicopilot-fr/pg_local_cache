@@ -1,9 +1,26 @@
 #ifndef PG_LOCAL_CACHE_RESP_H
 #define PG_LOCAL_CACHE_RESP_H
 
+#include "resp_limits.h"
+
+#ifdef PGLC_RESP_STANDALONE
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/*
+ * Keep the wire codec independently testable without linking a PostgreSQL
+ * backend.  The production build takes these definitions from postgres.h and
+ * pg_local_cache.h instead.
+ */
+typedef size_t Size;
+typedef int64_t int64;
+typedef uint64_t uint64;
+#else
 #include "postgres.h"
 
 #include "pg_local_cache.h"
+#endif
 
 typedef struct PgLocalCacheRespArg
 {
@@ -27,4 +44,3 @@ extern char *pglc_resp_bulk(const char *value, Size value_len, Size *length);
 extern char *pglc_resp_null(Size *length);
 
 #endif
-

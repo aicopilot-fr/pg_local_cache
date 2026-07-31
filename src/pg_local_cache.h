@@ -9,15 +9,15 @@
 #include "storage/lwlock.h"
 #include "utils/hsearch.h"
 
+#include "resp_limits.h"
+
 #define PGLC_NAMESPACE_MAX 64
 #define PGLC_KEY_MAX 256
 #define PGLC_VALUE_MAX 8192
 #define PGLC_MAX_MAPPINGS 128
 #define PGLC_RELATION_STATES_MAX 1024
 #define PGLC_MAX_CLIENTS_PER_WORKER 128
-#define PGLC_REQUEST_MAX 65536
 #define PGLC_RESPONSE_MAX (PGLC_VALUE_MAX + 1024)
-#define PGLC_RESP_MAX_ARGS 16
 #define PGLC_AUTH_TOKEN_MAX 1024
 #define PGLC_MAX_AUTH_FAILURES 5
 #define PGLC_EVICTION_SAMPLE 64

@@ -1,9 +1,44 @@
+#ifdef PGLC_RESP_STANDALONE
+#include <ctype.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+#define PG_INT64_MAX INT64_MAX
+#define INT64_FORMAT "%" PRId64
+#define pg_strncasecmp strncasecmp
+
+static void *
+palloc(size_t size)
+{
+	void	   *result = malloc(size);
+
+	if (result == NULL)
+		abort();
+	return result;
+}
+
+static char *
+pstrdup(const char *value)
+{
+	size_t		length = strlen(value) + 1;
+	char	   *result = palloc(length);
+
+	memcpy(result, value, length);
+	return result;
+}
+#else
 #include "postgres.h"
 
 #include <ctype.h>
 #include <limits.h>
 
 #include "utils/builtins.h"
+#endif
 
 #include "resp.h"
 
@@ -221,4 +256,3 @@ pglc_resp_null(Size *length)
 	*length = 5;
 	return response;
 }
-

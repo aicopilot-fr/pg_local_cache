@@ -14,6 +14,57 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  source-unit:
+    name: source-unit (ASan + UBSan)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Test the production RESP codec source
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: make -C tests/unit clean check sanitize
+
+      - name: Test the benchmark source
+        run: make benchmark-test
+
+  comparative-docker-smoke:
+    name: comparative-docker-smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Exercise Compose, identical RESP client, and pgbench
+        env:
+          PGLC_BENCH_DURATION: "1"
+          PGLC_BENCH_WARMUP_SECONDS: "0"
+          PGLC_BENCH_REPETITIONS: "1"
+          PGLC_BENCH_CONCURRENCY: "4"
+          PGLC_BENCH_PIPELINE: "8"
+          PGLC_BENCH_KEYS: "128"
+          PGLC_BENCH_CACHE_ENTRIES: "128"
+          PGLC_BENCH_PG_LOCAL_CACHE_WORKERS: "1"
+          PGLC_BENCH_SERVER_CPUS: "2"
+          PGLC_BENCH_CLIENT_CPUS: "2"
+          PGLC_BENCH_SERVER_MEMORY: "1g"
+          PGLC_BENCH_MIN_OPS: "0"
+          PGLC_BENCH_OUTPUT_DIR: ${{ runner.temp }}/comparison-smoke
+        run: bash benchmarks/run.sh
+
+      - name: Upload smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: comparison-smoke
+          path: ${{ runner.temp }}/comparison-smoke/
+          if-no-files-found: warn
+          retention-days: 7
+
   docker-integration:
     name: docker-integration (${{ matrix.profile }})
     runs-on: ubuntu-24.04
@@ -56,7 +107,12 @@ jobs:
           bash -n docker/healthcheck.sh
           bash -n docker/initdb/010_pg_local_cache.sh
           bash -n tests/docker_smoke.sh
-          python3 -m py_compile tests/integration.py tests/load.py
+          bash -n benchmarks/run.sh
+          python3 -m py_compile \
+            benchmarks/compare.py \
+            tests/benchmark_test.py \
+            tests/integration.py \
+            tests/load.py
 
       - name: Build, integrate, and enforce warm-cache throughput
         env:

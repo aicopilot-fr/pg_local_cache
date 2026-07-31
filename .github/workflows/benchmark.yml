@@ -1,0 +1,91 @@
+name: Comparative benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: Measured seconds per target and repetition
+        required: true
+        default: 120
+        type: number
+      warmup:
+        description: Untimed warmup seconds per target and repetition
+        required: true
+        default: 15
+        type: number
+      repetitions:
+        description: Measured repetitions
+        required: true
+        default: 3
+        type: number
+      pipeline:
+        description: GET pipeline depth
+        required: true
+        default: "32"
+        type: choice
+        options: ["32", "1"]
+      workers:
+        description: pg_local_cache worker processes
+        required: true
+        default: "4"
+        type: choice
+        options: ["4", "1"]
+      keys:
+        description: Warm keyspace size
+        required: true
+        default: "16384"
+        type: choice
+        options: ["16384", "1024"]
+  schedule:
+    - cron: "17 3 1 * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pg_local_cache_comparison-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: pg_local_cache vs Valkey vs Redis vs PostgreSQL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate benchmark source
+        run: |
+          bash -n benchmarks/run.sh
+          python3 -m py_compile benchmarks/compare.py tests/benchmark_test.py
+          python3 -m unittest -v tests/benchmark_test.py
+
+      - name: Run identical RESP comparison and PostgreSQL reference
+        env:
+          PGLC_BENCH_DURATION: ${{ inputs.duration || '120' }}
+          PGLC_BENCH_WARMUP_SECONDS: ${{ inputs.warmup || '15' }}
+          PGLC_BENCH_REPETITIONS: ${{ inputs.repetitions || '3' }}
+          PGLC_BENCH_PIPELINE: ${{ inputs.pipeline || '32' }}
+          PGLC_BENCH_PG_LOCAL_CACHE_WORKERS: ${{ inputs.workers || '4' }}
+          PGLC_BENCH_KEYS: ${{ inputs.keys || '16384' }}
+          PGLC_BENCH_OUTPUT_DIR: ${{ github.workspace }}/benchmark-results
+        run: bash benchmarks/run.sh
+
+      - name: Add report to job summary
+        if: always()
+        run: |
+          if [[ -f benchmark-results/comparison.md ]]; then
+            cat benchmark-results/comparison.md >> "$GITHUB_STEP_SUMMARY"
+          elif [[ -f benchmark-results/failure.md ]]; then
+            cat benchmark-results/failure.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload machine-readable and Markdown reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pg_local_cache-comparison
+          path: benchmark-results/
+          if-no-files-found: warn
+          retention-days: 30

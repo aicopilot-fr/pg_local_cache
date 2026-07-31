@@ -263,6 +263,88 @@ make load
 измеряйте отдельно: они включают стоимость PostgreSQL transaction, storage,
 WAL и locks.
 
+## Сравнение с Valkey, Redis и прямым PostgreSQL
+
+В `benchmarks/` есть воспроизводимый comparative suite со следующими
+зафиксированными целями:
+
+- `pg_local_cache` на `postgres:16.14-bookworm`;
+- `valkey/valkey:9.1.1-trixie`;
+- `redis:8.8.1-trixie`;
+- отдельный stock `postgres:16.14-bookworm` без загруженного расширения через
+  `pgbench -M prepared` как SQL reference.
+
+Для всех трёх RESP-сервисов используется один и тот же multiprocess Python
+client, byte-identical `GET`, TCP через одну Docker network, одинаковые ключи,
+value size, число persistent connections и pipeline. Каждый ответ проверяется.
+Данные загружаются и прогреваются до таймера; у Valkey/Redis отключены RDB/AOF,
+а у `pg_local_cache` каждый measured run обязан иметь ноль cache misses и SQL
+reads. Порядок сервисов вращается между повторами. Key count должен делиться
+на число connections, а keys на connection — на pipeline depth: harness
+закрепляет за каждым process непересекающийся stride и тестом доказывает
+полное, равновесное покрытие заявленного working set.
+
+Полный запуск по умолчанию: 16 clients, pipeline 32, 16384 ключа по 128 bytes,
+15 секунд warmup и три measured run по 120 секунд:
+
+```bash
+bash benchmarks/run.sh
+```
+
+Результат сохраняется в `benchmarks/results/comparison.json` и
+`comparison.md`: все отдельные run, median/min/max/CV, p50/p95/p99,
+утилизация CPU client quota, версии, image tag и digest/ID, identity
+benchmark-runner, Git revision и SHA-256 harness. Если client достигает 90%
+своей CPU quota, report явно помечает результат как lower bound, непригодный
+для engine ranking. Короткий smoke, который нельзя публиковать как performance
+result:
+
+```bash
+PGLC_BENCH_DURATION=5 \
+PGLC_BENCH_WARMUP_SECONDS=1 \
+PGLC_BENCH_REPETITIONS=1 \
+PGLC_BENCH_KEYS=1024 \
+bash benchmarks/run.sh
+```
+
+По умолчанию сравнивается deployment profile с четырьмя
+`pg_local_cache` workers. Для one-worker lane и latency без batching:
+
+```bash
+PGLC_BENCH_PG_LOCAL_CACHE_WORKERS=1 \
+PGLC_BENCH_PIPELINE=1 \
+bash benchmarks/run.sh
+```
+
+Stock PostgreSQL не смешивается с RESP-таблицей: `pgbench` использует другой
+client и PostgreSQL extended protocol. Он выполняет тот же lookup по primary
+key в prepared pipeline и показывает value lookups/s. SELECT внутри одного
+pipeline разделяют implicit transaction/snapshot, поэтому этот результат
+амортизирует больше SQL overhead и не считается wire-identical конкурентом.
+RESP latency — время от отправки всего pipeline до завершения каждого ответа,
+включая очередь за более ранними ответами, а не server service time одной
+команды. p50/p95/p99 считаются по детерминированным per-connection reservoirs
+Algorithm R (суммарно до 1000000 samples) из всего measured interval; при
+слиянии sample получает вес по числу завершённых операций connection. Поэтому
+медленные connections не перевешивают быстрые, а хвост прогона не вытесняет
+его начало.
+
+Suite следует официальным рекомендациям не сравнивать разные хранилища
+разными benchmark clients
+([Valkey](https://valkey.io/topics/benchmark/),
+[Redis](https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/benchmarks/))
+и использовать длинные повторные прогоны
+([PostgreSQL pgbench](https://www.postgresql.org/docs/16/pgbench.html)).
+CPU quota не означает CPU affinity, поэтому shared GitHub runner пригоден для
+регрессий и артефактов, но не для маркетингового рейтинга. Для
+publication-quality результата закрепите server/client на разных физических
+CPU, исключите swap и фоновые процессы и повторите suite на целевом железе.
+
+Warm GET также не сравнивает главную семантическую разницу: Valkey/Redis
+хранят управляемую приложением копию, а `pg_local_cache` читает
+PostgreSQL-owned row и автоматически инвалидирует её в транзакции. Отдельно
+нужно измерять cold miss, writes, WAL и invalidation-heavy workloads.
+
 ## Тесты и CI
 
 Полный Docker smoke собирает образ, поднимает чистый volume, проверяет health,
@@ -274,6 +356,22 @@ PG_LOCAL_CACHE_SMOKE_MIN_OPS=10000 \
 bash tests/docker_smoke.sh
 ```
 
+Нативные source-level тесты компилируют реальный `src/resp.c` вне PostgreSQL и
+проверяют parser/encoder, каждый корректный усечённый prefix, malformed input,
+binary/NUL payload, граничные размеры и 30000 deterministic random,
+mutation и truncation cases. Обычный и ASan+UBSan прогоны:
+
+```bash
+make source-test
+make source-sanitize
+make benchmark-test
+```
+
+Это 296215 C assertions в каждом режиме плюс unit tests самого comparative
+harness. Wire limits подключаются из одного общего header, поэтому test и
+production build не могут разойтись по `PGLC_REQUEST_MAX` или числу RESP
+arguments.
+
 Integration suite покрывает AUTH limits, malformed/fragmented/pipelined RESP,
 GET/SET/DEL, positive/negative cache, SQL/DDL/TRUNCATE invalidation, отсутствие
 сброса на unrelated/TEMP DDL, rollback, key move, trigger integrity, typmod,
@@ -281,9 +379,13 @@ deterministic collation, value-type allowlist, remap fence, relation-state GC,
 timeouts, каждый настроенный worker PID, full cache, race fence и 2PC
 rejection.
 
-Workflow `.github/workflows/ci.yml` выполняет два независимых профиля на push,
-PR и ручном запуске: correctness с cache `128`, включённым 2PC и нестандартной
-database/role; throughput с production-профилем cache `65536` и gate 10k.
+Workflow `.github/workflows/ci.yml` выполняет независимые профили на push,
+PR и ручном запуске: source unit/sanitizers, односекундный Docker smoke всего
+comparative stack и `pgbench`, correctness с cache `128`, включённым 2PC и
+нестандартной database/role, а также throughput с production-профилем cache
+`65536` и gate 10k. Отдельный
+`.github/workflows/benchmark.yml` запускается вручную и ежемесячно, не
+сравнивает конкурентов через pass/fail и публикует JSON/Markdown artifact.
 
 ## Наблюдаемость
 
