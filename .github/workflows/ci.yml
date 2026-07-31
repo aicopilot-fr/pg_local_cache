@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pg_local_cache_ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker-integration:
+    name: docker-integration (${{ matrix.profile }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: correctness-small-cache-2pc
+            database: pg_local_cache_ci
+            role: local_cache_ci_worker
+            cache_entries: "128"
+            max_prepared_transactions: "10"
+            require_small_cache: "1"
+            require_2pc: "1"
+            duration: "1"
+            min_ops: "0"
+            concurrency: "4"
+            pipeline: "8"
+            keys: "128"
+          - profile: warm-throughput
+            database: app
+            role: local_cache_worker
+            cache_entries: "65536"
+            max_prepared_transactions: "0"
+            require_small_cache: "0"
+            require_2pc: "0"
+            duration: "5"
+            min_ops: "10000"
+            concurrency: "16"
+            pipeline: "32"
+            keys: "1024"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate scripts
+        run: |
+          bash -n docker/entrypoint.sh
+          bash -n docker/healthcheck.sh
+          bash -n docker/initdb/010_pg_local_cache.sh
+          bash -n tests/docker_smoke.sh
+          python3 -m py_compile tests/integration.py tests/load.py
+
+      - name: Build, integrate, and enforce warm-cache throughput
+        env:
+          PG_LOCAL_CACHE_SMOKE_DATABASE: ${{ matrix.database }}
+          PG_LOCAL_CACHE_SMOKE_ROLE: ${{ matrix.role }}
+          PG_LOCAL_CACHE_SMOKE_CACHE_ENTRIES: ${{ matrix.cache_entries }}
+          PG_LOCAL_CACHE_SMOKE_MAX_PREPARED_TRANSACTIONS: ${{ matrix.max_prepared_transactions }}
+          PG_LOCAL_CACHE_SMOKE_REQUIRE_SMALL_CACHE: ${{ matrix.require_small_cache }}
+          PG_LOCAL_CACHE_SMOKE_REQUIRE_2PC: ${{ matrix.require_2pc }}
+          PG_LOCAL_CACHE_SMOKE_DURATION: ${{ matrix.duration }}
+          PG_LOCAL_CACHE_SMOKE_MIN_OPS: ${{ matrix.min_ops }}
+          PG_LOCAL_CACHE_SMOKE_CONCURRENCY: ${{ matrix.concurrency }}
+          PG_LOCAL_CACHE_SMOKE_PIPELINE: ${{ matrix.pipeline }}
+          PG_LOCAL_CACHE_SMOKE_KEYS: ${{ matrix.keys }}
+        run: bash tests/docker_smoke.sh

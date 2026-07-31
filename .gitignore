@@ -1,6 +1,7 @@
 *.bc
 *.o
 *.so
+__pycache__/
 compile_commands.json
 core
 log/
@@ -10,3 +11,4 @@ regression.out
 results/
 tmp_check/
 tmp_check_iso/
+secrets/

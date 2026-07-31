@@ -1,6 +1,6 @@
 comment = 'RESP2 row cache with transaction-aware invalidation'
-default_version = '0.1.0'
-module_pathname = '$libdir/pg_kvik'
+default_version = '1.0.0'
+module_pathname = '$libdir/pg_local_cache'
 relocatable = false
-schema = kvik
+schema = local_cache
 superuser = true

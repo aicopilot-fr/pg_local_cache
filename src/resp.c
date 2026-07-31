@@ -63,7 +63,7 @@ parse_decimal_line(const char *buffer, Size length, Size *position,
 }
 
 int
-pgk_resp_parse(const char *buffer, Size length, PgKvikRespArg *args,
+pglc_resp_parse(const char *buffer, Size length, PgLocalCacheRespArg *args,
 			   int *argc, Size *consumed, const char **error)
 {
 	Size		position = 0;
@@ -86,7 +86,7 @@ pgk_resp_parse(const char *buffer, Size length, PgKvikRespArg *args,
 	status = parse_decimal_line(buffer, length, &position, &nargs, error);
 	if (status <= 0)
 		return status;
-	if (nargs <= 0 || nargs > PGK_RESP_MAX_ARGS)
+	if (nargs <= 0 || nargs > PGLC_RESP_MAX_ARGS)
 	{
 		*error = "invalid argument count";
 		return -1;
@@ -108,7 +108,7 @@ pgk_resp_parse(const char *buffer, Size length, PgKvikRespArg *args,
 									&argument_length, error);
 		if (status <= 0)
 			return status;
-		if (argument_length < 0 || argument_length > PGK_REQUEST_MAX)
+		if (argument_length < 0 || argument_length > PGLC_REQUEST_MAX)
 		{
 			*error = "invalid bulk string length";
 			return -1;
@@ -135,7 +135,7 @@ pgk_resp_parse(const char *buffer, Size length, PgKvikRespArg *args,
 }
 
 bool
-pgk_resp_arg_equals(const PgKvikRespArg *arg, const char *literal)
+pglc_resp_arg_equals(const PgLocalCacheRespArg *arg, const char *literal)
 {
 	Size		literal_length = strlen(literal);
 
@@ -165,19 +165,19 @@ line_response(char prefix, const char *message, Size *length)
 }
 
 char *
-pgk_resp_simple(const char *message, Size *length)
+pglc_resp_simple(const char *message, Size *length)
 {
 	return line_response('+', message, length);
 }
 
 char *
-pgk_resp_error(const char *message, Size *length)
+pglc_resp_error(const char *message, Size *length)
 {
 	return line_response('-', message, length);
 }
 
 char *
-pgk_resp_integer(int64 value, Size *length)
+pglc_resp_integer(int64 value, Size *length)
 {
 	char		number[64];
 	int			number_length;
@@ -195,7 +195,7 @@ pgk_resp_integer(int64 value, Size *length)
 }
 
 char *
-pgk_resp_bulk(const char *value, Size value_len, Size *length)
+pglc_resp_bulk(const char *value, Size value_len, Size *length)
 {
 	char		header[64];
 	int			header_length;
@@ -214,7 +214,7 @@ pgk_resp_bulk(const char *value, Size value_len, Size *length)
 }
 
 char *
-pgk_resp_null(Size *length)
+pglc_resp_null(Size *length)
 {
 	char	   *response = pstrdup("$-1\r\n");
 
