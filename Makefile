@@ -29,7 +29,7 @@ endif
 verify-static: all
 	python3 -m py_compile benchmarks/compare.py tests/benchmark_test.py \
 		tests/integration.py tests/pipeline_integration.py tests/load.py
-	bash -n docker/entrypoint.sh docker/healthcheck.sh \
+	bash -n docker/entrypoint.sh docker/healthcheck.sh docker/attach-table.sh \
 		docker/initdb/010_pg_local_cache.sh tests/docker_smoke.sh \
 		benchmarks/run.sh
 

@@ -26,13 +26,24 @@ RESP_HOST = os.environ.get("PG_LOCAL_CACHE_RESP_HOST", "127.0.0.1")
 RESP_PORT = int(os.environ.get("PG_LOCAL_CACHE_RESP_PORT", "6380"))
 AUTH_TOKEN = os.environ.get("PG_LOCAL_CACHE_AUTH_TOKEN", "")
 WORKER_ROLE = os.environ.get("PG_LOCAL_CACHE_TEST_ROLE", "")
+WRITER_ROLE = os.environ.get("PG_LOCAL_CACHE_TEST_WRITER_ROLE", "")
+WRITER_PASSWORD = os.environ.get("PG_LOCAL_CACHE_TEST_WRITER_PASSWORD", "")
+WRITER_HOST = os.environ.get("PG_LOCAL_CACHE_TEST_WRITER_HOST", "127.0.0.1")
 
-if WORKER_ROLE and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", WORKER_ROLE):
+if WORKER_ROLE and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]{0,62}", WORKER_ROLE):
     raise ValueError("PG_LOCAL_CACHE_TEST_ROLE is not a safe SQL identifier")
+if WRITER_ROLE and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]{0,62}", WRITER_ROLE):
+    raise ValueError("PG_LOCAL_CACHE_TEST_WRITER_ROLE is not a safe SQL identifier")
+if bool(WRITER_ROLE) != bool(WRITER_PASSWORD):
+    raise ValueError("writer role and password must be configured together")
 
 
 class RespError(RuntimeError):
     """An error frame returned by the RESP server."""
+
+
+def sql_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
 
 
 class RespConnection:
@@ -185,13 +196,24 @@ def assert_eventual_value(client: RespConnection, key: str, expected: bytes) -> 
 def start_idle_writer(
     table: str, value: str, *, application_name: str
 ) -> subprocess.Popen[str]:
-    role = f"SET ROLE {WORKER_ROLE};" if WORKER_ROLE else ""
+    role = (
+        f"SET ROLE {sql_identifier(WORKER_ROLE)};"
+        if WORKER_ROLE and not WRITER_ROLE
+        else ""
+    )
+    arguments = psql_base_args()
+    environment = None
+    if WRITER_ROLE:
+        arguments.extend(("-h", WRITER_HOST, "-U", WRITER_ROLE))
+        environment = os.environ.copy()
+        environment["PGPASSWORD"] = WRITER_PASSWORD
     process = subprocess.Popen(
-        psql_base_args(),
+        arguments,
         text=True,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        env=environment,
     )
     assert process.stdin is not None
     process.stdin.write(
@@ -201,9 +223,13 @@ def start_idle_writer(
     )
     process.stdin.flush()
     deadline = time.monotonic() + 10
+    writer_identity = (
+        f"AND usename = '{WRITER_ROLE}' " if WRITER_ROLE else ""
+    )
     while sql(
         "SELECT count(*) FROM pg_catalog.pg_stat_activity "
         f"WHERE application_name = '{application_name}' "
+        f"{writer_identity}"
         "AND state = 'idle in transaction'"
     ) != "1":
         if process.poll() is not None:
@@ -584,12 +610,12 @@ def main() -> None:
     suffix = str(os.getpid())
     table = f"pglc_pipeline_{suffix}"
     namespace = f"pipeline{suffix}"
-    grant = (
-        f"GRANT USAGE ON SCHEMA public TO {WORKER_ROLE};"
+    granted_roles = list(dict.fromkeys(filter(None, (WORKER_ROLE, WRITER_ROLE))))
+    grant = "".join(
+        f"GRANT USAGE ON SCHEMA public TO {sql_identifier(role)};"
         f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.{table} "
-        f"TO {WORKER_ROLE};"
-        if WORKER_ROLE
-        else ""
+        f"TO {sql_identifier(role)};"
+        for role in granted_roles
     )
     sql("CREATE EXTENSION IF NOT EXISTS pg_local_cache")
     sql(
@@ -621,7 +647,7 @@ def main() -> None:
         print(
             "pipeline integration passed: fragmentation/order, warm-hit stats, "
             "error recovery, fairness resume, half-close drain, backpressure, "
-            "close-after-flush, commit/rollback fence"
+            "close-after-flush, commit/rollback fence, non-superuser writer"
         )
     finally:
         sql(

@@ -36,6 +36,8 @@ COPY --chmod=0755 docker/entrypoint.sh \
     /usr/local/bin/pg_local_cache_entrypoint
 COPY --chmod=0755 docker/healthcheck.sh \
     /usr/local/bin/pg_local_cache_healthcheck
+COPY --chmod=0755 docker/attach-table.sh \
+    /usr/local/bin/pg_local_cache_attach
 COPY --chmod=0755 docker/initdb/010_pg_local_cache.sh \
     /docker-entrypoint-initdb.d/010_pg_local_cache.sh
 

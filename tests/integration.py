@@ -26,12 +26,16 @@ REQUIRE_SMALL_CACHE = (
 )
 REQUIRE_2PC = os.environ.get("PG_LOCAL_CACHE_REQUIRE_2PC", "") == "1"
 
-if WORKER_ROLE and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", WORKER_ROLE):
+if WORKER_ROLE and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]{0,62}", WORKER_ROLE):
     raise ValueError("PG_LOCAL_CACHE_TEST_ROLE is not a safe SQL identifier")
 
 
 class RespError(RuntimeError):
     pass
+
+
+def sql_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
 
 
 class RespClient:
@@ -134,7 +138,7 @@ def grant_worker(table: str) -> str:
         return ""
     return (
         f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.{table} "
-        f"TO {WORKER_ROLE};"
+        f"TO {sql_identifier(WORKER_ROLE)};"
     )
 
 

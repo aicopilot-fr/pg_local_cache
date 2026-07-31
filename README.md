@@ -58,11 +58,46 @@ docker compose ps
 Runtime-копия AUTH token хранится в отдельном `tmpfs` с mode `0600`, а не в
 writable layer контейнера.
 
+`Dockerfile` — multi-stage образ: compiler и PostgreSQL headers остаются в
+builder stage, а runtime содержит только PostgreSQL 16, extension, init,
+healthcheck и команду подключения таблицы. Собрать образ и проверить CLI:
+
+```bash
+docker build --tag pg_local_cache:1.0.0 .
+docker run --rm pg_local_cache:1.0.0 pg_local_cache_attach --help
+```
+
 На первом запуске можно изменить базу и dedicated role, задав одновременно
 `POSTGRES_DB`, такое же `PG_LOCAL_CACHE_DATABASE` и
 `PG_LOCAL_CACHE_ROLE`. Init-скрипт создаст непривилегированную роль и выдаст
 только базовые права. После инициализации volume смена этих значений требует
 ручного создания role/grants либо нового volume.
+
+### Обычный PostgreSQL-пользователь
+
+Да: application role может быть обычным `NOSUPERUSER` и выполнять привычные
+SQL `SELECT`/`INSERT`/`UPDATE`/`DELETE`. Установленный trigger участвует в той
+же транзакции, поэтому публикация инвалидации происходит только при commit, а
+rollback ничего не инвалидирует. Права на внутренние trigger functions
+application role не нужны.
+
+Не используйте `POSTGRES_USER` как пользователя приложения: официальный
+PostgreSQL image создаёт эту bootstrap-role как superuser. Создайте отдельную:
+
+```sql
+CREATE ROLE app_user
+    LOGIN PASSWORD 'replace-with-a-secret'
+    NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+GRANT CONNECT ON DATABASE app TO app_user;
+GRANT USAGE ON SCHEMA public TO app_user;
+```
+
+RESP port — не альтернативный способ войти паролем `app_user`. Он принимает
+общий cache token, а все команды выполняются под одной фиксированной
+`PG_LOCAL_CACHE_ROLE` (`local_cache_worker`). Token даёт доступ ко всем
+зарегистрированным namespaces, `STAT` и `INVALIDATE`; per-user PostgreSQL ACL
+и RLS на RESP endpoint не применяются. Для разных trust zones используйте
+разные инстансы/token либо отдельный auth proxy.
 
 `POSTGRES_IMAGE` вынесен в build argument. Для воспроизводимого production
 build передайте разрешённый вашей организацией digest вместо плавающего тега:
@@ -72,7 +107,7 @@ docker compose build \
   --build-arg POSTGRES_IMAGE=postgres@sha256:<approved-digest>
 ```
 
-Создание mapping:
+Создайте таблицу:
 
 ```sql
 CREATE TABLE public.items (
@@ -80,15 +115,52 @@ CREATE TABLE public.items (
     value text NOT NULL
 );
 
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.items TO app_user;
+```
+
+В Docker достаточно одной команды. Она находит одиночный primary key,
+выдаёт `local_cache_worker` необходимые права и вызывает административный
+`register_mapping`, который сам создаёт и проверяет row/truncate
+`ENABLE ALWAYS` triggers:
+
+```bash
+docker compose exec postgres pg_local_cache_attach \
+  --table public.items \
+  --writable
+```
+
+Это административная команда: запускайте её только через trusted deploy/init
+под bootstrap/extension owner. Доступ к Docker daemon или `docker exec` уже
+эквивалентен root-доступу к этому контейнеру; `app_user` выполнять attach не
+должен.
+
+Для таблицы ровно из PK и одной value-колонки namespace и value column
+выводятся автоматически (`items`, `value`). Если колонок больше, укажите их
+явно:
+
+```bash
+docker compose exec postgres pg_local_cache_attach \
+  --database app \
+  --namespace items \
+  --table public.items \
+  --value-column value \
+  --writable
+```
+
+Составной PK намеренно не поддерживается. По умолчанию mapping read-only;
+флаг `--writable` включает RESP `SET`/`DEL`. Если другие `NOT NULL` columns
+имеют defaults на sequence/function, worker role дополнительно нужны права на
+эти объекты. Команда только добавляет ACL и не отзывает старые grants. Она не
+переназначит занятый другой таблицей namespace без явного `--replace`.
+
+Эквивалентная ручная регистрация для native installation:
+
+```sql
 GRANT SELECT, INSERT, UPDATE, DELETE
     ON TABLE public.items TO local_cache_worker;
 
 SELECT local_cache.register_mapping(
-    'items',
-    'public.items',
-    'id',
-    'value',
-    true
+    'items', 'public.items', 'id', 'value', true
 );
 ```
 
@@ -104,9 +176,12 @@ redis-cli -h 127.0.0.1 -p 6380 -a "$PG_LOCAL_CACHE_TOKEN" \
   GET items:1
 ```
 
-`register_mapping`, `unregister_mapping` и ручная инвалидация закрыты от
-`PUBLIC`. Выполняйте их от имени extension owner либо выдавайте права только
-отдельной административной роли.
+`register_mapping` и `unregister_mapping` закрыты от `PUBLIC`. Выполняйте их
+от имени extension owner либо выдавайте `EXECUTE` только полностью доверенной
+административной роли: это `SECURITY DEFINER` API управляет triggers.
+`local_cache.invalidate(text)` дополнительно требует реального superuser в C,
+поэтому одного `GRANT EXECUTE` для обычной роли недостаточно. Обычным
+application roles ручная инвалидация не нужна.
 
 ## Нативная установка
 
