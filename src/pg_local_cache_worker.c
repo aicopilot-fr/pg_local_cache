@@ -35,21 +35,29 @@
 #include "pg_local_cache.h"
 #include "resp.h"
 
+#define PGLC_OUTPUT_BATCH_BYTES (16 * 1024)
+#define PGLC_OUTPUT_BUFFER_MAX \
+	(PGLC_RESPONSE_MAX + PGLC_OUTPUT_BATCH_BYTES)
+#define PGLC_READY_CLIENTS_PER_TURN 8
+
 typedef struct PgLocalCacheClient
 {
 	int			fd;
 	bool		authenticated;
 	bool		close_after_flush;
+	bool		input_ready;
 	uint8		authentication_failures;
+	Size		input_start;
 	Size		used;
 	Size		output_used;
 	Size		output_sent;
 	TimestampTz last_activity;
 	char		input[PGLC_REQUEST_MAX];
-	char		output[PGLC_RESPONSE_MAX];
+	char		output[PGLC_OUTPUT_BUFFER_MAX];
 } PgLocalCacheClient;
 
 static MemoryContext mapping_context = NULL;
+static MemoryContext command_context = NULL;
 static PgLocalCacheMapping *worker_mappings = NULL;
 static int	worker_mapping_count = 0;
 static uint64 worker_mapping_generation = 0;
@@ -60,6 +68,7 @@ static void load_auth_token(void);
 static int create_listener(void);
 static void run_server(int listener);
 static void close_client(PgLocalCacheClient *client);
+static void compact_client_input(PgLocalCacheClient *client);
 static bool flush_client_output(PgLocalCacheClient *client);
 static bool queue_response(PgLocalCacheClient *client,
 						   const char *response, Size response_length,
@@ -75,7 +84,7 @@ static void maybe_reload_mappings(void);
 static bool reload_mappings(void);
 static PgLocalCacheMapping *find_mapping(const char *nspace);
 static bool split_wire_key(const PgLocalCacheRespArg *wire_key,
-						   char **nspace, char **raw_key,
+						   char *nspace, char *raw_key,
 						   char **error);
 static bool canonicalize_key(PgLocalCacheMapping *mapping, const char *raw_key,
 							 Datum *key_value, char **canonical,
@@ -109,8 +118,11 @@ pg_local_cache_worker_main(Datum main_arg)
 	pg_atomic_fetch_add_u64(&pglc_shared->worker_starts, 1);
 
 	mapping_context = AllocSetContextCreate(TopMemoryContext,
-											"pg_local_cache mappings",
-											ALLOCSET_DEFAULT_SIZES);
+										"pg_local_cache mappings",
+										ALLOCSET_DEFAULT_SIZES);
+	command_context = AllocSetContextCreate(TopMemoryContext,
+										"pg_local_cache command",
+										ALLOCSET_SMALL_SIZES);
 	maybe_reload_mappings();
 
 	listener = create_listener();
@@ -306,6 +318,7 @@ run_server(int listener)
 	PgLocalCacheClient *clients;
 	struct pollfd poll_fds[PGLC_MAX_CLIENTS_PER_WORKER + 1];
 	int			poll_to_client[PGLC_MAX_CLIENTS_PER_WORKER + 1];
+	int			next_ready_client = 0;
 	int			i;
 
 	/*
@@ -320,12 +333,44 @@ run_server(int listener)
 
 	for (;;)
 	{
+		bool		have_buffered_ready = false;
 		int			poll_count = 1;
 		int			poll_result;
+		int			ready_clients_processed = 0;
+		int			ready_scan_start = next_ready_client;
 		int			latch_result;
+		int			step;
 		TimestampTz now = GetCurrentTimestamp();
 
 		maybe_reload_mappings();
+
+		/*
+		 * A fairness yield leaves complete requests in the client buffer.  Give
+		 * a bounded round-robin set of runnable clients one turn before waiting
+		 * for more socket events; TCP does not generate another POLLIN edge for
+		 * bytes which are already in userspace.
+		 */
+		for (step = 0; step < PGLC_MAX_CLIENTS_PER_WORKER; step++)
+		{
+			int			client_index =
+				(ready_scan_start + step) % PGLC_MAX_CLIENTS_PER_WORKER;
+			PgLocalCacheClient *client = &clients[client_index];
+
+			if (client->fd < 0 || !client->input_ready ||
+				client->output_sent < client->output_used)
+				continue;
+			client->input_ready = false;
+			if (!process_client(client))
+				close_client(client);
+			next_ready_client =
+				(client_index + 1) % PGLC_MAX_CLIENTS_PER_WORKER;
+			if (++ready_clients_processed >= PGLC_READY_CLIENTS_PER_TURN)
+				break;
+		}
+		if (ready_clients_processed == 0)
+			next_ready_client =
+				(next_ready_client + 1) % PGLC_MAX_CLIENTS_PER_WORKER;
+
 		poll_fds[0].fd = listener;
 		poll_fds[0].events = POLLIN;
 		poll_fds[0].revents = 0;
@@ -336,8 +381,8 @@ run_server(int listener)
 			if (clients[i].fd >= 0)
 			{
 				if (TimestampDifferenceExceeds(clients[i].last_activity,
-											  now,
-											  pglc_idle_timeout_ms))
+										  now,
+										  pglc_idle_timeout_ms))
 				{
 					if (clients[i].output_sent < clients[i].output_used)
 						pg_atomic_fetch_add_u64(
@@ -352,10 +397,14 @@ run_server(int listener)
 				poll_fds[poll_count].revents = 0;
 				poll_to_client[poll_count] = i;
 				poll_count++;
+				if (clients[i].input_ready &&
+					clients[i].output_sent == clients[i].output_used)
+					have_buffered_ready = true;
 			}
 		}
 
-		poll_result = poll(poll_fds, poll_count, 250);
+		poll_result = poll(poll_fds, poll_count,
+						   have_buffered_ready ? 0 : 250);
 		if (poll_result < 0 && errno != EINTR)
 			ereport(LOG,
 					(errcode_for_socket_access(),
@@ -435,10 +484,12 @@ run_server(int listener)
 				}
 
 				clients[slot].fd = client_fd;
+				clients[slot].input_start = 0;
 				clients[slot].used = 0;
 				clients[slot].output_used = 0;
 				clients[slot].output_sent = 0;
 				clients[slot].close_after_flush = false;
+				clients[slot].input_ready = false;
 				clients[slot].authentication_failures = 0;
 				clients[slot].last_activity = GetCurrentTimestamp();
 				clients[slot].authenticated =
@@ -453,7 +504,7 @@ run_server(int listener)
 
 			if (client_index < 0 || clients[client_index].fd < 0)
 				continue;
-			if (poll_fds[i].revents & (POLLERR | POLLHUP | POLLNVAL))
+			if (poll_fds[i].revents & (POLLERR | POLLNVAL))
 			{
 				close_client(&clients[client_index]);
 				continue;
@@ -470,15 +521,36 @@ run_server(int listener)
 				}
 				if (clients[client_index].output_sent ==
 					clients[client_index].output_used &&
-					clients[client_index].used > 0 &&
-					!process_client(&clients[client_index]))
-					close_client(&clients[client_index]);
-				continue;
+					clients[client_index].input_start <
+					clients[client_index].used)
+					clients[client_index].input_ready = true;
+				if (!(poll_fds[i].revents & POLLHUP))
+					continue;
 			}
 			if (poll_fds[i].revents & POLLIN)
 			{
 				if (!process_client(&clients[client_index]))
 					close_client(&clients[client_index]);
+			}
+			if (clients[client_index].fd < 0)
+				continue;
+			if (poll_fds[i].revents & POLLHUP)
+			{
+				/*
+				 * POLLHUP can accompany the final POLLIN.  Drain complete requests
+				 * already copied into userspace when their replies were flushed.  A
+				 * full hangup with backpressured output cannot make progress and must
+				 * close instead of spinning because poll reports HUP unconditionally.
+				 */
+				if (clients[client_index].input_start <
+					clients[client_index].used &&
+					clients[client_index].output_sent ==
+					clients[client_index].output_used)
+				{
+					clients[client_index].input_ready = true;
+					continue;
+				}
+				close_client(&clients[client_index]);
 			}
 		}
 	}
@@ -497,17 +569,37 @@ close_client(PgLocalCacheClient *client)
 		pg_atomic_fetch_sub_u64(&pglc_shared->active_clients, 1);
 	}
 	client->fd = -1;
+	client->input_start = 0;
 	client->used = 0;
 	client->output_used = 0;
 	client->output_sent = 0;
 	client->close_after_flush = false;
+	client->input_ready = false;
 	client->authentication_failures = 0;
 	client->authenticated = false;
+}
+
+static void
+compact_client_input(PgLocalCacheClient *client)
+{
+	if (client->input_start == 0)
+		return;
+	if (client->input_start < client->used)
+	{
+		memmove(client->input, client->input + client->input_start,
+				client->used - client->input_start);
+		client->used -= client->input_start;
+	}
+	else
+		client->used = 0;
+	client->input_start = 0;
 }
 
 static bool
 flush_client_output(PgLocalCacheClient *client)
 {
+	bool		wrote = false;
+
 	while (client->output_sent < client->output_used)
 	{
 		ssize_t		written = send(client->fd,
@@ -523,15 +615,23 @@ flush_client_output(PgLocalCacheClient *client)
 		if (written > 0)
 		{
 			client->output_sent += (Size) written;
-			client->last_activity = GetCurrentTimestamp();
+			wrote = true;
 			continue;
 		}
 		if (written < 0 && errno == EINTR)
 			continue;
 		if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+		{
+			pg_atomic_fetch_add_u64(
+				&pglc_shared->output_backpressure_events, 1);
+			if (wrote)
+				client->last_activity = GetCurrentTimestamp();
 			return true;
+		}
 		return false;
 	}
+	if (wrote)
+		client->last_activity = GetCurrentTimestamp();
 	client->output_used = 0;
 	client->output_sent = 0;
 	return true;
@@ -542,117 +642,159 @@ queue_response(PgLocalCacheClient *client,
 			   const char *response, Size response_length,
 			   bool close_after)
 {
-	if (response_length > sizeof(client->output) ||
-		client->output_sent < client->output_used)
+	if (client->output_sent != 0 ||
+		response_length > sizeof(client->output) - client->output_used)
 		return false;
-	memcpy(client->output, response, response_length);
-	client->output_used = response_length;
-	client->output_sent = 0;
-	client->close_after_flush = close_after;
-	return flush_client_output(client);
+	memcpy(client->output + client->output_used, response, response_length);
+	client->output_used += response_length;
+	client->close_after_flush |= close_after;
+	return true;
+}
+
+static bool
+finish_client_turn(PgLocalCacheClient *client)
+{
+	if (client->input_start == client->used)
+	{
+		client->input_start = 0;
+		client->used = 0;
+	}
+	if (!flush_client_output(client))
+		return false;
+	return !(client->close_after_flush &&
+			 client->output_sent == client->output_used);
 }
 
 static bool
 process_client(PgLocalCacheClient *client)
 {
-	ssize_t		received;
+	bool		read_attempted = false;
 	int			commands_processed = 0;
 
 	if (client->output_sent < client->output_used)
 		return true;
+	client->input_ready = false;
+	maybe_reload_mappings();
 
-	if (client->used < sizeof(client->input))
+	for (;;)
 	{
-		received = recv(client->fd, client->input + client->used,
-						sizeof(client->input) - client->used, 0);
-		if (received == 0)
-			return false;
-		if (received > 0)
+		while (client->input_start < client->used)
 		{
-			client->used += (Size) received;
-			client->last_activity = GetCurrentTimestamp();
-		}
-		else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
-			return false;
-		else if (client->used == 0)
-			return true;
-	}
+			PgLocalCacheRespArg args[PGLC_RESP_MAX_ARGS];
+			int			argc;
+			Size		consumed;
+			const char *protocol_error;
+			int			parse_result;
+			MemoryContext previous_context;
+			char	   *response;
+			Size		response_length;
+			bool		close_after = false;
+			bool		queued;
 
-	while (client->used > 0)
-	{
-		PgLocalCacheRespArg args[PGLC_RESP_MAX_ARGS];
-		int			argc;
-		Size		consumed;
-		const char *protocol_error;
-		int			parse_result;
-		MemoryContext command_context;
-		MemoryContext previous_context;
-		char	   *response;
-		Size		response_length;
-		bool		close_after = false;
-		bool		queued;
+			/*
+			 * Reserve room for the largest possible response before executing a
+			 * command.  SET and DEL must never be replayed merely because a
+			 * nonblocking send could not accept their response.
+			 */
+			if (sizeof(client->output) - client->output_used <
+				PGLC_RESPONSE_MAX)
+			{
+				if (!flush_client_output(client))
+					return false;
+				if (client->output_sent < client->output_used)
+				{
+					client->input_ready = true;
+					return true;
+				}
+			}
 
-		CHECK_FOR_INTERRUPTS();
-		parse_result = pglc_resp_parse(client->input, client->used,
-									  args, &argc, &consumed,
-									  &protocol_error);
-		if (parse_result == 0)
-			return client->used < sizeof(client->input);
-		if (parse_result < 0)
-		{
-			Size		error_length;
-			char	   *error_response;
+			CHECK_FOR_INTERRUPTS();
+			parse_result = pglc_resp_parse(
+				client->input + client->input_start,
+				client->used - client->input_start,
+				args, &argc, &consumed, &protocol_error);
+			if (parse_result == 0)
+			{
+				compact_client_input(client);
+				if (client->used == sizeof(client->input))
+				{
+					client->close_after_flush = true;
+					return finish_client_turn(client);
+				}
+				break;
+			}
+			if (parse_result < 0)
+			{
+				Size		error_length;
+				char	   *error_response;
 
-			pg_atomic_fetch_add_u64(&pglc_shared->protocol_errors, 1);
-			error_response = pglc_resp_error(protocol_error, &error_length);
-			queued = queue_response(client, error_response, error_length, true);
-			pfree(error_response);
-			if (!queued)
-				return false;
-			return client->output_sent < client->output_used;
-		}
+				pg_atomic_fetch_add_u64(&pglc_shared->protocol_errors, 1);
+				error_response = pglc_resp_error(protocol_error, &error_length);
+				queued = queue_response(client, error_response,
+										error_length, true);
+				pfree(error_response);
+				if (!queued)
+					return false;
+				client->input_start = client->used;
+				return finish_client_turn(client);
+			}
 
-		command_context = AllocSetContextCreate(CurrentMemoryContext,
-												"pg_local_cache command",
-												ALLOCSET_DEFAULT_SIZES);
-		previous_context = MemoryContextSwitchTo(command_context);
-		response = execute_command(client, args, argc,
+			previous_context = MemoryContextSwitchTo(command_context);
+			response = execute_command(client, args, argc,
 								   &response_length, &close_after);
-		queued = queue_response(client, response, response_length,
+			queued = queue_response(client, response, response_length,
 								close_after);
-		MemoryContextSwitchTo(previous_context);
-		MemoryContextDelete(command_context);
+			MemoryContextSwitchTo(previous_context);
+			if (queued)
+				client->input_start += consumed;
+			MemoryContextReset(command_context);
 
-		if (consumed < client->used)
-			memmove(client->input, client->input + consumed,
-					client->used - consumed);
-		client->used -= consumed;
-
-		if (!queued)
-			return false;
-		if (close_after && client->output_sent == client->output_used)
-			return false;
-		if (client->output_sent < client->output_used)
-			return true;
-
-		commands_processed++;
-		if (commands_processed >= pglc_max_pipeline_commands &&
-			client->used > 0)
-		{
-			Size		error_length;
-			char	   *error_response;
-
-			error_response = pglc_resp_error(
-				"ERR pipeline command limit exceeded", &error_length);
-			queued = queue_response(client, error_response,
-									error_length, true);
-			pfree(error_response);
 			if (!queued)
 				return false;
-			return client->output_sent < client->output_used;
+			if (close_after)
+			{
+				client->input_start = client->used;
+				return finish_client_turn(client);
+			}
+
+			commands_processed++;
+			if (commands_processed >= pglc_max_pipeline_commands)
+			{
+				client->input_ready = client->input_start < client->used;
+				return finish_client_turn(client);
+			}
+		}
+
+		if (read_attempted)
+			break;
+
+		compact_client_input(client);
+		for (;;)
+		{
+			ssize_t		received;
+
+			received = recv(client->fd, client->input + client->used,
+								sizeof(client->input) - client->used, 0);
+			if (received < 0 && errno == EINTR)
+				continue;
+			read_attempted = true;
+			if (received == 0)
+			{
+				client->close_after_flush = true;
+				return finish_client_turn(client);
+			}
+			if (received > 0)
+			{
+				client->used += (Size) received;
+				client->last_activity = GetCurrentTimestamp();
+				break;
+			}
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				return finish_client_turn(client);
+			return false;
 		}
 	}
-	return true;
+	return finish_client_turn(client);
 }
 
 static char *
@@ -722,10 +864,13 @@ static char *
 execute_command_inner(PgLocalCacheClient *client, PgLocalCacheRespArg *args, int argc,
 					  Size *response_length, bool *close_after)
 {
-	char	   *nspace;
-	char	   *raw_key;
+	char		nspace[PGLC_NAMESPACE_MAX];
+	char		raw_key[PGLC_KEY_MAX];
 	char	   *key_error;
 	PgLocalCacheMapping *mapping;
+	bool		is_delete;
+	bool		is_get;
+	bool		is_set;
 
 	if (argc == 0)
 		return pglc_resp_error("ERR empty command", response_length);
@@ -767,7 +912,31 @@ execute_command_inner(PgLocalCacheClient *client, PgLocalCacheRespArg *args, int
 
 	if (!client->authenticated)
 		return pglc_resp_error("NOAUTH Authentication required",
-							  response_length);
+								  response_length);
+
+	/* Keep the dominant cache commands at the front of the dispatch path. */
+	is_get = pglc_resp_arg_equals(&args[0], "GET");
+	is_set = !is_get && pglc_resp_arg_equals(&args[0], "SET");
+	is_delete = !is_get && !is_set && pglc_resp_arg_equals(&args[0], "DEL");
+	if (is_get || is_set || is_delete)
+	{
+		if ((is_get && argc != 2) ||
+			(is_set && argc != 3) ||
+			(is_delete && argc != 2))
+			return pglc_resp_error("ERR wrong number of arguments",
+								  response_length);
+		if (!split_wire_key(&args[1], nspace, raw_key, &key_error))
+			return pglc_resp_error(key_error, response_length);
+		mapping = find_mapping(nspace);
+		if (mapping == NULL)
+			return pglc_resp_error("ERR unknown pg_local_cache namespace",
+								  response_length);
+		if (is_get)
+			return command_get(mapping, raw_key, response_length);
+		if (is_set)
+			return command_set(mapping, raw_key, &args[2], response_length);
+		return command_delete(mapping, raw_key, response_length);
+	}
 
 	if (pglc_resp_arg_equals(&args[0], "PING"))
 	{
@@ -868,10 +1037,9 @@ execute_command_inner(PgLocalCacheClient *client, PgLocalCacheRespArg *args, int
 
 		if (argc != 2 || args[1].len == 0 ||
 			args[1].len >= PGLC_NAMESPACE_MAX)
-				return pglc_resp_error("ERR INVALIDATE expects one namespace",
+			return pglc_resp_error("ERR INVALIDATE expects one namespace",
 								  response_length);
 		namespace_value = pnstrdup(args[1].data, args[1].len);
-		maybe_reload_mappings();
 		invalidate_mapping = find_mapping(namespace_value);
 		if (invalidate_mapping == NULL)
 			return pglc_resp_error("ERR unknown pg_local_cache namespace",
@@ -881,35 +1049,12 @@ execute_command_inner(PgLocalCacheClient *client, PgLocalCacheRespArg *args, int
 		return pglc_resp_integer((int64) count, response_length);
 	}
 
-	if (!pglc_resp_arg_equals(&args[0], "GET") &&
-		!pglc_resp_arg_equals(&args[0], "SET") &&
-		!pglc_resp_arg_equals(&args[0], "DEL"))
-		return pglc_resp_error("ERR unsupported command", response_length);
-
-	if ((pglc_resp_arg_equals(&args[0], "GET") && argc != 2) ||
-		(pglc_resp_arg_equals(&args[0], "SET") && argc != 3) ||
-		(pglc_resp_arg_equals(&args[0], "DEL") && argc != 2))
-		return pglc_resp_error("ERR wrong number of arguments", response_length);
-
-	if (!split_wire_key(&args[1], &nspace, &raw_key, &key_error))
-		return pglc_resp_error(key_error, response_length);
-
-	maybe_reload_mappings();
-	mapping = find_mapping(nspace);
-	if (mapping == NULL)
-		return pglc_resp_error("ERR unknown pg_local_cache namespace",
-							  response_length);
-
-	if (pglc_resp_arg_equals(&args[0], "GET"))
-		return command_get(mapping, raw_key, response_length);
-	if (pglc_resp_arg_equals(&args[0], "SET"))
-		return command_set(mapping, raw_key, &args[2], response_length);
-	return command_delete(mapping, raw_key, response_length);
+	return pglc_resp_error("ERR unsupported command", response_length);
 }
 
 static bool
-split_wire_key(const PgLocalCacheRespArg *wire_key, char **nspace,
-			   char **raw_key, char **error)
+split_wire_key(const PgLocalCacheRespArg *wire_key, char *nspace,
+			   char *raw_key, char **error)
 {
 	const char *separator;
 	Size		namespace_length;
@@ -941,10 +1086,12 @@ split_wire_key(const PgLocalCacheRespArg *wire_key, char **nspace,
 		return false;
 	}
 
-	*nspace = pnstrdup(wire_key->data, namespace_length);
-	*raw_key = pnstrdup(separator + 1, key_length);
-	pg_verifymbstr(*nspace, namespace_length, false);
-	pg_verifymbstr(*raw_key, key_length, false);
+	memcpy(nspace, wire_key->data, namespace_length);
+	nspace[namespace_length] = '\0';
+	memcpy(raw_key, separator + 1, key_length);
+	raw_key[key_length] = '\0';
+	pg_verifymbstr(nspace, namespace_length, false);
+	pg_verifymbstr(raw_key, key_length, false);
 	return true;
 }
 
@@ -1168,14 +1315,14 @@ static void
 maybe_reload_mappings(void)
 {
 	uint64		generation = pglc_config_generation();
-	TimestampTz now = GetCurrentTimestamp();
 
-	if (generation != worker_mapping_generation &&
-		(worker_next_mapping_retry == 0 || now >= worker_next_mapping_retry))
-	{
-		if (reload_mappings())
-			worker_next_mapping_retry = 0;
-	}
+	if (generation == worker_mapping_generation)
+		return;
+	if (worker_next_mapping_retry != 0 &&
+		GetCurrentTimestamp() < worker_next_mapping_retry)
+		return;
+	if (reload_mappings())
+		worker_next_mapping_retry = 0;
 }
 
 static void

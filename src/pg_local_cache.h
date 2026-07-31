@@ -78,6 +78,7 @@ typedef struct PgLocalCacheSharedState
 	pg_atomic_uint64 rejected_connections;
 	pg_atomic_uint64 authentication_failures;
 	pg_atomic_uint64 protocol_errors;
+	pg_atomic_uint64 output_backpressure_events;
 	pg_atomic_uint64 slow_client_drops;
 	pg_atomic_uint64 worker_starts;
 } PgLocalCacheSharedState;

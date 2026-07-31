@@ -31,8 +31,8 @@ Redis/Valkey-процесс не нужен: TCP listener, shared cache, SQL fal
 - fail-closed, если обязательный trigger удалён, изменён или отключён;
 - typmod-aware `varchar`/`bpchar`, только deterministic key collation и
   стандартный B-tree equality opclass;
-- statement/lock/idle timeouts, bounded pipeline, AUTH failure limit,
-  nonblocking socket output и operational counters;
+- statement/lock/idle timeouts, bounded per-client event-loop budget, AUTH
+  failure limit, batched nonblocking socket output и operational counters;
 - отказ от `PREPARE TRANSACTION`, если транзакция меняла mapped table.
 
 ## Быстрый запуск в Docker
@@ -195,6 +195,12 @@ PostgreSQL column, не произвольный binary blob.
 после commit. Если TCP-соединение оборвалось до ответа, outcome записи
 неизвестен; слепой автоматический retry может повторить операцию.
 
+RESP batching объединяет только системные вызовы отправки, а не PostgreSQL
+транзакции. Команды исполняются последовательно, input cursor сдвигается лишь
+после постановки ответа в bounded output buffer, поэтому `EAGAIN` не приводит
+к внутреннему replay `SET`/`DEL`. `max_pipeline_commands` ограничивает работу
+одного клиента за event-loop turn и не является wire protocol limit.
+
 SQL API:
 
 ```sql
@@ -248,20 +254,28 @@ PG_LOCAL_CACHE_MIN_OPS=10000 \
 make load
 ```
 
-Контрольный прогон PostgreSQL 16.14 с non-superuser role, 4 workers,
-`cache_entries=16384`, 16 clients, pipeline 32, 1024 warm keys и value
-128 bytes:
+Полный контрольный прогон PostgreSQL 16.14 с non-superuser role, 4 workers,
+`cache_entries=65536`, 16 clients, pipeline 32, 16384 warm keys, value
+128 bytes, 15 секунд warmup и 3 measured run по 120 секунд:
 
-- `246583 ops/s`;
-- p50 `1.620 ms`, p95 `4.688 ms`, p99 `6.792 ms`;
-- `0` errors, `0` misses и `0` SQL reads во время measurement.
+- median `239292 ops/s`, range `236072–243811`, CV `1.32%`;
+- median p50 `1.693 ms`, p95 `4.265 ms`, p99 `6.951 ms`;
+- `0` errors, `0` misses и `0` SQL reads во всех measured run.
 
-Это не универсальная гарантия для любого CPU/container. CI повторяет
-короткий smoke gate `>=10000 warm GET/s`; перед production rollout повторите
-30–60 second gate несколько раз на закреплённых CPU целевой машины и
-контролируйте p99. `SET`, `DEL`, cold miss и invalidation-heavy workloads
-измеряйте отдельно: они включают стоимость PostgreSQL transaction, storage,
-WAL и locks.
+До batching/input-cursor/context-reuse оптимизаций тот же полный workload дал
+median `64918 ops/s`, p50 `6.082 ms`, p95 `16.388 ms`, p99 `26.943 ms`.
+Наблюдаемый raw throughput вырос в `3.69x` (`+268.6%`), а p50/p95/p99
+уменьшились на `72.2%`/`74.0%`/`74.2%`. Это два отдельных запуска на shared
+двухъядерном GitHub runner: контрольные Valkey/Redis/stock PostgreSQL между
+ними сдвинулись на `1.3–4.2%`, а нормализованный по контролям прирост составил
+`3.54–3.64x`. Поэтому результат является regression evidence для этой
+оптимизации, а не универсальной гарантией для любого CPU/container.
+
+CI повторяет короткий smoke gate `>=10000 warm GET/s`; перед production
+rollout повторите 30–60 second gate несколько раз на закреплённых CPU целевой
+машины и контролируйте p99. `SET`, `DEL`, cold miss и invalidation-heavy
+workloads измеряйте отдельно: они включают стоимость PostgreSQL transaction,
+storage, WAL и locks.
 
 ## Сравнение с Valkey, Redis и прямым PostgreSQL
 
@@ -290,6 +304,26 @@ reads. Порядок сервисов вращается между повто�
 ```bash
 bash benchmarks/run.sh
 ```
+
+Проверенный полный прогон 2026-07-31 на 2 CPU quota для client и каждого
+server container:
+
+| Target | Median ops/s | Min–max ops/s | CV | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| pg_local_cache | 239292 | 236072–243811 | 1.32% | 1.693 ms | 4.265 ms | 6.951 ms |
+| Valkey 9.1.1 | 235349 | 233980–235787 | 0.33% | 1.886 ms | 4.363 ms | 6.850 ms |
+| Redis 8.8.1 | 238019 | 235799–240762 | 0.85% | 1.849 ms | 4.358 ms | 6.694 ms |
+| stock PostgreSQL 16.14 | 47974 | 47479–48233 | 0.65% | — | — | — |
+
+`pg_local_cache` оказался на `1.7%` выше median Valkey и на `0.5%` выше
+Redis, но такая малая разница находится внутри вариативности shared runner и
+не является доказательством engine ranking. Полные отчёты сохранены в
+репозитории: [до оптимизации](benchmarks/reference/2026-07-31-before-batching.md)
+([JSON](benchmarks/reference/2026-07-31-before-batching.json)) и
+[после оптимизации](benchmarks/reference/2026-07-31-transaction-safe-batching.md)
+([JSON](benchmarks/reference/2026-07-31-transaction-safe-batching.json)).
+Исходный полный прогон также доступен в
+[GitHub Actions run 30660130760](https://github.com/aicopilot-fr/pg_local_cache/actions/runs/30660130760).
 
 Результат сохраняется в `benchmarks/results/comparison.json` и
 `comparison.md`: все отдельные run, median/min/max/CV, p50/p95/p99,
@@ -379,8 +413,10 @@ production build не могут разойтись по `PGLC_REQUEST_MAX` ил
 arguments.
 
 Integration suite покрывает AUTH limits, malformed/fragmented/pipelined RESP,
-GET/SET/DEL, positive/negative cache, SQL/DDL/TRUNCATE invalidation, отсутствие
-сброса на unrelated/TEMP DDL, rollback, key move, trigger integrity, typmod,
+точный порядок и resume после fairness yield, half-close, принудительный
+socket backpressure без replay мутаций, GET/SET/DEL, positive/negative cache,
+точные commit/rollback invalidation deltas, SQL/DDL/TRUNCATE invalidation,
+отсутствие сброса на unrelated/TEMP DDL, key move, trigger integrity, typmod,
 deterministic collation, value-type allowlist, remap fence, relation-state GC,
 timeouts, каждый настроенный worker PID, full cache, race fence и 2PC
 rejection.
@@ -400,7 +436,8 @@ comparative stack и `pgbench`, correctness с cache `128`, включённым
 - active/positive/negative/dirty entries и relation states;
 - hits, misses, negative hits, evictions;
 - database reads/writes и invalidations;
-- active/rejected connections, AUTH/protocol failures, slow-client drops;
+- active/rejected connections, AUTH/protocol failures, output backpressure
+  events и slow-client drops;
 - worker starts и pending forget markers.
 
 Следите за hit ratio, неожиданными SQL reads, evictions, rejected connections,

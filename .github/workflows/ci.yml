@@ -112,6 +112,7 @@ jobs:
             benchmarks/compare.py \
             tests/benchmark_test.py \
             tests/integration.py \
+            tests/pipeline_integration.py \
             tests/load.py
 
       - name: Build, integrate, and enforce warm-cache throughput

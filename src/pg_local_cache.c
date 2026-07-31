@@ -183,7 +183,7 @@ pglc_define_gucs(void)
 							NULL);
 
 	DefineCustomIntVariable("pg_local_cache.max_pipeline_commands",
-							"Maximum RESP commands accepted from one buffered pipeline.",
+							"Maximum RESP commands processed for one client per event-loop turn.",
 							NULL,
 							&pglc_max_pipeline_commands,
 							256,
@@ -372,6 +372,7 @@ pglc_shmem_startup(void)
 		pg_atomic_init_u64(&pglc_shared->rejected_connections, 0);
 		pg_atomic_init_u64(&pglc_shared->authentication_failures, 0);
 		pg_atomic_init_u64(&pglc_shared->protocol_errors, 0);
+		pg_atomic_init_u64(&pglc_shared->output_backpressure_events, 0);
 		pg_atomic_init_u64(&pglc_shared->slow_client_drops, 0);
 		pg_atomic_init_u64(&pglc_shared->worker_starts, 0);
 	}
@@ -1446,6 +1447,7 @@ pglc_stats_json(void)
 	uint64		rejected_connections;
 	uint64		authentication_failures;
 	uint64		protocol_errors;
+	uint64		output_backpressure_events;
 	uint64		slow_client_drops;
 	uint64		worker_starts;
 	HASH_SEQ_STATUS relation_sequence;
@@ -1494,6 +1496,8 @@ pglc_stats_json(void)
 	authentication_failures =
 		pg_atomic_read_u64(&pglc_shared->authentication_failures);
 	protocol_errors = pg_atomic_read_u64(&pglc_shared->protocol_errors);
+	output_backpressure_events =
+		pg_atomic_read_u64(&pglc_shared->output_backpressure_events);
 	slow_client_drops =
 		pg_atomic_read_u64(&pglc_shared->slow_client_drops);
 	worker_starts = pg_atomic_read_u64(&pglc_shared->worker_starts);
@@ -1519,6 +1523,7 @@ pglc_stats_json(void)
 		",\"rejected_connections\":" UINT64_FORMAT
 		",\"authentication_failures\":" UINT64_FORMAT
 		",\"protocol_errors\":" UINT64_FORMAT
+		",\"output_backpressure_events\":" UINT64_FORMAT
 		",\"slow_client_drops\":" UINT64_FORMAT
 		",\"worker_starts\":" UINT64_FORMAT
 		",\"cache_hit\":" UINT64_FORMAT
@@ -1531,7 +1536,8 @@ pglc_stats_json(void)
 		cache_hits, cache_misses, negative_hits,
 		database_reads, database_writes, invalidations, evictions,
 		active_clients, rejected_connections, authentication_failures,
-		protocol_errors, slow_client_drops, worker_starts,
+		protocol_errors, output_backpressure_events, slow_client_drops,
+		worker_starts,
 		cache_hits, cache_misses, evictions, database_reads);
 }
 

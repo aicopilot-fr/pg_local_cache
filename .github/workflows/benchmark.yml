@@ -69,6 +69,8 @@ jobs:
           PGLC_BENCH_PIPELINE: ${{ inputs.pipeline || '32' }}
           PGLC_BENCH_PG_LOCAL_CACHE_WORKERS: ${{ inputs.workers || '4' }}
           PGLC_BENCH_KEYS: ${{ inputs.keys || '16384' }}
+          PGLC_BENCH_SERVER_CPUS: "2"
+          PGLC_BENCH_CLIENT_CPUS: "2"
           PGLC_BENCH_OUTPUT_DIR: ${{ github.workspace }}/benchmark-results
         run: bash benchmarks/run.sh
 

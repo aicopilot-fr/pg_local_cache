@@ -131,6 +131,16 @@ PGDATABASE="$database" \
 PG_LOCAL_CACHE_RESP_HOST="127.0.0.1" \
 PG_LOCAL_CACHE_RESP_PORT="$cache_host_port" \
 PG_LOCAL_CACHE_AUTH_TOKEN="$auth_token" \
+PG_LOCAL_CACHE_TEST_ROLE="$worker_role" \
+    python3 -B "${repository_directory}/tests/pipeline_integration.py"
+
+PG_LOCAL_CACHE_PSQL="$psql_wrapper" \
+PGHOST="/var/run/postgresql" \
+PGPORT="5432" \
+PGDATABASE="$database" \
+PG_LOCAL_CACHE_RESP_HOST="127.0.0.1" \
+PG_LOCAL_CACHE_RESP_PORT="$cache_host_port" \
+PG_LOCAL_CACHE_AUTH_TOKEN="$auth_token" \
 PG_LOCAL_CACHE_BENCH_ROLE="$worker_role" \
 PG_LOCAL_CACHE_BENCH_DURATION="${PG_LOCAL_CACHE_SMOKE_DURATION:-1}" \
 PG_LOCAL_CACHE_BENCH_CONCURRENCY="${PG_LOCAL_CACHE_SMOKE_CONCURRENCY:-4}" \

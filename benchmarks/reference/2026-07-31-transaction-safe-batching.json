@@ -1,0 +1,285 @@
+{
+  "comparison_warnings": [],
+  "environment": {
+    "cgroup_cpu_max": "200000 100000",
+    "cgroup_memory_max": "3221225472",
+    "docker": "28.0.4",
+    "docker_compose": "2.38.2",
+    "host_visible_cpu_count": 2,
+    "machine": "x86_64",
+    "plain_postgres_server_version": "16.14 (Debian 16.14-1.pgdg12+1)",
+    "platform": "Linux-6.17.0-1020-azure-x86_64-with-glibc2.36",
+    "postgres_server_version": "16.14 (Debian 16.14-1.pgdg12+1)",
+    "python": "3.11.2"
+  },
+  "gate": {
+    "message": "pg_local_cache median >= 10000 ops/s, zero RESP errors, misses, and SQL reads",
+    "status": "PASS"
+  },
+  "generated_at_utc": "2026-07-31T20:11:39.662805+00:00",
+  "images": {
+    "benchmark_client": {
+      "harness_sha256": "93befb23c30d3ec67b7eceeff24577c37c73c83df35d19a863374233963c7c96",
+      "identity": "sha256:67ebd528396faa668e625ff97572e95cab9dcbc16335f7aa2e02a8434b169595",
+      "image": "pg_local_cache-benchmark-runner:2003",
+      "source_revision": "24e4d5c37ea76e63f19756ff528d89feae9d67e3"
+    },
+    "pg_local_cache": {
+      "base_identity": "postgres@sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55",
+      "base_image": "postgres:16.14-bookworm",
+      "identity": "sha256:1e3380b3f2ef75021e9453ed6a92dd674bc300d82e1b0f77c3fd7c7d312e2b09",
+      "image": "pg_local_cache:benchmark-2003"
+    },
+    "postgres_plain": {
+      "identity": "postgres@sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55",
+      "image": "postgres:16.14-bookworm"
+    },
+    "redis": {
+      "identity": "redis@sha256:c88d347edef6249a6d2293f926f1eeb48bd40c57cbcd02c07f52e7f1fd2cb46b",
+      "image": "redis:8.8.1-trixie"
+    },
+    "valkey": {
+      "identity": "valkey/valkey@sha256:3acc0687f2a2e1091fae6450d7842dd658c941338cf0a873ddd9e14b9e4ea4dd",
+      "image": "valkey/valkey:9.1.1-trixie"
+    }
+  },
+  "postgres_reference": {
+    "client": "pgbench",
+    "operations_per_batch": 32,
+    "protocol": "stock PostgreSQL extended protocol, prepared + pipeline",
+    "runs": [
+      {
+        "batch_latency_average_ms": 10.615,
+        "batch_transactions_per_second": 1507.293937,
+        "failed_batches": 0,
+        "operations_per_second": 48233.405984,
+        "successful_batches": 180736,
+        "successful_operations": 5783552
+      },
+      {
+        "batch_latency_average_ms": 10.672,
+        "batch_transactions_per_second": 1499.19072,
+        "failed_batches": 0,
+        "operations_per_second": 47974.10304,
+        "successful_batches": 179760,
+        "successful_operations": 5752320
+      },
+      {
+        "batch_latency_average_ms": 10.784,
+        "batch_transactions_per_second": 1483.726339,
+        "failed_batches": 0,
+        "operations_per_second": 47479.242848,
+        "successful_batches": 177799,
+        "successful_operations": 5689568
+      }
+    ],
+    "server": "plain postgres:16.14 (pg_local_cache not loaded)",
+    "summary": {
+      "coefficient_of_variation_percent": 0.6531956587775919,
+      "maximum_operations_per_second": 48233.405984,
+      "mean_operations_per_second": 47895.58395733333,
+      "median_operations_per_second": 47974.10304,
+      "minimum_operations_per_second": 47479.242848
+    }
+  },
+  "resp_methodology": {
+    "authentication_before_timer": true,
+    "client": "same stdlib Python multiprocess RESP2 client",
+    "latency_definition": "time from pipeline send until each response completion",
+    "latency_sampling": "deterministic per-connection Algorithm R reservoirs over the entire measured interval, operation-weighted when merged",
+    "persistent_connections": true,
+    "preload_and_warm_outside_timer": true,
+    "reply_validation": "every RESP value",
+    "target_order": "rotated each repetition",
+    "transport": "Docker bridge TCP",
+    "valkey_redis_persistence": "disabled"
+  },
+  "resp_targets": {
+    "pg_local_cache": {
+      "runs": [
+        {
+          "cache_misses_during_measurement": 0,
+          "client_cpu_quota_utilization_percent": 61.091392821689126,
+          "client_cpu_seconds": 146.62750499999999,
+          "database_reads_during_measurement": 0,
+          "elapsed_seconds": 120.00668034199998,
+          "error_messages": [],
+          "errors": 0,
+          "latency_samples": 200000,
+          "operations_per_second": 239292.01206267966,
+          "p50_ms": 1.692565,
+          "p95_ms": 4.33622,
+          "p99_ms": 7.317282,
+          "successful_operations": 28716640
+        },
+        {
+          "cache_misses_during_measurement": 0,
+          "client_cpu_quota_utilization_percent": 60.89769467685142,
+          "client_cpu_seconds": 146.19181300000002,
+          "database_reads_during_measurement": 0,
+          "elapsed_seconds": 120.03066271700004,
+          "error_messages": [],
+          "errors": 0,
+          "latency_samples": 200000,
+          "operations_per_second": 236072.4781367616,
+          "p50_ms": 1.740626,
+          "p95_ms": 4.265462,
+          "p99_ms": 6.950698,
+          "successful_operations": 28335936
+        },
+        {
+          "cache_misses_during_measurement": 0,
+          "client_cpu_quota_utilization_percent": 62.21993426580288,
+          "client_cpu_seconds": 149.33602399999995,
+          "database_reads_during_measurement": 0,
+          "elapsed_seconds": 120.0065748720001,
+          "error_messages": [],
+          "errors": 0,
+          "latency_samples": 200000,
+          "operations_per_second": 243811.17477278062,
+          "p50_ms": 1.683577,
+          "p95_ms": 4.177671,
+          "p99_ms": 6.818287,
+          "successful_operations": 29258944
+        }
+      ],
+      "summary": {
+        "coefficient_of_variation_percent": 1.324068242844157,
+        "maximum_operations_per_second": 243811.17477278062,
+        "mean_operations_per_second": 239725.22165740732,
+        "median_operations_per_second": 239292.01206267966,
+        "median_p50_ms": 1.692565,
+        "median_p95_ms": 4.265462,
+        "median_p99_ms": 6.950698,
+        "minimum_operations_per_second": 236072.4781367616
+      },
+      "version": "1.0.0"
+    },
+    "redis": {
+      "runs": [
+        {
+          "client_cpu_quota_utilization_percent": 63.041853808948154,
+          "client_cpu_seconds": 151.312817,
+          "elapsed_seconds": 120.00980924399994,
+          "error_messages": [],
+          "errors": 0,
+          "latency_samples": 200000,
+          "operations_per_second": 235798.5916173332,
+          "p50_ms": 1.886109,
+          "p95_ms": 4.475122,
+          "p99_ms": 6.830319,
+          "successful_operations": 28298144
+        },
+        {
+          "client_cpu_quota_utilization_percent": 62.71597997645383,
+          "client_cpu_seconds": 150.528814,
+          "elapsed_seconds": 120.00834082200004,
+          "error_messages": [],
+          "errors": 0,
+          "latency_samples": 200000,
+          "operations_per_second": 238019.18936924066,
+          "p50_ms": 1.849078,
+          "p95_ms": 4.358091,
+          "p99_ms": 6.693506,
+          "successful_operations": 28564288
+        },
+        {
+          "client_cpu_quota_utilization_percent": 62.939930169950344,
+          "client_cpu_seconds": 151.067636,
+          "elapsed_seconds": 120.00937687100009,
+          "error_messages": [],
+          "errors": 0,
+          "latency_samples": 200000,
+          "operations_per_second": 240761.986715907,
+          "p50_ms": 1.848406,
+          "p95_ms": 4.274223,
+          "p99_ms": 6.642932,
+          "successful_operations": 28893696
+        }
+      ],
+      "summary": {
+        "coefficient_of_variation_percent": 0.8522627375171988,
+        "maximum_operations_per_second": 240761.986715907,
+        "mean_operations_per_second": 238193.25590082697,
+        "median_operations_per_second": 238019.18936924066,
+        "median_p50_ms": 1.849078,
+        "median_p95_ms": 4.358091,
+        "median_p99_ms": 6.693506,
+        "minimum_operations_per_second": 235798.5916173332
+      },
+      "version": "8.8.1"
+    },
+    "valkey": {
+      "runs": [
+        {
+          "client_cpu_quota_utilization_percent": 61.66582104173229,
+          "client_cpu_seconds": 148.005391,
+          "elapsed_seconds": 120.00601670399999,
+          "error_messages": [],
+          "errors": 0,
+          "latency_samples": 200000,
+          "operations_per_second": 233980.26841652583,
+          "p50_ms": 1.873137,
+          "p95_ms": 4.407468,
+          "p99_ms": 6.850412,
+          "successful_operations": 28079040
+        },
+        {
+          "client_cpu_quota_utilization_percent": 61.69528867953257,
+          "client_cpu_seconds": 148.07565699999998,
+          "elapsed_seconds": 120.00564400400003,
+          "error_messages": [],
+          "errors": 0,
+          "latency_samples": 200000,
+          "operations_per_second": 235787.3101289873,
+          "p50_ms": 1.898532,
+          "p95_ms": 4.362901,
+          "p99_ms": 6.799631,
+          "successful_operations": 28295808
+        },
+        {
+          "client_cpu_quota_utilization_percent": 61.98406339019955,
+          "client_cpu_seconds": 148.77099399999997,
+          "elapsed_seconds": 120.00745503199983,
+          "error_messages": [],
+          "errors": 0,
+          "latency_samples": 200000,
+          "operations_per_second": 235349.11220697805,
+          "p50_ms": 1.88615,
+          "p95_ms": 4.360022,
+          "p99_ms": 6.901672,
+          "successful_operations": 28243648
+        }
+      ],
+      "summary": {
+        "coefficient_of_variation_percent": 0.327453378948567,
+        "maximum_operations_per_second": 235787.3101289873,
+        "mean_operations_per_second": 235038.89691749704,
+        "median_operations_per_second": 235349.11220697805,
+        "median_p50_ms": 1.88615,
+        "median_p95_ms": 4.362901,
+        "median_p99_ms": 6.850412,
+        "minimum_operations_per_second": 233980.26841652583
+      },
+      "version": "9.1.1"
+    }
+  },
+  "schema_version": 1,
+  "workload": {
+    "client_cpus": 2.0,
+    "client_memory": "3g",
+    "concurrency": 16,
+    "duration_seconds": 120.0,
+    "keys": 16384,
+    "max_latency_samples": 200000,
+    "operation": "warm positive GET",
+    "pg_local_cache_capacity": 65536,
+    "pg_local_cache_workers": 4,
+    "pipeline": 32,
+    "repetitions": 3,
+    "server_cpus": 2.0,
+    "server_memory": "2g",
+    "value_size": 128,
+    "warmup_seconds": 15.0
+  }
+}
