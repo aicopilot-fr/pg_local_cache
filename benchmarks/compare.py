@@ -86,7 +86,7 @@ class Config:
             value_size=env_int("PGLC_BENCH_VALUE_SIZE", 128, 1, 8192),
             max_latency_samples=env_int(
                 "PGLC_BENCH_MAX_LATENCY_SAMPLES",
-                1_000_000,
+                200_000,
                 1000,
                 10_000_000,
             ),
@@ -94,7 +94,7 @@ class Config:
             client_cpus=client_cpus,
             server_cpus=env_float("PGLC_BENCH_SERVER_CPUS", 4, 0.1, 1024),
             client_memory=os.environ.get(
-                "PGLC_BENCH_CLIENT_MEMORY", "1g"
+                "PGLC_BENCH_CLIENT_MEMORY", "3g"
             ),
             server_memory=os.environ.get(
                 "PGLC_BENCH_SERVER_MEMORY", "2g"

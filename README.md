@@ -324,10 +324,16 @@ pipeline разделяют implicit transaction/snapshot, поэтому это
 RESP latency — время от отправки всего pipeline до завершения каждого ответа,
 включая очередь за более ранними ответами, а не server service time одной
 команды. p50/p95/p99 считаются по детерминированным per-connection reservoirs
-Algorithm R (суммарно до 1000000 samples) из всего measured interval; при
-слиянии sample получает вес по числу завершённых операций connection. Поэтому
-медленные connections не перевешивают быстрые, а хвост прогона не вытесняет
-его начало.
+Algorithm R (по умолчанию суммарно до 200000 samples) из всего measured
+interval; при слиянии sample получает вес по числу завершённых операций
+connection. Поэтому медленные connections не перевешивают быстрые, а хвост
+прогона не вытесняет его начало.
+
+Benchmark client по умолчанию ограничен `3 GiB`. Это учитывает пиковую память
+Python при слиянии latency reservoirs и переходе к `pgbench`; лимит и число
+samples можно изменить через `PGLC_BENCH_CLIENT_MEMORY` и
+`PGLC_BENCH_MAX_LATENCY_SAMPLES`. Если процесс будет убит до записи JSON,
+runner сохранит `process-failure.txt` для CI artifact.
 
 Suite следует официальным рекомендациям не сравнивать разные хранилища
 разными benchmark clients

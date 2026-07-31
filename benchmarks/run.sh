@@ -45,6 +45,7 @@ rm -f -- \
     "${output_directory}/comparison.md" \
     "${output_directory}/failure.json" \
     "${output_directory}/failure.md" \
+    "${output_directory}/process-failure.txt" \
     "${output_directory}/.comparison.json.tmp" \
     "${output_directory}/.comparison.md.tmp" \
     "${output_directory}/.failure.json.tmp" \
@@ -118,7 +119,17 @@ export PGLC_BENCH_SOURCE_REVISION
 
 "${compose[@]}" up --detach --wait \
     pg-local-cache postgres-plain valkey redis
-"${compose[@]}" run --rm benchmark
+benchmark_status=0
+"${compose[@]}" run --rm benchmark || benchmark_status="$?"
+if ((benchmark_status != 0)) && \
+    [[ ! -f "${output_directory}/comparison.json" ]] && \
+    [[ ! -f "${output_directory}/failure.json" ]]; then
+    printf 'benchmark process exited with status %s before writing a report\n' \
+        "$benchmark_status" > "${output_directory}/process-failure.txt"
+fi
+if ((benchmark_status != 0)); then
+    exit "$benchmark_status"
+fi
 
 printf 'Benchmark reports: %s/comparison.json and %s/comparison.md\n' \
     "$output_directory" "$output_directory"

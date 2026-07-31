@@ -38,7 +38,7 @@ def config(**overrides: object) -> object:
         "min_ops": 10_000.0,
         "client_cpus": 2.0,
         "server_cpus": 2.0,
-        "client_memory": "1g",
+        "client_memory": "3g",
         "server_memory": "1g",
         "pg_local_cache_workers": 1,
         "pg_jobs": 2,
@@ -97,6 +97,19 @@ class RespCodecTests(unittest.TestCase):
 
 
 class ReportingTests(unittest.TestCase):
+    def test_proven_full_run_memory_defaults(self) -> None:
+        with mock.patch.dict(
+            compare.os.environ,
+            {
+                "PGLC_BENCH_AUTH_TOKEN": "test-token",
+                "PGLC_BENCH_PG_PASSWORD": "test-password",
+            },
+            clear=True,
+        ):
+            defaults = compare.Config.from_environment()
+        self.assertEqual(defaults.max_latency_samples, 200_000)
+        self.assertEqual(defaults.client_memory, "3g")
+
     def test_latency_reservoir_samples_the_whole_stream(self) -> None:
         samples = array("d")
         generator = mock.Mock()
@@ -239,10 +252,10 @@ tps = 800.000000 (without initial connection time)
                 "pipeline": 32,
                 "keys": 16384,
                 "value_size": 128,
-                "max_latency_samples": 1_000_000,
+                "max_latency_samples": 200_000,
                 "server_cpus": 4,
                 "client_cpus": 4,
-                "client_memory": "1g",
+                "client_memory": "3g",
                 "pg_local_cache_workers": 4,
             },
             "resp_targets": {
