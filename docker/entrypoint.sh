@@ -44,12 +44,11 @@ max_worker_processes="${PG_LOCAL_CACHE_MAX_WORKER_PROCESSES:-16}"
 idle_timeout_ms="${PG_LOCAL_CACHE_IDLE_TIMEOUT_MS:-300000}"
 statement_timeout_ms="${PG_LOCAL_CACHE_STATEMENT_TIMEOUT_MS:-2000}"
 lock_timeout_ms="${PG_LOCAL_CACHE_LOCK_TIMEOUT_MS:-250}"
+singleflight_wait_ms="${PG_LOCAL_CACHE_SINGLEFLIGHT_WAIT_MS:-25}"
 max_pipeline_commands="${PG_LOCAL_CACHE_MAX_PIPELINE_COMMANDS:-256}"
 max_dirty_keys="${PG_LOCAL_CACHE_MAX_DIRTY_KEYS:-4096}"
 token_file="${PG_LOCAL_CACHE_AUTH_TOKEN_FILE:-/run/secrets/pg_local_cache_auth_token}"
-
-[[ "$token_file" != "$runtime_token" ]] \
-    || fail "PG_LOCAL_CACHE_AUTH_TOKEN_FILE must point to an input secret"
+runtime_token_config=""
 
 [[ "$database" =~ ^[A-Za-z_][A-Za-z0-9_$]{0,62}$ ]] \
     || fail "PG_LOCAL_CACHE_DATABASE must be an unquoted PostgreSQL identifier"
@@ -62,7 +61,7 @@ token_file="${PG_LOCAL_CACHE_AUTH_TOKEN_FILE:-/run/secrets/pg_local_cache_auth_t
 [[ "$bind_address" == "127.0.0.1" || "$bind_address" == "0.0.0.0" ]] \
     || fail "PG_LOCAL_CACHE_BIND_ADDRESS must be 127.0.0.1 or 0.0.0.0"
 
-require_integer_between "PG_LOCAL_CACHE_PORT" "$port" 1 65535
+require_integer_between "PG_LOCAL_CACHE_PORT" "$port" 0 65535
 require_integer_between "PG_LOCAL_CACHE_WORKERS" "$workers" 1 32
 require_integer_between "PG_LOCAL_CACHE_CACHE_ENTRIES" "$cache_entries" 128 65536
 require_integer_between \
@@ -74,35 +73,43 @@ require_integer_between \
 require_integer_between \
     "PG_LOCAL_CACHE_LOCK_TIMEOUT_MS" "$lock_timeout_ms" 10 60000
 require_integer_between \
+    "PG_LOCAL_CACHE_SINGLEFLIGHT_WAIT_MS" "$singleflight_wait_ms" 0 1000
+require_integer_between \
     "PG_LOCAL_CACHE_MAX_PIPELINE_COMMANDS" "$max_pipeline_commands" 1 4096
 require_integer_between \
     "PG_LOCAL_CACHE_MAX_DIRTY_KEYS" "$max_dirty_keys" 128 1048576
-(( max_worker_processes >= workers + 2 )) \
-    || fail "PG_LOCAL_CACHE_MAX_WORKER_PROCESSES must be at least workers + 2"
+if (( port != 0 )); then
+    (( max_worker_processes >= workers + 2 )) \
+        || fail "PG_LOCAL_CACHE_MAX_WORKER_PROCESSES must be at least workers + 2"
+    [[ "$token_file" != "$runtime_token" ]] \
+        || fail "PG_LOCAL_CACHE_AUTH_TOKEN_FILE must point to an input secret"
+    [[ -f "$token_file" ]] \
+        || fail "auth token file does not exist: ${token_file}"
+    [[ ! -L "$token_file" ]] \
+        || fail "auth token file must not be a symbolic link"
 
-[[ -f "$token_file" ]] \
-    || fail "auth token file does not exist: ${token_file}"
-[[ ! -L "$token_file" ]] \
-    || fail "auth token file must not be a symbolic link"
+    token_mode="$(stat -c '%a' "$token_file")"
+    [[ "$token_mode" == "600" ]] \
+        || fail "auth token file must have mode 0600 (actual: ${token_mode})"
 
-token_mode="$(stat -c '%a' "$token_file")"
-[[ "$token_mode" == "600" ]] \
-    || fail "auth token file must have mode 0600 (actual: ${token_mode})"
+    auth_token="$(<"$token_file")"
+    [[ "$auth_token" =~ ^[A-Za-z0-9_-]{32,256}$ ]] \
+        || fail "auth token must be 32-256 base64url characters"
 
-auth_token="$(<"$token_file")"
-[[ "$auth_token" =~ ^[A-Za-z0-9_-]{32,256}$ ]] \
-    || fail "auth token must be 32-256 base64url characters"
-
-if [[ "$bind_address" != "127.0.0.1" && ${#auth_token} -lt 32 ]]; then
-    fail "a non-loopback listener requires an auth token of at least 32 characters"
+    if [[ "$bind_address" != "127.0.0.1" && ${#auth_token} -lt 32 ]]; then
+        fail "a non-loopback listener requires an auth token of at least 32 characters"
+    fi
 fi
 
 [[ "$PGDATA" != *"'"* && "$PGDATA" != *$'\n'* ]] \
     || fail "PGDATA contains a character that cannot be safely placed in postgresql.conf"
 
 install -d -o postgres -g postgres -m 0700 "$runtime_directory"
-umask 077
-install -o postgres -g postgres -m 0600 "$token_file" "$runtime_token"
+if (( port != 0 )); then
+    umask 077
+    install -o postgres -g postgres -m 0600 "$token_file" "$runtime_token"
+    runtime_token_config="$runtime_token"
+fi
 
 export PG_LOCAL_CACHE_DATABASE="$database"
 export PG_LOCAL_CACHE_ROLE="$role"
@@ -120,9 +127,10 @@ temporary_config="${runtime_config}.tmp"
     printf "pg_local_cache.idle_timeout_ms = %s\n" "$idle_timeout_ms"
     printf "pg_local_cache.statement_timeout_ms = %s\n" "$statement_timeout_ms"
     printf "pg_local_cache.lock_timeout_ms = %s\n" "$lock_timeout_ms"
+    printf "pg_local_cache.singleflight_wait_ms = %s\n" "$singleflight_wait_ms"
     printf "pg_local_cache.max_pipeline_commands = %s\n" "$max_pipeline_commands"
     printf "pg_local_cache.max_dirty_keys = %s\n" "$max_dirty_keys"
-    printf "pg_local_cache.auth_token_file = '%s'\n" "$runtime_token"
+    printf "pg_local_cache.auth_token_file = '%s'\n" "$runtime_token_config"
     printf "pg_local_cache.allow_superuser = off\n"
     printf "max_worker_processes = %s\n" "$max_worker_processes"
 } > "$temporary_config"

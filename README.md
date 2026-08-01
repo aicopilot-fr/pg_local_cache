@@ -20,7 +20,10 @@ Redis/Valkey-процесс не нужен: TCP listener, shared cache, SQL fal
   `INVALIDATE`, `STAT`, `INFO`, минимальные `CLIENT`, `COMMAND`, `SELECT 0`
   и `QUIT`;
 - positive и negative cache в PostgreSQL shared memory;
+- прозрачный fast path для обычного parameterized SQL lookup по primary key:
+  тот же libpq/JDBC/ORM driver и тот же `SELECT`, без cache-specific client;
 - несколько `SO_REUSEPORT` workers и общий cache между ними;
+- bounded single-flight для одновременных cold `GET` одного ключа;
 - shared-lock hot path, bounded sampled eviction и O(1) epoch invalidation;
 - parameterized saved SPI plans;
 - автоматическая инвалидация после SQL `INSERT`, `UPDATE`, `DELETE`,
@@ -66,6 +69,25 @@ healthcheck и команду подключения таблицы. Собра�
 docker build --tag pg_local_cache:1.0.0 .
 docker run --rm pg_local_cache:1.0.0 pg_local_cache_attach --help
 ```
+
+Если нужен только прозрачный SQL cache без RESP listener, второй secret и
+отдельный порт не требуются. SQL-only Compose выставляет
+`pg_local_cache.port=0`, но оставляет shared memory, planner hook,
+транзакционные triggers и `local_cache.stats()`:
+
+```bash
+mkdir -p secrets
+umask 077
+openssl rand -base64 36 > secrets/postgres_password
+chmod 600 secrets/postgres_password
+
+docker compose -f compose.sql-only.yaml up --detach --build --wait
+psql 'postgresql://postgres@127.0.0.1:5432/app'
+```
+
+В этом режиме healthcheck не ждёт RESP workers и не читает cache token.
+`local_cache_worker` всё ещё создаётся как изолированная техническая роль для
+единого attach/mapping API, но сетевых background workers нет.
 
 На первом запуске можно изменить базу и dedicated role, задав одновременно
 `POSTGRES_DB`, такое же `PG_LOCAL_CACHE_DATABASE` и
@@ -120,8 +142,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.items TO app_user;
 
 В Docker достаточно одной команды. Она находит одиночный primary key,
 выдаёт `local_cache_worker` необходимые права и вызывает административный
-`register_mapping`, который сам создаёт и проверяет row/truncate
-`ENABLE ALWAYS` triggers:
+`register_mapping`, который сам создаёт и проверяет statement guard и
+row/truncate `ENABLE ALWAYS` triggers:
 
 ```bash
 docker compose exec postgres pg_local_cache_attach \
@@ -156,13 +178,96 @@ docker compose exec postgres pg_local_cache_attach \
 Эквивалентная ручная регистрация для native installation:
 
 ```sql
-GRANT SELECT, INSERT, UPDATE, DELETE
-    ON TABLE public.items TO local_cache_worker;
+-- Для таблицы из PK + одной value column достаточно relation:
+SELECT local_cache.attach_table('public.items'::regclass);
 
-SELECT local_cache.register_mapping(
-    'items', 'public.items', 'id', 'value', true
+-- Явная value column, namespace и writable RESP API:
+SELECT local_cache.attach_table(
+    'public.items'::regclass,
+    'value',
+    'items',
+    true
 );
 ```
+
+`attach_table` сам находит одиночный primary key, выдаёт dedicated worker role
+минимальные table/schema grants, регистрирует mapping и возвращает JSON с
+готовыми key/GET/SET/DEL templates. Это административная функция с
+`SECURITY DEFINER`, отозванная у `PUBLIC`; application role она не нужна.
+
+Низкоуровневый `register_mapping(namespace, relation, key_column,
+value_column, writable)` оставлен для миграций, которым нужен полный контроль
+ACL. В этом случае grants worker role выдаются вручную.
+
+### Drop-in SQL fast path без нового драйвера
+
+После `attach_table` приложение может продолжить отправлять обычный SQL через
+libpq, JDBC, Npgsql, psycopg или существующий ORM. Для fast path поддерживается
+узкая и предсказуемая форма lookup:
+
+```sql
+PREPARE get_item(bigint) AS
+SELECT value
+FROM public.items
+WHERE id = $1;
+
+EXECUTE get_item(42);
+```
+
+Также поддерживается `LIMIT 1`. Projection должна содержать ровно mapped
+value column, а predicate — ровно equality по mapped PK с `Const` или внешним
+parameter. Alias таблицы допустим. Join, `SELECT *`, дополнительные filters,
+sort, CTE, aggregate, row lock и expression над value не кешируются: PostgreSQL
+просто строит штатный план и возвращает правильный результат. Это fail-open по
+производительности, а не по данным.
+
+Обычные межтиповые integer lookup тоже прозрачны: например, PostgreSQL
+разбирает `bigint_id = 1` как `int8 = int4`. Fast path использует equality из
+того же B-tree opfamily и безопасно расширяет `int2/int4` key expression до
+типа PK; потенциально сужающие преобразования остаются на штатном плане.
+
+На тёплом positive entry CustomScan возвращает value из shared memory. На
+первом miss он выполняет сохранённый в плане штатный unique B-tree IndexScan,
+проверяет `ctid` и raw `xmin` на свежем MVCC snapshot и только затем публикует
+positive value. Поэтому специальная функция, второй порт или cache-aware
+driver не нужны. Отсутствующая строка и cached negative entry всегда идут в
+основную таблицу; transparent SQL path намеренно не публикует negative cache.
+
+Безопасные fallback обязательны:
+
+- `REPEATABLE READ` и `SERIALIZABLE` читают только PostgreSQL;
+- после собственного `INSERT`/`UPDATE`/`DELETE` в текущей транзакции cache
+  обходится до её завершения;
+- entry с `xmin`, невидимым statement snapshot, не используется;
+- FullXID age fence не позволяет raw 32-bit `xmin` пережить неоднозначное
+  окно transaction-ID wraparound;
+- disabled/изменённые triggers, RLS, recovery и неподдерживаемая форма запроса
+  отключают fast path;
+- commit invalidation и self-fill защищены одной системой
+  key/relation/global/config version fences; rollback не публикует invalidation.
+
+Application role нужны только обычные права на source table. Planner читает
+mapping внутри extension, но стандартная проверка ACL исходного `SELECT`
+остаётся обязательной; `USAGE` на `local_cache` приложению не выдаётся.
+Session kill switch доступен без superuser:
+
+```sql
+SET pg_local_cache.sql_cache = off;
+-- или только для текущей транзакции
+SET LOCAL pg_local_cache.sql_cache = off;
+```
+
+Проверить выбор fast path можно тем же запросом:
+
+```sql
+EXPLAIN (ANALYZE, COSTS OFF)
+SELECT value FROM public.items WHERE id = 42 LIMIT 1;
+```
+
+В плане будет `Custom Scan (pg_local_cache_sql)` с `Cache Namespace`, а при
+`ANALYZE` — `Cache Hits`, `Cache Misses` и `Cache Bypasses`. Суммарные
+`sql_cache_hits`, `sql_cache_misses`, `sql_cache_fills` и
+`sql_cache_bypasses` доступны в `local_cache.stats()`.
 
 Проверка через `redis-cli`:
 
@@ -197,7 +302,8 @@ sudo make PG_CONFIG=/path/to/pg_config install
 
 ```sql
 CREATE ROLE local_cache_worker
-    LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION;
+    LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION
+    NOBYPASSRLS;
 GRANT CONNECT ON DATABASE app TO local_cache_worker;
 ```
 
@@ -227,7 +333,8 @@ GRANT SELECT ON TABLE local_cache.mapping TO local_cache_worker;
 
 ## Конфигурация
 
-Все параметры имеют context `postmaster` и требуют restart.
+Все параметры, кроме явно отмеченного session GUC, имеют context `postmaster`
+и требуют restart.
 
 | GUC | Default | Назначение |
 |---|---:|---|
@@ -238,10 +345,12 @@ GRANT SELECT ON TABLE local_cache.mapping TO local_cache_worker;
 | `pg_local_cache.idle_timeout_ms` | `300000` | Idle/slow-client deadline |
 | `pg_local_cache.statement_timeout_ms` | `2000` | Полный SQL command deadline |
 | `pg_local_cache.lock_timeout_ms` | `250` | Lock wait deadline |
+| `pg_local_cache.singleflight_wait_ms` | `25` | Максимальное ожидание concurrent loader, `0..1000` ms |
 | `pg_local_cache.max_pipeline_commands` | `256` | Fairness budget команд за event-loop turn |
 | `pg_local_cache.max_dirty_keys` | `4096` | Переход к relation invalidation |
 | `pg_local_cache.auth_token_file` | empty | Production AUTH secret |
 | `pg_local_cache.allow_superuser` | `off` | Только локальная разработка |
+| `pg_local_cache.sql_cache` | `on` | `USERSET`: transparent ordinary-SQL fast path; restart не нужен |
 
 Одна cache entry занимает примерно 8.6 KiB до hash overhead. Значение
 `65536`, используемое Docker-профилем, требует около 0.55 GiB только для
@@ -298,6 +407,14 @@ primary `GET`, начавшийся после завершившегося SQL 
 возвращает более старое cached value. Пересекающийся с commit `GET` может
 вернуть старое или новое committed значение.
 
+При одновременном cold `GET` первый worker получает versioned load lease.
+Followers ждут не больше `singleflight_wait_ms`: если лидер успел, они берут
+его результат без SQL; если нет, выполняют собственный SQL для ответа, но не
+имеют права публиковать его поверх лидера. `0` отключает ожидание и уменьшает
+head-of-line blocking, ценой возможных duplicate reads. Crash/FATAL лидера не
+закрепляет entry навсегда: lease истекает, а новый generation fence запрещает
+late fill и ABA после eviction/recreate.
+
 Гарантия зависит от исправных extension triggers/event trigger. Worker
 проверяет их имя, функцию, type, arguments и `ENABLE ALWAYS`; при расхождении
 namespace перестаёт обслуживаться.
@@ -341,16 +458,30 @@ make load
 median `64918 ops/s`, p50 `6.082 ms`, p95 `16.388 ms`, p99 `26.943 ms`.
 Наблюдаемый raw throughput вырос в `3.69x` (`+268.6%`), а p50/p95/p99
 уменьшились на `72.2%`/`74.0%`/`74.2%`. Это два отдельных запуска на shared
-двухъядерном GitHub runner: контрольные Valkey/Redis/stock PostgreSQL между
-ними сдвинулись на `1.3–4.2%`, а нормализованный по контролям прирост составил
-`3.54–3.64x`. Поэтому результат является regression evidence для этой
-оптимизации, а не универсальной гарантией для любого CPU/container.
+двухъядерном GitHub runner. Поэтому результат является regression evidence
+для этой оптимизации, а не универсальной гарантией для любого CPU/container.
 
 CI повторяет короткий smoke gate `>=10000 warm GET/s`; перед production
 rollout повторите 30–60 second gate несколько раз на закреплённых CPU целевой
 машины и контролируйте p99. `SET`, `DEL`, cold miss и invalidation-heavy
 workloads измеряйте отдельно: они включают стоимость PostgreSQL transaction,
 storage, WAL и locks.
+
+Когда включён ordinary-SQL lane, у него есть независимый fail-closed gate
+`PGLC_BENCH_SQL_MIN_OPS` (default `10000`): проверяются не только ops/s, но и
+ровно один `sql_cache_hit` на каждый успешный timed `SELECT`, ноль miss/fill/
+bypass и отдельный cold miss→fill→hit proof.
+
+Дополнительные методологически раздельные сценарии — cold/warm GET,
+same-key stampede, RESP SET/DEL, direct/transparent prepared SQL, отдельный
+unnamed extended-protocol SQL (`Parse/Bind/Execute` на каждый lookup),
+обязательный ordinary-SQL cold miss→fill→hit, mapped/stock SQL writes и
+post-commit validation — описаны в
+[benchmarks/SCENARIOS.md](benchmarks/SCENARIOS.md).
+
+Prepared и extended SQL результаты не объединяются. У extended lane свой
+fail-closed порог `PGLC_BENCH_SQL_EXTENDED_MIN_OPS`; если он не задан, он
+наследует `PGLC_BENCH_SQL_MIN_OPS` (по умолчанию те же `10000 ops/s`).
 
 ## Сравнение с Valkey, Redis и прямым PostgreSQL
 
@@ -388,7 +519,6 @@ server container:
 | pg_local_cache | 239292 | 236072–243811 | 1.32% | 1.693 ms | 4.265 ms | 6.951 ms |
 | Valkey 9.1.1 | 235349 | 233980–235787 | 0.33% | 1.886 ms | 4.363 ms | 6.850 ms |
 | Redis 8.8.1 | 238019 | 235799–240762 | 0.85% | 1.849 ms | 4.358 ms | 6.694 ms |
-| stock PostgreSQL 16.14 | 47974 | 47479–48233 | 0.65% | — | — | — |
 
 `pg_local_cache` оказался на `1.7%` выше median Valkey и на `0.5%` выше
 Redis, но такая малая разница находится внутри вариативности shared runner и
@@ -399,6 +529,13 @@ Redis, но такая малая разница находится внутри
 ([JSON](benchmarks/reference/2026-07-31-transaction-safe-batching.json)).
 Исходный полный прогон также доступен в
 [GitHub Actions run 30660130760](https://github.com/aicopilot-fr/pg_local_cache/actions/runs/30660130760).
+
+Число stock PostgreSQL `47974 ops/s` из этих исторических артефактов
+считать валидным нельзя: runner ошибочно передавал `pgbench -d`, то есть
+включал per-command debug logging. RESP-замеры `pg_local_cache`/Valkey/Redis
+этим дефектом не затронуты. Флаг удалён, source-тест запрещает его возврат;
+новое stock PostgreSQL и ordinary-SQL значение будет опубликовано только
+после полного повторного прогона исправленного harness.
 
 Результат сохраняется в `benchmarks/results/comparison.json` и
 `comparison.md`: все отдельные run, median/min/max/CV, p50/p95/p99,
@@ -471,6 +608,14 @@ PG_LOCAL_CACHE_SMOKE_MIN_OPS=10000 \
 bash tests/docker_smoke.sh
 ```
 
+Отдельный tokenless smoke поднимает `compose.sql-only.yaml`, проверяет ноль
+RESP workers и запускает transparent-SQL suite под реальным `LOGIN
+NOSUPERUSER` пользователем:
+
+```bash
+bash tests/docker_sql_only_smoke.sh
+```
+
 Нативные source-level тесты компилируют реальный `src/resp.c` вне PostgreSQL и
 проверяют parser/encoder, каждый корректный усечённый prefix, malformed input,
 binary/NUL payload, граничные размеры и 30000 deterministic random,
@@ -496,6 +641,12 @@ deterministic collation, value-type allowlist, remap fence, relation-state GC,
 timeouts, каждый настроенный worker PID, full cache, race fence и 2PC
 rejection.
 
+Отдельный transparent-SQL black-box suite работает под реальной
+`LOGIN NOSUPERUSER` role без `USAGE` на `local_cache`. Он проверяет cold
+self-fill, warm hit, prepared parameter и `LIMIT 1`, `EXPLAIN`, session GUC,
+отсутствующую строку, rollback/commit invalidation, own-write bypass,
+`REPEATABLE READ` fallback, неподдерживаемый query fallback и сохранение ACL.
+
 Workflow `.github/workflows/ci.yml` выполняет независимые профили на push,
 PR и ручном запуске: source unit/sanitizers, односекундный Docker smoke всего
 comparative stack и `pgbench`, correctness с cache `128`, включённым 2PC и
@@ -508,8 +659,11 @@ comparative stack и `pgbench`, correctness с cache `128`, включённым
 
 `STAT` и `local_cache.stats()` возвращают:
 
-- active/positive/negative/dirty entries и relation states;
+- active/expired loading leases, positive/negative/dirty entries и relation
+  states;
 - hits, misses, negative hits, evictions;
+- transparent SQL hits, misses, verified fills и safety bypasses;
+- single-flight leader/waiter/reuse/timeout counters;
 - database reads/writes и invalidations;
 - active/rejected connections, AUTH/protocol failures, output backpressure
   events и slow-client drops;
@@ -528,8 +682,18 @@ timeout errors и рестартами workers. Cache недолговечен �
 - value types: `int2`, `int4`, `int8`, `numeric`, `bool`, `text`, `varchar`,
   `bpchar`, `uuid`, `json`, `jsonb`; domain, enum и composite запрещены;
 - key требует full immediate single-column `UNIQUE` B-tree с default equality;
-- RLS, partitions, foreign/temp/unlogged tables, nondeterministic collations и
-  composite keys не поддерживаются;
+- RLS, table inheritance/partitions, foreign/temp/unlogged tables,
+  nondeterministic collations и composite keys не поддерживаются; worker SQL
+  дополнительно использует `ONLY`, чтобы поздно добавленный child не изменил
+  семантику уже подготовленного mapping;
+- mapped relation должна быть standalone: нельзя подключить ни parent с
+  children, ни inheritance child, ни declarative partition;
+- `ROLLBACK TO SAVEPOINT` после записи в mapped table может оставить только
+  консервативный dirty marker до конца внешней транзакции. Это способно дать
+  лишний bypass/invalidation (и консервативно отклонить 2PC), но не stale read;
+- transparent SQL fast path дополнительно не принимает `bpchar` key и
+  кеширует только точный scalar `SELECT value WHERE pk = Const/$1` с
+  необязательным `LIMIT 1`; все прочие запросы штатно исполняет PostgreSQL;
 - writable mapping не поддерживает generated/identity key/value columns;
 - `SET` передаёт только key/value; другие `NOT NULL` columns требуют default;
 - нет TTL, `MGET`, `MULTI/WATCH`, Lua, Pub/Sub, NX/XX/EX/PX и RESP3;

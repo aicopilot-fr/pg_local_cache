@@ -58,8 +58,14 @@ jobs:
       - name: Validate benchmark source
         run: |
           bash -n benchmarks/run.sh
-          python3 -m py_compile benchmarks/compare.py tests/benchmark_test.py
-          python3 -m unittest -v tests/benchmark_test.py
+          python3 -m py_compile \
+            benchmarks/compare.py \
+            benchmarks/scenarios.py \
+            tests/benchmark_test.py \
+            tests/scenario_benchmark_test.py
+          python3 -m unittest -v \
+            tests/benchmark_test.py \
+            tests/scenario_benchmark_test.py
 
       - name: Run identical RESP comparison and PostgreSQL reference
         env:
@@ -69,6 +75,11 @@ jobs:
           PGLC_BENCH_PIPELINE: ${{ inputs.pipeline || '32' }}
           PGLC_BENCH_PG_LOCAL_CACHE_WORKERS: ${{ inputs.workers || '4' }}
           PGLC_BENCH_KEYS: ${{ inputs.keys || '16384' }}
+          PGLC_BENCH_REQUIRE_SINGLE_FLIGHT: "1"
+          PGLC_BENCH_SINGLEFLIGHT_WAIT_MS: "250"
+          PGLC_BENCH_SQL_DIRECT_SETUP: "SET pg_local_cache.sql_cache = off"
+          PGLC_BENCH_SQL_FAST_PATH_SETUP: "SET pg_local_cache.sql_cache = on"
+          PGLC_BENCH_SQL_MIN_OPS: "10000"
           PGLC_BENCH_SERVER_CPUS: "2"
           PGLC_BENCH_CLIENT_CPUS: "2"
           PGLC_BENCH_OUTPUT_DIR: ${{ github.workspace }}/benchmark-results
@@ -81,6 +92,11 @@ jobs:
             cat benchmark-results/comparison.md >> "$GITHUB_STEP_SUMMARY"
           elif [[ -f benchmark-results/failure.md ]]; then
             cat benchmark-results/failure.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -f benchmark-results/scenarios.md ]]; then
+            cat benchmark-results/scenarios.md >> "$GITHUB_STEP_SUMMARY"
+          elif [[ -f benchmark-results/scenarios-failure.md ]]; then
+            cat benchmark-results/scenarios-failure.md >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload machine-readable and Markdown reports

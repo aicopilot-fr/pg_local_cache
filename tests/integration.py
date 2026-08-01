@@ -9,7 +9,9 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 
 PSQL = os.environ.get("PG_LOCAL_CACHE_PSQL", "psql")
@@ -116,6 +118,27 @@ def sql(query: str) -> str:
     ).strip()
 
 
+def sql_script(script: str) -> str:
+    return subprocess.check_output(
+        [
+            PSQL,
+            "-X",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-h",
+            PGHOST,
+            "-p",
+            PGPORT,
+            "-d",
+            PGDATABASE,
+            "-Atq",
+        ],
+        input=script,
+        text=True,
+        stderr=subprocess.STDOUT,
+    ).strip()
+
+
 def sql_fails(query: str, expected: str) -> None:
     result = subprocess.run(
         psql_args(query), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
@@ -179,10 +202,15 @@ def main() -> None:
     remap_a_table = f"pglc_it_remap_a_{suffix}"
     remap_b_table = f"pglc_it_remap_b_{suffix}"
     unrelated_table = f"pglc_unrelated_{suffix}"
+    inherited_table = f"pglc_inherited_{suffix}"
+    partition_parent = f"pglc_partition_parent_{suffix}"
     rls_table = f"pglc_it_rls_{suffix}"
     partial_table = f"pglc_it_partial_{suffix}"
     collation_table = f"pglc_it_collation_{suffix}"
     collation = f"pglc_it_nd_{suffix}"
+    nested_read_function = f"pglc_nested_read_{suffix}"
+    nested_trigger_function = f"pglc_nested_trigger_{suffix}"
+    nested_trigger = f"aaa_pglc_nested_{suffix}"
     namespace = f"it{suffix}"
     second_namespace = f"itsecond{suffix}"
     typmod_namespace = f"ittypmod{suffix}"
@@ -190,14 +218,21 @@ def main() -> None:
     client: RespClient | None = None
 
     sql("CREATE EXTENSION IF NOT EXISTS pg_local_cache")
-    sql(
-        f"CREATE TABLE public.{table}"
-        " (id bigint PRIMARY KEY, value text NOT NULL);"
-        f"INSERT INTO public.{table} VALUES (1, 'one');"
-        f"{grant_worker(table)}"
-        f"SELECT local_cache.register_mapping('{namespace}',"
-        f" 'public.{table}', 'id', 'value', true)"
+    attached = json.loads(
+        sql(
+            "SET client_min_messages = warning;"
+            f"CREATE TABLE public.{table}"
+            " (id bigint PRIMARY KEY, value text NOT NULL);"
+            f"INSERT INTO public.{table} VALUES (1, 'one');"
+            f"SELECT local_cache.attach_table('public.{table}', 'value',"
+            f" '{namespace}', true)"
+        )
     )
+    assert attached["namespace"] == namespace, attached
+    assert attached["primary_key_column"] == "id", attached
+    assert attached["value_column"] == "value", attached
+    assert attached["writable"] is True, attached
+    assert attached["templates"]["get"] == f"GET {namespace}:<id>", attached
 
     try:
         if AUTH_TOKEN:
@@ -302,6 +337,39 @@ def main() -> None:
         assert wait_for_mapping(client, f"{namespace}:1") == "one"
         assert client.command("GET", f"{namespace}:1") == "one"
 
+        # A cold-key wave must collapse to one SQL lookup across RESP workers.
+        configured_workers = int(sql("SHOW pg_local_cache.workers"))
+        stampede_clients = [
+            RespClient() for _ in range(max(2, configured_workers * 2))
+        ]
+        try:
+            client.command("INVALIDATE", namespace)
+            before_stampede = json.loads(client.command("STAT"))
+            reads_before_stampede = before_stampede["database_reads"]
+            stampede_barrier = threading.Barrier(len(stampede_clients))
+
+            def cold_get(probe: RespClient) -> object:
+                stampede_barrier.wait(timeout=5)
+                return probe.command("GET", f"{namespace}:1")
+
+            with ThreadPoolExecutor(max_workers=len(stampede_clients)) as pool:
+                observed = list(pool.map(cold_get, stampede_clients))
+            assert observed == ["one"] * len(stampede_clients), observed
+            stampede_stats = json.loads(client.command("STAT"))
+            assert (
+                stampede_stats["database_reads"] - reads_before_stampede == 1
+            ), stampede_stats
+            assert stampede_stats["singleflight_leaders"] > 0
+            waiter_delta = (
+                stampede_stats["singleflight_waiters"]
+                - before_stampede["singleflight_waiters"]
+            )
+            assert 0 <= waiter_delta < len(stampede_clients), stampede_stats
+            assert stampede_stats["loading_entries"] == 0
+        finally:
+            for probe in stampede_clients:
+                probe.close()
+
         for bogus in range(1050):
             try:
                 client.command("INVALIDATE", f"bogus{suffix}_{bogus}")
@@ -323,6 +391,72 @@ def main() -> None:
             " WHERE id = 1; ROLLBACK"
         )
         assert client.command("GET", f"{namespace}:1") == "two"
+
+        # The statement guard must run before any row trigger.  Cache each
+        # helper SELECT plan while the backend is still clean, then make an
+        # alphabetically earlier user AFTER trigger read the just-written row.
+        # Without the BEFORE STATEMENT guard, both UPDATE and DELETE can read a
+        # warm stale entry before our exact AFTER invalidator gets control.
+        sql(
+            f"INSERT INTO public.{table} VALUES (77, 'delete-old');"
+            f"CREATE FUNCTION public.{nested_read_function}(p_id bigint) "
+            "RETURNS text LANGUAGE plpgsql VOLATILE AS $read$ "
+            "DECLARE observed text; BEGIN "
+            f"SELECT value INTO observed FROM public.{table} WHERE id = p_id; "
+            "RETURN observed; END $read$;"
+            f"CREATE FUNCTION public.{nested_trigger_function}() "
+            "RETURNS trigger LANGUAGE plpgsql AS $trigger$ "
+            "DECLARE observed text; BEGIN "
+            "IF TG_OP = 'UPDATE' THEN "
+            f"observed := public.{nested_read_function}(NEW.id); "
+            "IF observed IS DISTINCT FROM NEW.value THEN "
+            "RAISE EXCEPTION 'stale nested UPDATE read: %, expected %', "
+            "observed, NEW.value; END IF; RETURN NEW; "
+            "ELSIF TG_OP = 'DELETE' THEN "
+            f"observed := public.{nested_read_function}(OLD.id); "
+            "IF observed IS NOT NULL THEN "
+            "RAISE EXCEPTION 'stale nested DELETE read: %', observed; "
+            "END IF; RETURN OLD; END IF; RETURN NULL; END $trigger$;"
+            f"CREATE TRIGGER {nested_trigger} "
+            f"AFTER UPDATE OR DELETE ON public.{table} FOR EACH ROW "
+            f"EXECUTE FUNCTION public.{nested_trigger_function}()"
+        )
+        assert client.command("GET", f"{namespace}:77") == "delete-old"
+        sql_script(
+            f"SELECT public.{nested_read_function}(1);\n"
+            "BEGIN;\n"
+            f"UPDATE public.{table} SET value = 'nested-rolled-back' "
+            "WHERE id = 1;\n"
+            "ROLLBACK;\n"
+        )
+        assert client.command("GET", f"{namespace}:1") == "two"
+        sql_script(
+            f"SELECT public.{nested_read_function}(1);\n"
+            "BEGIN;\n"
+            f"UPDATE public.{table} SET value = 'nested-committed' "
+            "WHERE id = 1;\n"
+            "COMMIT;\n"
+        )
+        assert client.command("GET", f"{namespace}:1") == "nested-committed"
+        sql_script(
+            f"SELECT public.{nested_read_function}(77);\n"
+            "BEGIN;\n"
+            f"DELETE FROM public.{table} WHERE id = 77;\n"
+            "ROLLBACK;\n"
+        )
+        assert client.command("GET", f"{namespace}:77") == "delete-old"
+        sql_script(
+            f"SELECT public.{nested_read_function}(77);\n"
+            "BEGIN;\n"
+            f"DELETE FROM public.{table} WHERE id = 77;\n"
+            "COMMIT;\n"
+        )
+        assert client.command("GET", f"{namespace}:77") is None
+        sql(
+            f"DROP TRIGGER {nested_trigger} ON public.{table};"
+            f"DROP FUNCTION public.{nested_trigger_function}();"
+            f"DROP FUNCTION public.{nested_read_function}(bigint)"
+        )
 
         assert client.command("SET", f"{namespace}:1", "from-resp") == "OK"
         assert sql(f"SELECT value FROM public.{table} WHERE id = 1") == "from-resp"
@@ -362,6 +496,46 @@ def main() -> None:
         sql(f"ALTER TABLE public.{table} ADD COLUMN note text")
         assert client.command("GET", f"{namespace}:1") == "from-resp"
 
+        # A plan prepared before guard drift must fail closed at Begin even
+        # after the DDL transaction resets the backend-local dirty marker.
+        guard_drift = sql_script(
+            "SET client_min_messages = warning;\n"
+            "SET plan_cache_mode = force_generic_plan;\n"
+            f"PREPARE pglc_guard_{suffix}(bigint) AS "
+            f"SELECT value FROM public.{table} WHERE id = $1;\n"
+            f"EXPLAIN (ANALYZE, COSTS OFF) EXECUTE pglc_guard_{suffix}(1);\n"
+            "BEGIN;\n"
+            f"ALTER TABLE public.{table} DISABLE TRIGGER "
+            "pg_local_cache_statement_guard;\n"
+            "COMMIT;\n"
+            f"EXPLAIN (ANALYZE, COSTS OFF) EXECUTE pglc_guard_{suffix}(1);\n"
+            "BEGIN;\n"
+            f"ALTER TABLE public.{table} ENABLE ALWAYS TRIGGER "
+            "pg_local_cache_statement_guard;\n"
+            "COMMIT;\n"
+            f"DEALLOCATE pglc_guard_{suffix};\n"
+        )
+        assert "Custom Scan (pg_local_cache_sql)" in guard_drift, guard_drift
+        assert (
+            "Cache Bypasses: 1" in guard_drift
+            or "Index Scan using" in guard_drift
+        ), guard_drift
+        assert wait_for_mapping(client, f"{namespace}:1") == "from-resp"
+        sql(
+            f"ALTER TABLE public.{table}"
+            " DISABLE TRIGGER pg_local_cache_statement_guard"
+        )
+        wait_for_unavailable_mapping(client, f"{namespace}:1")
+        guard_plan = sql(
+            f"EXPLAIN (COSTS OFF) SELECT value FROM public.{table} WHERE id = 1"
+        )
+        assert "pg_local_cache_sql" not in guard_plan, guard_plan
+        sql(
+            f"ALTER TABLE public.{table}"
+            " ENABLE ALWAYS TRIGGER pg_local_cache_statement_guard"
+        )
+        assert wait_for_mapping(client, f"{namespace}:1") == "from-resp"
+
         sql(
             f"ALTER TABLE public.{table}"
             " DISABLE TRIGGER pg_local_cache_row_invalidate"
@@ -378,20 +552,110 @@ def main() -> None:
         )
         wait_for_unavailable_mapping(client, f"{namespace}:1")
         sql(
+            "CREATE TRIGGER pg_local_cache_row_invalidate "
+            f"AFTER INSERT OR UPDATE OR DELETE ON public.{table} "
+            "FOR EACH ROW WHEN (false) "
+            "EXECUTE FUNCTION local_cache._row_invalidate("
+            f"'{namespace}', 'id');"
+            f"ALTER TABLE public.{table} ENABLE ALWAYS TRIGGER "
+            "pg_local_cache_row_invalidate"
+        )
+        wait_for_unavailable_mapping(client, f"{namespace}:1")
+        sql(
             f"SELECT local_cache.register_mapping('{namespace}',"
             f" 'public.{table}', 'id', 'value', true)"
         )
         assert wait_for_mapping(client, f"{namespace}:1") == "from-resp"
 
+        # PostgreSQL table inheritance does not inherit the parent's UNIQUE
+        # index or invalidation triggers.  Creating a child after registration
+        # must therefore make the mapping fail closed; transparent SQL retains
+        # ordinary inheritance semantics instead of returning the parent's
+        # cached row.  Dropping the last child must restore both interfaces
+        # automatically even though PostgreSQL can retain relhassubclass=true.
         sql(
-            f"CREATE TABLE public.{second_table}"
-            " (id uuid PRIMARY KEY, value text NOT NULL);"
-            f"INSERT INTO public.{second_table}"
-            " VALUES ('00000000-0000-0000-0000-000000000001', 'uuid-value');"
-            f"{grant_worker(second_table)}"
-            f"SELECT local_cache.register_mapping('{second_namespace}',"
-            f" 'public.{second_table}', 'id', 'value', false)"
+            f"CREATE TABLE public.{inherited_table} () "
+            f"INHERITS (public.{table});"
+            f"INSERT INTO public.{inherited_table} (id, value) "
+            "VALUES (1, 'from-child')"
         )
+        sql_fails(
+            f"SELECT local_cache.attach_table("
+            f"'public.{inherited_table}'::regclass, 'value')",
+            "table inheritance is not supported by pg_local_cache",
+        )
+        wait_for_unavailable_mapping(client, f"{namespace}:1")
+        inherited_plan = sql(
+            f"EXPLAIN (COSTS OFF) SELECT value FROM public.{table} WHERE id = 1"
+        )
+        assert "pg_local_cache_sql" not in inherited_plan, inherited_plan
+        sql(f"DROP TABLE public.{inherited_table}")
+        assert wait_for_mapping(client, f"{namespace}:1") == "from-resp"
+        recovered_plan = sql(
+            f"EXPLAIN (COSTS OFF) SELECT value FROM public.{table} WHERE id = 1"
+        )
+        assert "pg_local_cache_sql" in recovered_plan, recovered_plan
+
+        # A mapped standalone table can later be attached as a declarative
+        # partition.  The DDL event names the partitioned parent on some
+        # PostgreSQL paths, so validate the symmetric pg_inherits lookup: the
+        # worker must fail closed, prepared SQL must not use the cache, and a
+        # DETACH must recover automatically through the incomplete-map retry.
+        sql(
+            f"CREATE TABLE public.{partition_parent}"
+            f" (LIKE public.{table} INCLUDING ALL)"
+            " PARTITION BY RANGE (id);"
+            f"ALTER TABLE public.{partition_parent} ATTACH PARTITION "
+            f"public.{table} FOR VALUES FROM (MINVALUE) TO (MAXVALUE)"
+        )
+        sql_fails(
+            f"SELECT local_cache.attach_table('public.{table}'::regclass, "
+            f"'value', '{namespace}', true)",
+            "table inheritance is not supported by pg_local_cache",
+        )
+        wait_for_unavailable_mapping(client, f"{namespace}:1")
+        partition_plan = sql(
+            f"EXPLAIN (COSTS OFF) SELECT value FROM ONLY public.{table} "
+            "WHERE id = 1"
+        )
+        assert "pg_local_cache_sql" not in partition_plan, partition_plan
+        sql(
+            f"ALTER TABLE public.{partition_parent} DETACH PARTITION "
+            f"public.{table}"
+        )
+        assert wait_for_mapping(client, f"{namespace}:1") == "from-resp"
+        detached_plan = sql(
+            f"EXPLAIN (COSTS OFF) SELECT value FROM public.{table} WHERE id = 1"
+        )
+        assert "pg_local_cache_sql" in detached_plan, detached_plan
+        sql(f"DROP TABLE public.{partition_parent}")
+
+        generation_refresh = sql_script(
+            "SET client_min_messages = warning;\n"
+            "SET plan_cache_mode = force_generic_plan;\n"
+            f"PREPARE pglc_generation_{suffix}(bigint) AS "
+            f"SELECT value FROM public.{table} WHERE id = $1;\n"
+            f"EXPLAIN (ANALYZE, COSTS OFF) EXECUTE "
+            f"pglc_generation_{suffix}(1);\n"
+            "BEGIN;\n"
+            f"CREATE TABLE public.{second_table}"
+            " (id uuid PRIMARY KEY, value text NOT NULL);\n"
+            f"INSERT INTO public.{second_table}"
+            " VALUES ('00000000-0000-0000-0000-000000000001', 'uuid-value');\n"
+            f"{grant_worker(second_table)}\n"
+            f"SELECT local_cache.register_mapping('{second_namespace}',"
+            f" 'public.{second_table}', 'id', 'value', false);\n"
+            "COMMIT;\n"
+            f"EXPLAIN (ANALYZE, COSTS OFF) EXECUTE "
+            f"pglc_generation_{suffix}(1);\n"
+            f"EXPLAIN (ANALYZE, COSTS OFF) EXECUTE "
+            f"pglc_generation_{suffix}(1);\n"
+            f"DEALLOCATE pglc_generation_{suffix};\n"
+        )
+        assert generation_refresh.count("Custom Scan (pg_local_cache_sql)") == 3, generation_refresh
+        assert generation_refresh.count("Cache Hits: 1") == 2, generation_refresh
+        assert generation_refresh.count("Cache Misses: 1") == 1, generation_refresh
+        assert generation_refresh.count("Cache Bypasses: 0") == 3, generation_refresh
         assert (
             wait_for_mapping(
                 client,
@@ -480,6 +744,7 @@ def main() -> None:
             elapsed = time.monotonic() - started
             assert elapsed < min(statement_timeout_ms, lock_timeout_ms) / 1000 + 1
             assert client.command("PING") == "PONG"
+            assert json.loads(client.command("STAT"))["loading_entries"] == 0
         finally:
             if locker.poll() is None:
                 locker.terminate()
@@ -507,9 +772,26 @@ def main() -> None:
                 "(provider = icu, locale = 'und-u-ks-level2', "
                 "deterministic = false);"
                 f"CREATE TABLE public.{collation_table} "
-                f"(id text COLLATE public.{collation} PRIMARY KEY, "
-                "value text NOT NULL)"
+                "(id text COLLATE \"C\" PRIMARY KEY, value text NOT NULL);"
+                f"INSERT INTO public.{collation_table} VALUES ('FOO', 'one');"
+                f"{grant_worker(collation_table)}"
+                f"SELECT local_cache.register_mapping('itcoll{suffix}',"
+                f" 'public.{collation_table}', 'id', 'value', false)"
             )
+            assert client.command("GET", f"itcoll{suffix}:FOO") == "one"
+            sql(
+                f"ALTER TABLE public.{collation_table} ALTER COLUMN id "
+                f"TYPE text COLLATE public.{collation} USING id::text"
+            )
+            wait_for_unavailable_mapping(client, f"itcoll{suffix}:FOO")
+            nondeterministic_plan = sql(
+                f"EXPLAIN (COSTS OFF) SELECT value "
+                f"FROM public.{collation_table} WHERE id = 'foo'"
+            )
+            assert "pg_local_cache_sql" not in nondeterministic_plan, (
+                nondeterministic_plan
+            )
+            sql(f"SELECT local_cache.unregister_mapping('itcoll{suffix}')")
             sql_fails(
                 f"SELECT local_cache.register_mapping('itcoll{suffix}',"
                 f" 'public.{collation_table}', 'id', 'value', false)",
@@ -552,7 +834,6 @@ def main() -> None:
         assert post_remap_stats["pending_forget"] == 0
         assert post_remap_stats["relation_states"] <= relation_states_before
 
-        configured_workers = int(sql("SHOW pg_local_cache.workers"))
         expected_worker_ids = {
             int(pid)
             for pid in sql(
@@ -709,7 +990,8 @@ def main() -> None:
         print(
             "ok: auth, RESP GET/SET/DEL, positive/negative cache, "
             "SQL/DDL/TRUNCATE invalidation, rollback, key moves, "
-            "trigger fail-closed, multi-mapping reload, RLS rejection, "
+            "trigger/inheritance/partition fail-closed and recovery, "
+            "multi-mapping reload, RLS rejection, "
             "index/collation/typmod/value-type validation, "
             "remap fence and state GC, "
             "cache-full multi-row fence, race fence, 2PC rejection, "
@@ -725,6 +1007,8 @@ def main() -> None:
                 f"SELECT local_cache.unregister_mapping('{typmod_namespace}');"
                 f"SELECT local_cache.unregister_mapping('{remap_namespace}');"
                 f"SELECT local_cache.unregister_mapping('{namespace}');"
+                f"DROP FUNCTION IF EXISTS public.{nested_trigger_function}() CASCADE;"
+                f"DROP FUNCTION IF EXISTS public.{nested_read_function}(bigint) CASCADE;"
                 f"DROP TABLE IF EXISTS public.{second_table};"
                 f"DROP TABLE IF EXISTS public.{typmod_table};"
                 f"DROP TABLE IF EXISTS public.{enum_table};"
@@ -732,6 +1016,8 @@ def main() -> None:
                 f"DROP TABLE IF EXISTS public.{remap_a_table};"
                 f"DROP TABLE IF EXISTS public.{remap_b_table};"
                 f"DROP TABLE IF EXISTS public.{unrelated_table};"
+                f"DROP TABLE IF EXISTS public.{inherited_table};"
+                f"DROP TABLE IF EXISTS public.{partition_parent};"
                 f"DROP TABLE IF EXISTS public.{rls_table};"
                 f"DROP TABLE IF EXISTS public.{partial_table};"
                 f"DROP TABLE IF EXISTS public.{collation_table};"

@@ -21,6 +21,11 @@ RETURNS trigger
 AS 'MODULE_PATHNAME', 'pg_local_cache_truncate_invalidate'
 LANGUAGE C;
 
+CREATE FUNCTION _statement_guard()
+RETURNS trigger
+AS 'MODULE_PATHNAME', 'pg_local_cache_statement_guard'
+LANGUAGE C;
+
 CREATE FUNCTION _reload()
 RETURNS void
 AS 'MODULE_PATHNAME', 'pg_local_cache_reload'
@@ -39,6 +44,21 @@ BEGIN
           JOIN local_cache.mapping AS m
             ON (
                 d.objid = m.relation::oid
+                OR (
+                    d.classid = 'pg_catalog.pg_class'::regclass
+                    AND EXISTS (
+                        SELECT 1
+                          FROM pg_catalog.pg_inherits AS inh
+                         WHERE (
+                                   inh.inhrelid = d.objid
+                               AND inh.inhparent = m.relation
+                               )
+                            OR (
+                                   inh.inhparent = d.objid
+                               AND inh.inhrelid = m.relation
+                               )
+                    )
+                )
                 OR (
                     d.classid = 'pg_catalog.pg_class'::regclass
                     AND EXISTS (
@@ -119,11 +139,10 @@ BEGIN
                     )
                 )
                 /*
-                 * pg_event_trigger_dropped_objects() retains an index OID
-                 * after pg_index has gone, so its former table cannot be
-                 * resolved here.  Permanent index drops are rare and are
-                 * conservatively treated as mapping changes.  Temporary
-                 * objects are excluded below.
+                 * Once an index has been dropped, its former owning table
+                 * cannot be resolved from the catalogs.  Permanent index drops
+                 * are rare and are conservatively treated as mapping changes.
+                 * Temporary objects are excluded below.
                  */
                 OR (
                     d.classid = 'pg_catalog.pg_class'::regclass
@@ -178,6 +197,7 @@ DECLARE
     v_old_relation oid;
     v_relkind "char";
     v_relpersistence "char";
+    v_relispartition boolean;
     v_relrowsecurity boolean;
     v_relforcerowsecurity boolean;
     v_key_generated "char";
@@ -194,15 +214,29 @@ BEGIN
         RAISE EXCEPTION 'key and value columns must be different';
     END IF;
 
-    SELECT c.relkind, c.relpersistence,
+    SELECT c.relkind, c.relpersistence, c.relispartition,
            c.relrowsecurity, c.relforcerowsecurity
-      INTO v_relkind, v_relpersistence,
+      INTO v_relkind, v_relpersistence, v_relispartition,
            v_relrowsecurity, v_relforcerowsecurity
       FROM pg_class AS c
      WHERE c.oid = p_relation;
 
     IF v_relkind <> 'r' OR v_relpersistence <> 'p' THEN
-        RAISE EXCEPTION 'pg_local_cache alpha supports only permanent ordinary tables';
+        RAISE EXCEPTION 'pg_local_cache supports only permanent ordinary tables';
+    END IF;
+
+    -- relhassubclass can remain true after the last child is dropped, so use
+    -- exact pg_inherits rows in both directions.  relispartition also makes
+    -- the declarative-partition exclusion explicit.
+    IF v_relispartition OR EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_inherits AS inh
+         WHERE inh.inhparent = p_relation
+            OR inh.inhrelid = p_relation
+    ) THEN
+        RAISE EXCEPTION 'table inheritance is not supported by pg_local_cache'
+            USING HINT =
+                'Attach a standalone table with no inheritance parent or children.';
     END IF;
 
     IF v_relrowsecurity OR v_relforcerowsecurity THEN
@@ -354,6 +388,10 @@ BEGIN
             SELECT 1 FROM pg_class AS c WHERE c.oid = v_old_relation
         ) THEN
             EXECUTE format(
+                'DROP TRIGGER IF EXISTS pg_local_cache_statement_guard ON %s',
+                v_old_relation::regclass
+            );
+            EXECUTE format(
                 'DROP TRIGGER IF EXISTS pg_local_cache_row_invalidate ON %s',
                 v_old_relation::regclass
             );
@@ -381,6 +419,22 @@ BEGIN
         key_column = EXCLUDED.key_column,
         value_column = EXCLUDED.value_column,
         writable = EXCLUDED.writable;
+
+    EXECUTE format(
+        'DROP TRIGGER IF EXISTS pg_local_cache_statement_guard ON %s',
+        p_relation
+    );
+    EXECUTE format(
+        'CREATE TRIGGER pg_local_cache_statement_guard
+           BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON %s
+           FOR EACH STATEMENT
+           EXECUTE FUNCTION local_cache._statement_guard()',
+        p_relation
+    );
+    EXECUTE format(
+        'ALTER TABLE %s ENABLE ALWAYS TRIGGER pg_local_cache_statement_guard',
+        p_relation
+    );
 
     EXECUTE format(
         'DROP TRIGGER IF EXISTS pg_local_cache_row_invalidate ON %s',
@@ -437,6 +491,10 @@ BEGIN
             SELECT 1 FROM pg_class AS c WHERE c.oid = v_relation
         ) THEN
             EXECUTE format(
+                'DROP TRIGGER IF EXISTS pg_local_cache_statement_guard ON %s',
+                v_relation::regclass
+            );
+            EXECUTE format(
                 'DROP TRIGGER IF EXISTS pg_local_cache_row_invalidate ON %s',
                 v_relation::regclass
             );
@@ -450,9 +508,256 @@ BEGIN
 END;
 $function$;
 
+CREATE FUNCTION attach_table(
+    p_relation regclass,
+    p_value_column name DEFAULT NULL,
+    p_namespace text DEFAULT NULL,
+    p_writable boolean DEFAULT false
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $function$
+DECLARE
+    v_schema_name name;
+    v_relation_name name;
+    v_relkind "char";
+    v_relpersistence "char";
+    v_relispartition boolean;
+    v_primary_key_columns integer;
+    v_key_column name;
+    v_value_column name;
+    v_value_candidates integer;
+    v_namespace text;
+    v_worker_role text;
+    v_worker_is_superuser boolean;
+    v_worker_is_dedicated boolean;
+    v_existing_namespace text;
+    v_qualified_relation text;
+    v_key_template text;
+BEGIN
+    IF p_relation IS NULL THEN
+        RAISE EXCEPTION 'pg_local_cache relation must not be NULL';
+    END IF;
+    IF p_writable IS NULL THEN
+        RAISE EXCEPTION 'pg_local_cache writable flag must not be NULL';
+    END IF;
+
+    SELECT n.nspname, c.relname, c.relkind, c.relpersistence,
+           c.relispartition
+      INTO v_schema_name, v_relation_name, v_relkind, v_relpersistence,
+           v_relispartition
+      FROM pg_catalog.pg_class AS c
+      JOIN pg_catalog.pg_namespace AS n
+        ON n.oid = c.relnamespace
+     WHERE c.oid = p_relation;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_local_cache relation % does not exist', p_relation;
+    END IF;
+    IF v_relkind <> 'r' OR v_relpersistence <> 'p' THEN
+        RAISE EXCEPTION
+            'pg_local_cache can attach only a permanent ordinary table: %',
+            p_relation;
+    END IF;
+    -- Check exact hierarchy membership rather than sticky relhassubclass.
+    IF v_relispartition OR EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_inherits AS inh
+         WHERE inh.inhparent = p_relation
+            OR inh.inhrelid = p_relation
+    ) THEN
+        RAISE EXCEPTION 'table inheritance is not supported by pg_local_cache'
+            USING HINT =
+                'Attach a standalone table with no inheritance parent or children.';
+    END IF;
+
+    SELECT i.indnkeyatts, a.attname
+      INTO v_primary_key_columns, v_key_column
+      FROM pg_catalog.pg_index AS i
+      LEFT JOIN pg_catalog.pg_attribute AS a
+        ON a.attrelid = i.indrelid
+       AND a.attnum = i.indkey[0]
+       AND a.attnum > 0
+       AND NOT a.attisdropped
+     WHERE i.indrelid = p_relation
+       AND i.indisprimary;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'table % has no primary key', p_relation
+            USING HINT =
+                'Add a single-column PRIMARY KEY before attaching the table.';
+    END IF;
+    IF v_primary_key_columns <> 1 OR v_key_column IS NULL THEN
+        RAISE EXCEPTION
+            'table % has a composite primary key with % columns',
+            p_relation, v_primary_key_columns
+            USING HINT =
+                'Composite primary keys are not supported yet; use a single-column surrogate PRIMARY KEY.';
+    END IF;
+
+    IF p_value_column IS NULL THEN
+        SELECT count(*), min(a.attname::text)::name
+          INTO v_value_candidates, v_value_column
+          FROM pg_catalog.pg_attribute AS a
+         WHERE a.attrelid = p_relation
+           AND a.attnum > 0
+           AND NOT a.attisdropped
+           AND a.attname <> v_key_column;
+        IF v_value_candidates <> 1 OR v_value_column IS NULL THEN
+            RAISE EXCEPTION
+                'table % has % non-primary-key columns',
+                p_relation, v_value_candidates
+                USING HINT =
+                    'Pass p_value_column unless the table has exactly one non-primary-key column.';
+        END IF;
+    ELSE
+        v_value_column := p_value_column;
+    END IF;
+
+    v_namespace := COALESCE(
+        p_namespace,
+        v_relation_name::text
+    );
+    IF v_namespace !~ '^[A-Za-z0-9_.-]{1,63}$' THEN
+        RAISE EXCEPTION 'invalid pg_local_cache namespace: %', v_namespace
+            USING HINT =
+                'Pass p_namespace with 1-63 ASCII letters, digits, dot, dash, or underscore.';
+    END IF;
+
+    v_worker_role := pg_catalog.current_setting(
+        'pg_local_cache.role', true
+    );
+    IF v_worker_role IS NULL OR v_worker_role = '' THEN
+        RAISE EXCEPTION 'pg_local_cache.role is not configured'
+            USING HINT =
+                'Configure a dedicated non-superuser worker role and restart PostgreSQL.';
+    END IF;
+
+    SELECT r.rolsuper,
+           r.rolcanlogin
+           AND NOT r.rolsuper
+           AND NOT r.rolinherit
+           AND NOT r.rolcreatedb
+           AND NOT r.rolcreaterole
+           AND NOT r.rolreplication
+           AND NOT r.rolbypassrls
+           AND pg_catalog.has_database_privilege(
+               r.oid, pg_catalog.current_database(), 'CONNECT'
+           )
+           AND pg_catalog.has_schema_privilege(
+               r.oid, 'local_cache', 'USAGE'
+           )
+           AND pg_catalog.has_table_privilege(
+               r.oid, 'local_cache.mapping', 'SELECT'
+           )
+      INTO v_worker_is_superuser, v_worker_is_dedicated
+      FROM pg_catalog.pg_roles AS r
+     WHERE r.rolname = v_worker_role;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'configured pg_local_cache worker role % does not exist',
+            v_worker_role
+            USING HINT =
+                'Create the configured role before attaching a table.';
+    END IF;
+    IF v_worker_is_superuser THEN
+        RAISE EXCEPTION
+            'configured pg_local_cache worker role % must not be a superuser',
+            v_worker_role
+            USING HINT =
+                'Use a dedicated LOGIN NOSUPERUSER role for pg_local_cache workers.';
+    END IF;
+    IF v_worker_is_dedicated IS DISTINCT FROM true THEN
+        RAISE EXCEPTION
+            'configured pg_local_cache worker role % is not a dedicated least-privilege role',
+            v_worker_role
+            USING HINT =
+                'Require LOGIN NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS plus CONNECT and read-only local_cache metadata access.';
+    END IF;
+
+    /* Serialize namespace/relation conflict checks with register_mapping(). */
+    LOCK TABLE local_cache.mapping IN EXCLUSIVE MODE;
+
+    SELECT m.namespace
+      INTO v_existing_namespace
+      FROM local_cache.mapping AS m
+     WHERE m.relation = p_relation
+       AND m.namespace <> v_namespace;
+
+    IF FOUND THEN
+        RAISE EXCEPTION 'table % is already attached as namespace %',
+            p_relation, v_existing_namespace
+            USING HINT =
+                'Unregister the existing mapping before changing its namespace.';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM local_cache.mapping AS m
+         WHERE m.namespace = v_namespace
+           AND m.relation <> p_relation
+    ) THEN
+        RAISE EXCEPTION 'pg_local_cache namespace % is already in use',
+            v_namespace
+            USING HINT =
+                'Pass a different p_namespace or unregister the existing mapping.';
+    END IF;
+
+    EXECUTE pg_catalog.format(
+        'GRANT USAGE ON SCHEMA %I TO %I',
+        v_schema_name, v_worker_role
+    );
+    EXECUTE pg_catalog.format(
+        CASE WHEN p_writable
+             THEN 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE %I.%I TO %I'
+             ELSE 'GRANT SELECT ON TABLE %I.%I TO %I'
+        END,
+        v_schema_name, v_relation_name, v_worker_role
+    );
+
+    PERFORM local_cache.register_mapping(
+        v_namespace,
+        p_relation,
+        v_key_column,
+        v_value_column,
+        p_writable
+    );
+
+    v_qualified_relation := pg_catalog.format(
+        '%I.%I', v_schema_name, v_relation_name
+    );
+    v_key_template := pg_catalog.format(
+        '%s:<%s>', v_namespace, v_key_column
+    );
+
+    RETURN pg_catalog.jsonb_build_object(
+        'relation', v_qualified_relation,
+        'namespace', v_namespace,
+        'primary_key_column', v_key_column,
+        'value_column', v_value_column,
+        'writable', p_writable,
+        'worker_role', v_worker_role,
+        'templates', pg_catalog.jsonb_build_object(
+            'key', v_key_template,
+            'get', pg_catalog.format('GET %s', v_key_template),
+            'set', CASE WHEN p_writable THEN pg_catalog.format(
+                'SET %s <value>', v_key_template
+            ) ELSE NULL END,
+            'del', CASE WHEN p_writable THEN pg_catalog.format(
+                'DEL %s', v_key_template
+            ) ELSE NULL END
+        )
+    );
+END;
+$function$;
+
 REVOKE ALL ON FUNCTION register_mapping(text, regclass, name, name, boolean)
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION unregister_mapping(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION attach_table(regclass, name, text, boolean) FROM PUBLIC;
+REVOKE ALL ON FUNCTION _statement_guard() FROM PUBLIC;
 REVOKE ALL ON FUNCTION _row_invalidate() FROM PUBLIC;
 REVOKE ALL ON FUNCTION _truncate_invalidate() FROM PUBLIC;
 REVOKE ALL ON FUNCTION _ddl_invalidate() FROM PUBLIC;

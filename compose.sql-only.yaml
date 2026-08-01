@@ -1,4 +1,4 @@
-name: pg_local_cache
+name: pg_local_cache_sql_only
 
 services:
   postgres:
@@ -10,43 +10,28 @@ services:
     image: pg_local_cache:1.0.0
     restart: unless-stopped
     stop_grace_period: 60s
-    shm_size: 1gb
+    shm_size: 512mb
     environment:
       POSTGRES_DB: app
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       PG_LOCAL_CACHE_DATABASE: app
       PG_LOCAL_CACHE_ROLE: local_cache_worker
-      PG_LOCAL_CACHE_BIND_ADDRESS: 0.0.0.0
-      PG_LOCAL_CACHE_PORT: "6380"
-      PG_LOCAL_CACHE_WORKERS: "8"
-      PG_LOCAL_CACHE_CACHE_ENTRIES: "65536"
-      PG_LOCAL_CACHE_MAX_WORKER_PROCESSES: "16"
-      PG_LOCAL_CACHE_IDLE_TIMEOUT_MS: "300000"
-      PG_LOCAL_CACHE_STATEMENT_TIMEOUT_MS: "2000"
-      PG_LOCAL_CACHE_LOCK_TIMEOUT_MS: "250"
+      PG_LOCAL_CACHE_BIND_ADDRESS: 127.0.0.1
+      PG_LOCAL_CACHE_PORT: "0"
+      PG_LOCAL_CACHE_WORKERS: "1"
+      PG_LOCAL_CACHE_CACHE_ENTRIES: "16384"
+      PG_LOCAL_CACHE_MAX_WORKER_PROCESSES: "8"
       PG_LOCAL_CACHE_SINGLEFLIGHT_WAIT_MS: "25"
-      PG_LOCAL_CACHE_MAX_PIPELINE_COMMANDS: "256"
       PG_LOCAL_CACHE_MAX_DIRTY_KEYS: "4096"
-      PG_LOCAL_CACHE_AUTH_TOKEN_FILE: /run/secrets/pg_local_cache_auth_token
     ports:
       - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
-      - "127.0.0.1:${PG_LOCAL_CACHE_HOST_PORT:-6380}:6380"
     secrets:
       - source: postgres_password
         target: postgres_password
         mode: 0600
-      - source: pg_local_cache_auth_token
-        target: pg_local_cache_auth_token
-        mode: 0600
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-    tmpfs:
-      - /run/pg_local_cache:rw,noexec,nosuid,nodev,size=1m,mode=0700
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
+      - postgres_sql_only_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD", "/usr/local/bin/pg_local_cache_healthcheck"]
       interval: 10s
@@ -62,8 +47,6 @@ services:
 secrets:
   postgres_password:
     file: ./secrets/postgres_password
-  pg_local_cache_auth_token:
-    file: ./secrets/pg_local_cache_auth_token
 
 volumes:
-  postgres_data:
+  postgres_sql_only_data:

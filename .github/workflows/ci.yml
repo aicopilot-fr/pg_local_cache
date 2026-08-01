@@ -26,7 +26,7 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: make -C tests/unit clean check sanitize
+        run: make source-test source-sanitize
 
       - name: Test the benchmark source
         run: make benchmark-test
@@ -49,10 +49,15 @@ jobs:
           PGLC_BENCH_KEYS: "128"
           PGLC_BENCH_CACHE_ENTRIES: "128"
           PGLC_BENCH_PG_LOCAL_CACHE_WORKERS: "1"
+          PGLC_BENCH_REQUIRE_SINGLE_FLIGHT: "1"
+          PGLC_BENCH_SINGLEFLIGHT_WAIT_MS: "250"
+          PGLC_BENCH_SQL_DIRECT_SETUP: "SET pg_local_cache.sql_cache = off"
+          PGLC_BENCH_SQL_FAST_PATH_SETUP: "SET pg_local_cache.sql_cache = on"
           PGLC_BENCH_SERVER_CPUS: "2"
           PGLC_BENCH_CLIENT_CPUS: "2"
           PGLC_BENCH_SERVER_MEMORY: "1g"
           PGLC_BENCH_MIN_OPS: "0"
+          PGLC_BENCH_SQL_MIN_OPS: "10000"
           PGLC_BENCH_OUTPUT_DIR: ${{ runner.temp }}/comparison-smoke
         run: bash benchmarks/run.sh
 
@@ -108,12 +113,18 @@ jobs:
           bash -n docker/attach-table.sh
           bash -n docker/initdb/010_pg_local_cache.sh
           bash -n tests/docker_smoke.sh
+          bash -n tests/docker_sql_only_smoke.sh
           bash -n benchmarks/run.sh
           python3 -m py_compile \
             benchmarks/compare.py \
+            benchmarks/scenarios.py \
             tests/benchmark_test.py \
+            tests/cache_contract_test.py \
+            tests/scenario_benchmark_test.py \
             tests/integration.py \
             tests/pipeline_integration.py \
+            tests/sql_fastpath_integration.py \
+            tests/sql_api_test.py \
             tests/load.py
 
       - name: Build, integrate, and enforce warm-cache throughput
@@ -130,3 +141,14 @@ jobs:
           PG_LOCAL_CACHE_SMOKE_PIPELINE: ${{ matrix.pipeline }}
           PG_LOCAL_CACHE_SMOKE_KEYS: ${{ matrix.keys }}
         run: bash tests/docker_smoke.sh
+
+  docker-sql-only:
+    name: docker-sql-only (ordinary SQL, no RESP secret)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Build and test the tokenless SQL-only profile
+        run: bash tests/docker_sql_only_smoke.sh

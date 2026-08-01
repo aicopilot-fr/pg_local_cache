@@ -21,7 +21,7 @@ Options:
 
 The table must have exactly one primary-key column. The command grants the
 worker role the required table privileges and calls register_mapping(), which
-creates and validates the transaction-aware row and truncate triggers.
+creates and validates the transaction guard plus row and truncate invalidators.
 USAGE
 }
 

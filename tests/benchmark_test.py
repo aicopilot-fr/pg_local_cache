@@ -228,6 +228,9 @@ tps = 800.000000 (without initial connection time)
         self.assertEqual(result["successful_operations"], 4000)
         self.assertEqual(result["operations_per_second"], 3200.0)
         self.assertEqual(result["failed_batches"], 0)
+        arguments = run.call_args.args[0]
+        self.assertNotIn("-d", arguments)
+        self.assertEqual(arguments[-1], compare.PG_DATABASE)
         kwargs = run.call_args.kwargs
         self.assertIn("env", kwargs)
         self.assertNotIn("environment", kwargs)

@@ -38,6 +38,7 @@ PLAIN_PG_HOST = "postgres-plain"
 PG_PORT = 5432
 PG_DATABASE = "benchmark"
 PG_USER = "postgres"
+PG_APP_USER = "local_cache_benchmark_app"
 PG_WORKER_ROLE = "local_cache_benchmark_worker"
 SOCKET_TIMEOUT = 10.0
 LATENCY_RESERVOIR_SEED = 0x50474C43
@@ -329,9 +330,15 @@ def psql(config: Config, query: str, host: str = PG_HOST) -> str:
 
 
 def setup_postgres(config: Config) -> int:
+    app_password = config.pg_password.replace("'", "''")
     psql(
         config,
         "CREATE EXTENSION IF NOT EXISTS pg_local_cache;"
+        "DO $pglc$ BEGIN "
+        f"IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '{PG_APP_USER}') THEN "
+        f"EXECUTE 'CREATE ROLE {PG_APP_USER} LOGIN PASSWORD ''{app_password}'' "
+        "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS'; "
+        "END IF; END $pglc$;"
         f"SELECT local_cache.unregister_mapping('{NAMESPACE}');"
         f"DROP TABLE IF EXISTS public.{TABLE};"
         f"CREATE TABLE public.{TABLE}"
@@ -340,6 +347,7 @@ def setup_postgres(config: Config) -> int:
         f" SELECT g, repeat('x', {config.value_size})"
         f" FROM generate_series(1, {config.keys}) AS g;"
         f"GRANT SELECT ON TABLE public.{TABLE} TO {PG_WORKER_ROLE};"
+        f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.{TABLE} TO {PG_APP_USER};"
         f"SELECT local_cache.register_mapping("
         f"'{NAMESPACE}', 'public.{TABLE}', 'id', 'value', false);"
         f"ANALYZE public.{TABLE}",
@@ -353,14 +361,21 @@ def setup_postgres(config: Config) -> int:
 
 
 def setup_plain_postgres(config: Config) -> None:
+    app_password = config.pg_password.replace("'", "''")
     psql(
         config,
+        "DO $pglc$ BEGIN "
+        f"IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '{PG_APP_USER}') THEN "
+        f"EXECUTE 'CREATE ROLE {PG_APP_USER} LOGIN PASSWORD ''{app_password}'' "
+        "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS'; "
+        "END IF; END $pglc$;"
         f"DROP TABLE IF EXISTS public.{TABLE};"
         f"CREATE TABLE public.{TABLE}"
         " (id bigint PRIMARY KEY, value text NOT NULL);"
         f"INSERT INTO public.{TABLE}"
         f" SELECT g, repeat('x', {config.value_size})"
         f" FROM generate_series(1, {config.keys}) AS g;"
+        f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.{TABLE} TO {PG_APP_USER};"
         f"ANALYZE public.{TABLE}",
         host=PLAIN_PG_HOST,
     )
@@ -815,9 +830,7 @@ def run_pgbench_once(
             "-p",
             str(PG_PORT),
             "-U",
-            PG_USER,
-            "-d",
-            PG_DATABASE,
+            PG_APP_USER,
             "-n",
             "-M",
             "prepared",
@@ -831,6 +844,7 @@ def run_pgbench_once(
             str(seed),
             "-f",
             str(script_path),
+            PG_DATABASE,
         ],
         check=True,
         stdout=subprocess.PIPE,

@@ -1,5 +1,7 @@
 {
-  "comparison_warnings": [],
+  "comparison_warnings": [
+    "postgres_reference is invalid: the historical harness passed pgbench -d (per-command debug); RESP target results are unaffected"
+  ],
   "environment": {
     "cgroup_cpu_max": "200000 100000",
     "cgroup_memory_max": "3221225472",

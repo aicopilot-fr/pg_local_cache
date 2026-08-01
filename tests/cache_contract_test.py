@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""Source contracts for cache fill ownership and transaction fences.
+
+These checks complement Docker integration tests.  They intentionally pin the
+small pieces that are easy to lose during hot-path refactors: a timed-out
+follower must not publish, invalidation must revoke an obsolete loader, and an
+evicted/recreated key must not reuse a former entry generation.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+CORE = (ROOT / "src" / "pg_local_cache.c").read_text(encoding="utf-8")
+WORKER = (ROOT / "src" / "pg_local_cache_worker.c").read_text(
+    encoding="utf-8"
+)
+HEADER = (ROOT / "src" / "pg_local_cache.h").read_text(encoding="utf-8")
+SQL_FASTPATH = (ROOT / "src" / "pg_local_cache_sql.c").read_text(
+    encoding="utf-8"
+)
+INSTALL_SQL = (ROOT / "sql" / "pg_local_cache--1.0.0.sql").read_text(
+    encoding="utf-8"
+)
+ENTRYPOINT = (ROOT / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
+HEALTHCHECK = (ROOT / "docker" / "healthcheck.sh").read_text(encoding="utf-8")
+SQL_ONLY_COMPOSE = (ROOT / "compose.sql-only.yaml").read_text(encoding="utf-8")
+
+
+def c_function(source: str, name: str) -> str:
+    marker = f"\n{name}("
+    start = source.find(marker)
+    if start < 0:
+        raise AssertionError(f"C function {name}() is missing")
+    opening = source.find("{", start)
+    if opening < 0:
+        raise AssertionError(f"C function {name}() has no body")
+    depth = 0
+    for position in range(opening, len(source)):
+        character = source[position]
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : position + 1]
+    raise AssertionError(f"C function {name}() has an unterminated body")
+
+
+class CacheOwnershipSourceTests(unittest.TestCase):
+    def test_every_new_cache_slot_gets_a_unique_generation(self) -> None:
+        entry_lookup = c_function(CORE, "get_cache_entry")
+        self.assertIn("entry->version = next_entry_generation();", entry_lookup)
+        self.assertIn("pg_atomic_uint64 entry_generation;", HEADER)
+        self.assertIn(
+            "pg_atomic_init_u64(&pglc_shared->entry_generation, 0);", CORE
+        )
+
+    def test_store_requires_the_active_loader_id_and_fences_late_fill(self) -> None:
+        store = c_function(CORE, "pglc_cache_store")
+        self.assertIn(
+            "load_id != 0 && entry->loading && entry->load_id == load_id",
+            store,
+        )
+        generation_at = store.index("entry->version = next_entry_generation();")
+        publish_at = store.index("entry->valid = true;")
+        self.assertLess(generation_at, publish_at)
+        self.assertIn("entry->loading = false;", store)
+
+        command_get = c_function(WORKER, "command_get")
+        self.assertGreaterEqual(command_get.count("owns_load ? load_id : 0"), 2)
+
+    def test_claim_rejects_loader_from_an_obsolete_transaction_fence(self) -> None:
+        claim = c_function(CORE, "pglc_cache_claim_load")
+        for field in (
+            "load_global_version",
+            "load_relation_version",
+            "load_key_version",
+        ):
+            self.assertIn(field, HEADER)
+            self.assertIn(field, claim)
+        self.assertIn("entry->loading = false;", claim)
+        self.assertIn("entry->load_id++;", claim)
+
+    def test_release_cannot_clear_a_recreated_entry_loader(self) -> None:
+        release = c_function(CORE, "pglc_cache_release_load")
+        self.assertIn("const PgLocalCacheReadToken *claim_token", release)
+        for fence in (
+            "claim_token->cacheable",
+            "claim_token->has_entry",
+            "entry->key.database_oid == MyDatabaseId",
+            "strcmp(entry->key.nspace, mapping->nspace) == 0",
+            "strcmp(entry->key.key, canonical_key) == 0",
+            "entry->relation_oid == mapping->relation_oid",
+            "entry->version == claim_token->key_version",
+            "entry->load_global_version == claim_token->global_version",
+            "entry->load_relation_version == claim_token->relation_version",
+            "entry->load_key_version == claim_token->key_version",
+            "entry->load_id == load_id",
+        ):
+            self.assertIn(fence, release)
+        for mutable_current_fence in (
+            "pglc_shared->config_generation",
+            "pglc_shared->global_version == claim_token->global_version",
+            "relation_state->version == claim_token->relation_version",
+        ):
+            self.assertNotIn(mutable_current_fence, release)
+        self.assertIn(
+            "const PgLocalCacheReadToken *claim_token", HEADER
+        )
+        self.assertIn(
+            "pglc_cache_release_load(mapping, canonical, &token, load_id)",
+            WORKER,
+        )
+
+    def test_eviction_skips_live_loads_but_can_reclaim_expired_ones(self) -> None:
+        eviction = c_function(CORE, "evict_one_cache_entry")
+        active_check = eviction.index("cache_load_is_active_locked(entry, now)")
+        sample = eviction.index("++sampled")
+        self.assertLess(active_check, sample)
+        expiry = c_function(CORE, "cache_load_is_active_locked")
+        self.assertIn("TimestampDifferenceExceeds", expiry)
+        self.assertIn("entry->version = next_entry_generation();", expiry)
+
+    def test_waiter_metric_is_once_per_request_not_once_per_poll(self) -> None:
+        claim = c_function(CORE, "pglc_cache_claim_load")
+        self.assertNotIn("singleflight_waiters", claim)
+        command_get = c_function(WORKER, "command_get")
+        self.assertIn("waiter_counted", command_get)
+        self.assertEqual(command_get.count("pglc_note_singleflight_waiter();"), 1)
+
+    def test_follower_retries_after_owner_publishes_new_generation(self) -> None:
+        claim = c_function(CORE, "pglc_cache_claim_load")
+        current_at = claim.index("if (cache_entry_is_current_locked")
+        version_retry_at = claim.index(
+            "if (entry->version != token->key_version)", current_at
+        )
+        loader_cleanup_at = claim.index("if (entry->loading &&", current_at)
+        self.assertNotIn(
+            "entry->version != token->key_version", claim[:current_at]
+        )
+        self.assertLess(current_at, version_retry_at)
+        self.assertLess(version_retry_at, loader_cleanup_at)
+        self.assertIn(
+            "result = PGLC_LOAD_RETRY;", claim[current_at:version_retry_at]
+        )
+
+    def test_sql_xmin_has_a_full_xid_age_fence(self) -> None:
+        store = c_function(CORE, "pglc_cache_store")
+        lock_at = store.index(
+            "LWLockAcquire(pglc_shared->lock, LW_EXCLUSIVE);"
+        )
+        horizon_at = store.index("ReadNextFullTransactionId()")
+        self.assertLess(horizon_at, lock_at)
+        self.assertIn("source_observed_full_xid", HEADER)
+        self.assertIn(
+            "entry->source_observed_full_xid = observed_full_xid;", store
+        )
+
+        visible = c_function(SQL_FASTPATH, "pglc_sql_source_visibility")
+        self.assertIn("ReadNextFullTransactionId()", visible)
+        self.assertIn("current_full_xid < source_observed_full_xid", visible)
+        self.assertIn("UINT64CONST(0x80000000)", visible)
+        self.assertIn("PGLC_SOURCE_AGE_EXPIRED", visible)
+        self.assertIn("PGLC_SOURCE_SNAPSHOT_REJECTED", visible)
+        self.assertIn("XidInMVCCSnapshot(source_xmin, snapshot)", visible)
+
+        retire = c_function(CORE, "pglc_cache_retire_positive")
+        for fence in (
+            "token->cacheable",
+            "token->has_entry",
+            "token->config_generation",
+            "token->global_version",
+            "token->relation_version",
+            "token->key_version",
+            "token->source_observed_full_xid",
+            "global_dirty_writers == 0",
+            "relation_state->dirty_writers == 0",
+            "entry->dirty_writers == 0",
+            "cache_entry_is_current_locked",
+            "!entry->negative",
+            "expected_xmin",
+        ):
+            self.assertIn(fence, retire)
+        self.assertIn("entry->valid = false", retire)
+        self.assertIn("entry->loading = false", retire)
+        self.assertIn("entry->version = next_entry_generation()", retire)
+
+        access = c_function(SQL_FASTPATH, "pglc_sql_access")
+        self.assertIn("lookup_attempt < 2", access)
+        age_at = access.index("PGLC_SOURCE_AGE_EXPIRED")
+        retire_at = access.index("pglc_cache_retire_positive")
+        second_lookup_at = access.index("pglc_cache_lookup_quiet")
+        claim_at = access.index("pglc_cache_claim_load")
+        self.assertLess(age_at, retire_at)
+        self.assertLess(second_lookup_at, claim_at)
+
+    def test_cross_type_integer_keys_are_coerced_not_reinterpreted(self) -> None:
+        supported = c_function(SQL_FASTPATH, "pglc_sql_key_input_supported")
+        self.assertIn("key_type == INT8OID", supported)
+        self.assertIn("expression_type == INT4OID", supported)
+        coercion = c_function(SQL_FASTPATH, "pglc_sql_coerce_key_expr")
+        self.assertIn("coerce_to_target_type", coercion)
+        self.assertIn("COERCION_IMPLICIT", coercion)
+        matcher = c_function(SQL_FASTPATH, "pglc_sql_match_clause")
+        self.assertIn("pglc_sql_coerce_key_expr(other, meta)", matcher)
+        self.assertNotIn("operator->opno != type_cache->eq_opr", matcher)
+
+    def test_sql_cache_rejects_aliasing_custom_btree_families(self) -> None:
+        index_path = c_function(SQL_FASTPATH, "pglc_sql_unique_index_path")
+        self.assertIn("TYPECACHE_BTREE_OPFAMILY", index_path)
+        self.assertIn(
+            "index_info->opfamily[0] != type_cache->btree_opf", index_path
+        )
+        self.assertIn(
+            "get_op_opfamily_strategy(index_operator,\n"
+            "\t\t\t\t\t\t\t\t type_cache->btree_opf)",
+            index_path,
+        )
+
+    def test_worker_trigger_query_uses_real_pg16_catalog_columns(self) -> None:
+        # tgisclone/tgnattr exist only in the relcache Trigger C struct; the
+        # SQL catalog represents them as tgparentid and tgattr respectively.
+        self.assertNotIn("rt.tgisclone", WORKER)
+        self.assertNotIn("tt.tgisclone", WORKER)
+        self.assertNotIn("rt.tgnattr", WORKER)
+        self.assertNotIn("tt.tgnattr", WORKER)
+        self.assertIn("rt.tgparentid = 0", WORKER)
+        self.assertIn("cardinality(rt.tgattr) = 0", WORKER)
+
+    def test_statement_guard_fences_nested_trigger_reads(self) -> None:
+        guard = c_function(CORE, "pg_local_cache_statement_guard")
+        self.assertIn("TRIGGER_FIRED_BEFORE", guard)
+        self.assertIn("TRIGGER_FIRED_FOR_STATEMENT", guard)
+        for event in (
+            "TRIGGER_TYPE_INSERT",
+            "TRIGGER_TYPE_UPDATE",
+            "TRIGGER_TYPE_DELETE",
+            "TRIGGER_TYPE_TRUNCATE",
+        ):
+            self.assertIn(event, guard)
+        self.assertIn("trigger_data->tg_trigger->tgnargs != 0", guard)
+        self.assertIn("get_local_dirty_hash()", guard)
+        self.assertNotIn("pglc_collect_", guard)
+        publish = c_function(CORE, "pglc_publish_dirty")
+        empty_at = publish.index("hash_get_num_entries(local_dirty_hash) == 0")
+        shared_lock_at = publish.index(
+            "LWLockAcquire(pglc_shared->lock, LW_EXCLUSIVE)"
+        )
+        self.assertLess(empty_at, shared_lock_at)
+
+        trigger_validation = c_function(SQL_FASTPATH, "pglc_sql_triggers_valid")
+        self.assertIn("pg_local_cache_statement_guard", trigger_validation)
+        self.assertIn('"_statement_guard"', trigger_validation)
+        self.assertIn("TRIGGER_TYPE_BEFORE", trigger_validation)
+        self.assertIn("return guard_found && row_found && truncate_found", trigger_validation)
+
+        self.assertIn("gt.tgtype = 62 AND gt.tgnargs = 0", WORKER)
+        self.assertIn("octet_length(gt.tgargs) = 0", WORKER)
+        self.assertIn("gt.tgparentid = 0", WORKER)
+        self.assertIn("gt.tgqual IS NULL", WORKER)
+        self.assertIn("local_cache._statement_guard()", WORKER)
+        self.assertIn(
+            "BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE", INSTALL_SQL
+        )
+        self.assertIn(
+            "ENABLE ALWAYS TRIGGER pg_local_cache_statement_guard", INSTALL_SQL
+        )
+        self.assertIn(
+            "REVOKE ALL ON FUNCTION _statement_guard() FROM PUBLIC", INSTALL_SQL
+        )
+
+    def test_runtime_refreshes_only_an_identical_mapping_generation(self) -> None:
+        runtime = c_function(SQL_FASTPATH, "pglc_sql_validate_runtime")
+        self.assertIn("pglc_sql_read_mapping", runtime)
+        self.assertIn("pglc_sql_relation_base_meta", runtime)
+        self.assertIn("pglc_sql_relation_meta", runtime)
+        generation_at = runtime.index(
+            "state->mapping.config_generation == current_generation"
+        )
+        mapping_scan_at = runtime.index("pglc_sql_read_mapping")
+        self.assertLess(generation_at, mapping_scan_at)
+        for field in (
+            "relation_oid",
+            "nspace",
+            "key_attno",
+            "value_attno",
+            "key_type",
+            "value_type",
+            "key_typmod",
+            "value_typmod",
+        ):
+            self.assertIn(f"current_meta.{field}", runtime)
+        self.assertIn(
+            "state->mapping.config_generation = current_meta.config_generation",
+            runtime,
+        )
+        can_use = c_function(SQL_FASTPATH, "pglc_sql_can_use_cache")
+        self.assertIn(
+            "state->mapping.config_generation == pglc_config_generation()",
+            can_use,
+        )
+
+    def test_inheritance_checks_do_not_trust_sticky_relhassubclass(self) -> None:
+        # PostgreSQL may retain relhassubclass after the last child is dropped.
+        # Registration, worker reload, and both fast-path validation stages
+        # must all consult the actual pg_inherits rows so recovery is automatic.
+        self.assertNotIn("c.relhassubclass", INSTALL_SQL)
+        self.assertGreaterEqual(INSTALL_SQL.count("inh.inhparent = p_relation"), 2)
+        self.assertGreaterEqual(INSTALL_SQL.count("inh.inhrelid = p_relation"), 2)
+        self.assertGreaterEqual(INSTALL_SQL.count("v_relispartition"), 6)
+        self.assertIn("inh.inhparent = d.objid", INSTALL_SQL)
+        self.assertIn("inh.inhrelid = m.relation", INSTALL_SQL)
+        self.assertNotIn("c.relhassubclass", WORKER)
+        self.assertIn("inh.inhparent = c.oid", WORKER)
+        self.assertIn("inh.inhrelid = c.oid", WORKER)
+        self.assertIn("NOT c.relispartition", WORKER)
+
+        child_check = c_function(
+            SQL_FASTPATH, "pglc_sql_relation_has_children"
+        )
+        self.assertIn("find_inheritance_children", child_check)
+        self.assertLess(
+            child_check.index("!relation->rd_rel->relhassubclass"),
+            child_check.index("find_inheritance_children"),
+        )
+        parent_check = c_function(SQL_FASTPATH, "pglc_sql_relation_has_parent")
+        self.assertIn("relation->rd_rel->relispartition", parent_check)
+        self.assertIn("has_superclass", parent_check)
+        relation_meta = c_function(SQL_FASTPATH, "pglc_sql_relation_meta")
+        simple_query = c_function(SQL_FASTPATH, "pglc_sql_simple_query")
+        runtime = c_function(SQL_FASTPATH, "pglc_sql_validate_runtime")
+        self.assertIn("pglc_sql_relation_has_children", relation_meta)
+        self.assertIn("pglc_sql_relation_has_parent", relation_meta)
+        self.assertIn("rte->inh", simple_query)
+        self.assertNotIn("pglc_sql_relation_has_children", simple_query)
+        self.assertIn("pglc_sql_relation_meta", runtime)
+        self.assertNotIn("relhassubclass", relation_meta)
+        self.assertNotIn("has_subclass", simple_query)
+        self.assertNotIn("relhassubclass", runtime)
+
+        normalizer = c_function(
+            SQL_FASTPATH, "pglc_sql_normalize_query_inheritance"
+        )
+        self.assertIn("AccessShareLock", normalizer)
+        self.assertIn("pglc_sql_read_mapping", normalizer)
+        self.assertIn("pglc_sql_relation_has_children", normalizer)
+        self.assertIn("rte->inh = false", normalizer)
+        self.assertLess(
+            normalizer.index("try_table_open"),
+            normalizer.index("relation->rd_rel->relhassubclass"),
+        )
+        self.assertLess(
+            normalizer.index("relation->rd_rel->relhassubclass"),
+            normalizer.index("pglc_sql_read_mapping"),
+        )
+        planner = c_function(SQL_FASTPATH, "pglc_sql_planner")
+        self.assertIn("pglc_sql_normalize_query_inheritance", planner)
+        self.assertIn("previous_planner_hook", planner)
+        self.assertIn("worker_mappings_incomplete", WORKER)
+        retry = c_function(WORKER, "maybe_reload_mappings")
+        self.assertIn("!worker_mappings_incomplete", retry)
+        self.assertIn("worker_next_mapping_retry", retry)
+
+
+class SqlOnlyContainerSourceTests(unittest.TestCase):
+    def test_port_zero_does_not_require_or_copy_a_resp_secret(self) -> None:
+        self.assertIn(
+            'require_integer_between "PG_LOCAL_CACHE_PORT" "$port" 0 65535',
+            ENTRYPOINT,
+        )
+        self.assertIn("if (( port != 0 )); then", ENTRYPOINT)
+        self.assertIn('runtime_token_config=""', ENTRYPOINT)
+        self.assertIn(
+            'pg_local_cache.auth_token_file = \'%s\'', ENTRYPOINT
+        )
+
+    def test_sql_only_healthcheck_skips_worker_and_resp_probes(self) -> None:
+        self.assertIn(
+            "current_setting('pg_local_cache.port')::integer = 0",
+            HEALTHCHECK,
+        )
+        resp_probe = HEALTHCHECK.index('exec 3<>"/dev/tcp/127.0.0.1/${port}"')
+        early_exit = HEALTHCHECK.index("if (( port == 0 )); then")
+        self.assertLess(early_exit, resp_probe)
+
+    def test_sql_only_compose_has_no_resp_port_or_token_secret(self) -> None:
+        self.assertIn('PG_LOCAL_CACHE_PORT: "0"', SQL_ONLY_COMPOSE)
+        self.assertNotIn("pg_local_cache_auth_token", SQL_ONLY_COMPOSE)
+        self.assertNotIn(":6380", SQL_ONLY_COMPOSE)
+        self.assertIn("postgres_password", SQL_ONLY_COMPOSE)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -62,6 +62,7 @@ static PgLocalCacheMapping *worker_mappings = NULL;
 static int	worker_mapping_count = 0;
 static uint64 worker_mapping_generation = 0;
 static TimestampTz worker_next_mapping_retry = 0;
+static bool worker_mappings_incomplete = false;
 static char *worker_auth_token = NULL;
 
 static void load_auth_token(void);
@@ -1178,11 +1179,17 @@ command_get(PgLocalCacheMapping *mapping, const char *raw_key,
 	char		cached_value[PGLC_VALUE_MAX];
 	Size		cached_length;
 	bool		negative;
+	TransactionId source_xmin;
 	PgLocalCacheReadToken token;
 	bool		hit;
+	bool		owns_load = false;
+	bool		waiter_counted = false;
+	uint64		load_id = 0;
+	TimestampTz wait_started;
 	Datum		values[1];
 	char	   *database_value = NULL;
 	Size		database_value_length = 0;
+	TransactionId database_xmin = InvalidTransactionId;
 	MemoryContext result_context = CurrentMemoryContext;
 
 	if (!canonicalize_key(mapping, raw_key, &key_value,
@@ -1191,7 +1198,8 @@ command_get(PgLocalCacheMapping *mapping, const char *raw_key,
 
 	hit = pglc_cache_lookup(mapping, canonical,
 						   cached_value, sizeof(cached_value),
-						   &cached_length, &negative, &token);
+						   &cached_length, &negative, &source_xmin,
+						   &token);
 	if (hit)
 	{
 		if (negative)
@@ -1199,44 +1207,119 @@ command_get(PgLocalCacheMapping *mapping, const char *raw_key,
 		return pglc_resp_bulk(cached_value, cached_length, response_length);
 	}
 
-	values[0] = key_value;
-	begin_spi_transaction();
-	ensure_mapping_current(mapping);
-	if (SPI_execute_plan(mapping->get_plan, values, NULL, true, 1) !=
-		SPI_OK_SELECT)
-		elog(ERROR, "pg_local_cache GET plan failed");
-	ensure_mapping_current(mapping);
-	if (SPI_processed == 1)
+	wait_started = GetCurrentTimestamp();
+	for (;;)
 	{
-		database_value = SPI_getvalue(SPI_tuptable->vals[0],
-									  SPI_tuptable->tupdesc, 1);
-		if (database_value == NULL)
-			elog(ERROR, "pg_local_cache mapped value unexpectedly became NULL");
-		database_value_length = strlen(database_value);
-		if (database_value_length > PGLC_VALUE_MAX)
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("mapped value exceeds pg_local_cache limit of %d bytes",
-							PGLC_VALUE_MAX)));
-		{
-			char	   *copy =
-				MemoryContextAlloc(result_context, database_value_length + 1);
+		PgLocalCacheLoadClaim claim =
+			pglc_cache_claim_load(mapping, canonical, &token, &load_id);
 
-			memcpy(copy, database_value, database_value_length + 1);
-			database_value = copy;
+		if (claim == PGLC_LOAD_OWNER)
+		{
+			owns_load = true;
+			break;
+		}
+		if (claim == PGLC_LOAD_BYPASS)
+			break;
+		if (claim == PGLC_LOAD_WAIT && !waiter_counted)
+		{
+			pglc_note_singleflight_waiter();
+			waiter_counted = true;
+		}
+
+		hit = pglc_cache_lookup_quiet(mapping, canonical,
+									 cached_value, sizeof(cached_value),
+									 &cached_length, &negative, &source_xmin,
+									 &token);
+		if (hit)
+		{
+			pglc_note_singleflight_reuse();
+			if (negative)
+				return pglc_resp_null(response_length);
+			return pglc_resp_bulk(cached_value, cached_length,
+								  response_length);
+		}
+		if (claim == PGLC_LOAD_RETRY)
+			continue;
+		if (TimestampDifferenceExceeds(wait_started, GetCurrentTimestamp(),
+								   pglc_singleflight_wait_ms))
+		{
+			pglc_note_singleflight_timeout();
+			break;
+		}
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 1L, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	values[0] = key_value;
+	PG_TRY();
+	{
+		begin_spi_transaction();
+		ensure_mapping_current(mapping);
+		if (SPI_execute_plan(mapping->get_plan, values, NULL, true, 1) !=
+			SPI_OK_SELECT)
+			elog(ERROR, "pg_local_cache GET plan failed");
+		ensure_mapping_current(mapping);
+		if (SPI_processed == 1)
+		{
+			bool		xmin_is_null;
+			Datum		xmin_value;
+
+			database_value = SPI_getvalue(SPI_tuptable->vals[0],
+										  SPI_tuptable->tupdesc, 1);
+			if (database_value == NULL)
+				elog(ERROR, "pg_local_cache mapped value unexpectedly became NULL");
+			xmin_value = SPI_getbinval(SPI_tuptable->vals[0],
+									   SPI_tuptable->tupdesc, 2,
+									   &xmin_is_null);
+			if (xmin_is_null)
+				elog(ERROR, "pg_local_cache row xmin unexpectedly became NULL");
+			database_xmin = (TransactionId) DatumGetUInt32(xmin_value);
+			database_value_length = strlen(database_value);
+			if (database_value_length > PGLC_VALUE_MAX)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("mapped value exceeds pg_local_cache limit of %d bytes",
+								PGLC_VALUE_MAX)));
+			{
+				char	   *copy = MemoryContextAlloc(
+					result_context, database_value_length + 1);
+
+				memcpy(copy, database_value, database_value_length + 1);
+				database_value = copy;
+			}
+		}
+		commit_spi_transaction();
+		pglc_note_database_read();
+
+		if (database_value == NULL)
+			pglc_cache_store(mapping, canonical, &token, NULL, 0, true,
+							 owns_load ? load_id : 0,
+							 InvalidTransactionId);
+		else
+			pglc_cache_store(mapping, canonical, &token,
+							 database_value, database_value_length, false,
+							 owns_load ? load_id : 0,
+							 database_xmin);
+		if (owns_load)
+		{
+			pglc_cache_release_load(mapping, canonical, &token, load_id);
+			owns_load = false;
 		}
 	}
-	commit_spi_transaction();
-	pglc_note_database_read();
+	PG_CATCH();
+	{
+		if (owns_load)
+			pglc_cache_release_load(mapping, canonical, &token, load_id);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	if (database_value == NULL)
-	{
-		pglc_cache_store(mapping, canonical, &token, NULL, 0, true);
 		return pglc_resp_null(response_length);
-	}
 
-	pglc_cache_store(mapping, canonical, &token,
-					database_value, database_value_length, false);
 	return pglc_resp_bulk(database_value, database_value_length,
 						 response_length);
 }
@@ -1316,7 +1399,7 @@ maybe_reload_mappings(void)
 {
 	uint64		generation = pglc_config_generation();
 
-	if (generation == worker_mapping_generation)
+	if (generation == worker_mapping_generation && !worker_mappings_incomplete)
 		return;
 	if (worker_next_mapping_retry != 0 &&
 		GetCurrentTimestamp() < worker_next_mapping_retry)
@@ -1363,17 +1446,32 @@ reload_mappings(void)
 	PG_TRY();
 	{
 		int			result;
-		uint64		row;
-		uint64		mapping_count;
-		PgLocalCacheMapping *new_mappings;
+			uint64		row;
+			uint64		mapping_count;
+			uint64		configured_mapping_count;
+			PgLocalCacheMapping *new_mappings;
+			HeapTuple	count_tuple;
+			TupleDesc	count_desc;
+			bool		count_is_null;
 
 		begin_spi_transaction();
 		free_mapping_plans();
 		worker_mappings = NULL;
-		worker_mapping_count = 0;
-		MemoryContextReset(mapping_context);
+			worker_mapping_count = 0;
+			MemoryContextReset(mapping_context);
 
-		result = SPI_execute(
+			result = SPI_execute(
+				"SELECT count(*) FROM local_cache.mapping", true, 0);
+			if (result != SPI_OK_SELECT || SPI_processed != 1)
+				elog(ERROR, "could not count pg_local_cache mappings");
+			count_tuple = SPI_tuptable->vals[0];
+			count_desc = SPI_tuptable->tupdesc;
+			configured_mapping_count = DatumGetInt64(
+				SPI_getbinval(count_tuple, count_desc, 1, &count_is_null));
+			if (count_is_null || configured_mapping_count > PGLC_MAX_MAPPINGS)
+				elog(ERROR, "too many pg_local_cache mappings");
+
+			result = SPI_execute(
 			"SELECT m.namespace, c.oid, n.nspname, c.relname, "
 			"       m.key_column::text, m.value_column::text, m.writable, "
 			"       ka.atttypid, va.atttypid, ka.atttypmod, va.atttypmod "
@@ -1399,10 +1497,29 @@ reload_mappings(void)
 			"        'numeric'::regtype, 'bool'::regtype, "
 			"        'text'::regtype, 'varchar'::regtype, 'bpchar'::regtype, "
 			"        'uuid'::regtype, 'json'::regtype, 'jsonb'::regtype) "
+			"  JOIN pg_catalog.pg_trigger AS gt "
+			"    ON gt.tgrelid = c.oid "
+			"   AND gt.tgname = 'pg_local_cache_statement_guard' "
+			"   AND gt.tgenabled = 'A' AND NOT gt.tgisinternal "
+			"   AND gt.tgparentid = 0 AND NOT gt.tgdeferrable "
+			"   AND NOT gt.tginitdeferred AND gt.tgconstraint = 0 "
+			"   AND gt.tgconstrrelid = 0 AND gt.tgconstrindid = 0 "
+			"   AND pg_catalog.cardinality(gt.tgattr) = 0 "
+			"   AND gt.tgqual IS NULL "
+			"   AND gt.tgoldtable IS NULL AND gt.tgnewtable IS NULL "
+			"   AND gt.tgtype = 62 AND gt.tgnargs = 0 "
+			"   AND pg_catalog.octet_length(gt.tgargs) = 0 "
+			"   AND gt.tgfoid = 'local_cache._statement_guard()'::regprocedure "
 			"  JOIN pg_catalog.pg_trigger AS rt "
 			"    ON rt.tgrelid = c.oid "
 			"   AND rt.tgname = 'pg_local_cache_row_invalidate' "
 			"   AND rt.tgenabled = 'A' AND NOT rt.tgisinternal "
+			"   AND rt.tgparentid = 0 AND NOT rt.tgdeferrable "
+			"   AND NOT rt.tginitdeferred AND rt.tgconstraint = 0 "
+			"   AND rt.tgconstrrelid = 0 AND rt.tgconstrindid = 0 "
+			"   AND pg_catalog.cardinality(rt.tgattr) = 0 "
+			"   AND rt.tgqual IS NULL "
+			"   AND rt.tgoldtable IS NULL AND rt.tgnewtable IS NULL "
 			"   AND rt.tgtype = 29 AND rt.tgnargs = 2 "
 			"   AND rt.tgfoid = 'local_cache._row_invalidate()'::regprocedure "
 			"   AND rt.tgargs = "
@@ -1414,12 +1531,25 @@ reload_mappings(void)
 			"    ON tt.tgrelid = c.oid "
 			"   AND tt.tgname = 'pg_local_cache_truncate_invalidate' "
 			"   AND tt.tgenabled = 'A' AND NOT tt.tgisinternal "
+			"   AND tt.tgparentid = 0 AND NOT tt.tgdeferrable "
+			"   AND NOT tt.tginitdeferred AND tt.tgconstraint = 0 "
+			"   AND tt.tgconstrrelid = 0 AND tt.tgconstrindid = 0 "
+			"   AND pg_catalog.cardinality(tt.tgattr) = 0 "
+			"   AND tt.tgqual IS NULL "
+			"   AND tt.tgoldtable IS NULL AND tt.tgnewtable IS NULL "
 			"   AND tt.tgtype = 32 AND tt.tgnargs = 1 "
 			"   AND tt.tgfoid = 'local_cache._truncate_invalidate()'::regprocedure "
 			"   AND tt.tgargs = "
 			"       convert_to(m.namespace, current_setting('server_encoding')) "
 			"       || decode('00', 'hex') "
 			" WHERE c.relkind = 'r' AND c.relpersistence = 'p' "
+			"   AND NOT c.relispartition "
+			"   AND NOT EXISTS ("
+			"       SELECT 1 FROM pg_catalog.pg_inherits AS inh "
+			"        WHERE inh.inhparent = c.oid) "
+			"   AND NOT EXISTS ("
+			"       SELECT 1 FROM pg_catalog.pg_inherits AS inh "
+			"        WHERE inh.inhrelid = c.oid) "
 			"   AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity "
 			"   AND EXISTS ("
 			"       SELECT 1 FROM pg_catalog.pg_index AS i "
@@ -1535,7 +1665,7 @@ reload_mappings(void)
 			quoted_key = quote_identifier(mapping->key_column);
 			quoted_value = quote_identifier(mapping->value_column);
 
-			get_query = psprintf("SELECT %s::text FROM %s "
+			get_query = psprintf("SELECT %s::text, xmin FROM ONLY %s "
 								 "WHERE %s = $1 LIMIT 1",
 								 quoted_value, qualified_relation, quoted_key);
 			get_types[0] = mapping->key_type;
@@ -1553,7 +1683,7 @@ reload_mappings(void)
 				mapping->set_plan = prepare_kept_plan(set_query, 2,
 													  set_types);
 
-				delete_query = psprintf("DELETE FROM %s WHERE %s = $1",
+				delete_query = psprintf("DELETE FROM ONLY %s WHERE %s = $1",
 										qualified_relation, quoted_key);
 				delete_types[0] = mapping->key_type;
 				mapping->delete_plan = prepare_kept_plan(delete_query, 1,
@@ -1561,10 +1691,13 @@ reload_mappings(void)
 			}
 		}
 
-		commit_spi_transaction();
-		worker_mapping_generation = target_generation;
-		worker_next_mapping_retry = 0;
-		success = true;
+			commit_spi_transaction();
+			worker_mapping_generation = target_generation;
+			worker_mappings_incomplete =
+				mapping_count != configured_mapping_count;
+			worker_next_mapping_retry = worker_mappings_incomplete ?
+				TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 1000) : 0;
+			success = true;
 	}
 	PG_CATCH();
 	{
@@ -1581,8 +1714,9 @@ reload_mappings(void)
 			AbortCurrentTransaction();
 		free_mapping_plans();
 		MemoryContextReset(mapping_context);
-		worker_mappings = NULL;
-		worker_mapping_count = 0;
+			worker_mappings = NULL;
+			worker_mapping_count = 0;
+			worker_mappings_incomplete = true;
 		worker_next_mapping_retry =
 			TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 1000);
 		ereport(LOG,

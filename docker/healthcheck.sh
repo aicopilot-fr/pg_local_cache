@@ -8,16 +8,6 @@ database="${PG_LOCAL_CACHE_DATABASE:-${POSTGRES_DB:-$postgres_user}}"
 port="${PG_LOCAL_CACHE_PORT:-6380}"
 runtime_token="/run/pg_local_cache/auth_token"
 source_token="${PG_LOCAL_CACHE_AUTH_TOKEN_FILE:-/run/secrets/pg_local_cache_auth_token}"
-token_file="$source_token"
-
-if [[ -f "$runtime_token" ]]; then
-    token_file="$runtime_token"
-fi
-
-[[ -f "$token_file" && ! -L "$token_file" ]]
-[[ "$(stat -c '%a' "$token_file")" == "600" ]]
-auth_token="$(<"$token_file")"
-[[ "$auth_token" =~ ^[A-Za-z0-9_-]{32,256}$ ]]
 
 pg_isready \
     --quiet \
@@ -47,13 +37,30 @@ SELECT CASE
         SELECT count(*)
           FROM pg_catalog.pg_stat_activity
          WHERE backend_type = 'pg_local_cache RESP worker'
-    ) = pg_catalog.current_setting('pg_local_cache.workers')::integer
+    ) = CASE
+        WHEN pg_catalog.current_setting('pg_local_cache.port')::integer = 0
+            THEN 0
+        ELSE pg_catalog.current_setting('pg_local_cache.workers')::integer
+        END
     THEN 'ready'
     ELSE 'not-ready'
 END;
 SQL
 )"
 [[ "$sql_status" == "ready" ]]
+
+if (( port == 0 )); then
+    exit 0
+fi
+
+token_file="$source_token"
+if [[ -f "$runtime_token" ]]; then
+    token_file="$runtime_token"
+fi
+[[ -f "$token_file" && ! -L "$token_file" ]]
+[[ "$(stat -c '%a' "$token_file")" == "600" ]]
+auth_token="$(<"$token_file")"
+[[ "$auth_token" =~ ^[A-Za-z0-9_-]{32,256}$ ]]
 
 exec 3<>"/dev/tcp/127.0.0.1/${port}"
 printf '*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n' \

@@ -4,6 +4,7 @@
 
 #include "access/htup_details.h"
 #include "access/xact.h"
+#include "catalog/pg_trigger.h"
 #include "catalog/pg_type_d.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
@@ -20,6 +21,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/timestamp.h"
 
 #include "pg_local_cache.h"
 
@@ -31,6 +33,7 @@ int			pglc_cache_entries = 16384;
 int			pglc_idle_timeout_ms = 300000;
 int			pglc_statement_timeout_ms = 2000;
 int			pglc_lock_timeout_ms = 250;
+int			pglc_singleflight_wait_ms = 25;
 int			pglc_max_pipeline_commands = 256;
 int			pglc_max_dirty_keys = 4096;
 char	   *pglc_bind_address = NULL;
@@ -80,6 +83,7 @@ void		_PG_init(void);
 
 PG_FUNCTION_INFO_V1(pg_local_cache_row_invalidate);
 PG_FUNCTION_INFO_V1(pg_local_cache_truncate_invalidate);
+PG_FUNCTION_INFO_V1(pg_local_cache_statement_guard);
 PG_FUNCTION_INFO_V1(pg_local_cache_reload);
 PG_FUNCTION_INFO_V1(pg_local_cache_invalidate);
 PG_FUNCTION_INFO_V1(pg_local_cache_stats);
@@ -176,6 +180,19 @@ pglc_define_gucs(void)
 							250,
 							10,
 							60000,
+							PGC_POSTMASTER,
+							GUC_UNIT_MS,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_local_cache.singleflight_wait_ms",
+							"Maximum time a RESP GET waits for another worker loading the same key.",
+							NULL,
+							&pglc_singleflight_wait_ms,
+							25,
+							0,
+							1000,
 							PGC_POSTMASTER,
 							GUC_UNIT_MS,
 							NULL,
@@ -283,6 +300,7 @@ _PG_init(void)
 	BackgroundWorker worker;
 	int			i;
 
+	pglc_sql_init();
 	pglc_define_gucs();
 	RegisterXactCallback(pglc_xact_callback, NULL);
 	before_shmem_exit(pglc_backend_exit, (Datum) 0);
@@ -360,14 +378,23 @@ pglc_shmem_startup(void)
 		memset(pglc_shared, 0, sizeof(PgLocalCacheSharedState));
 		pglc_shared->lock = &(GetNamedLWLockTranche("pg_local_cache"))->lock;
 		pg_atomic_init_u64(&pglc_shared->clock, 0);
+		pg_atomic_init_u64(&pglc_shared->entry_generation, 0);
 		pg_atomic_init_u64(&pglc_shared->config_generation, 1);
 		pg_atomic_init_u64(&pglc_shared->cache_hits, 0);
 		pg_atomic_init_u64(&pglc_shared->cache_misses, 0);
 		pg_atomic_init_u64(&pglc_shared->negative_hits, 0);
+		pg_atomic_init_u64(&pglc_shared->sql_cache_hits, 0);
+		pg_atomic_init_u64(&pglc_shared->sql_cache_misses, 0);
+		pg_atomic_init_u64(&pglc_shared->sql_cache_fills, 0);
+		pg_atomic_init_u64(&pglc_shared->sql_cache_bypasses, 0);
 		pg_atomic_init_u64(&pglc_shared->database_reads, 0);
 		pg_atomic_init_u64(&pglc_shared->database_writes, 0);
 		pg_atomic_init_u64(&pglc_shared->invalidations, 0);
 		pg_atomic_init_u64(&pglc_shared->evictions, 0);
+		pg_atomic_init_u64(&pglc_shared->singleflight_leaders, 0);
+		pg_atomic_init_u64(&pglc_shared->singleflight_waiters, 0);
+		pg_atomic_init_u64(&pglc_shared->singleflight_reuses, 0);
+		pg_atomic_init_u64(&pglc_shared->singleflight_timeouts, 0);
 		pg_atomic_init_u64(&pglc_shared->active_clients, 0);
 		pg_atomic_init_u64(&pglc_shared->rejected_connections, 0);
 		pg_atomic_init_u64(&pglc_shared->authentication_failures, 0);
@@ -486,6 +513,45 @@ cache_entry_is_current_locked(PgLocalCacheCacheEntry *entry,
 			entry->relation_version == relation_state->version;
 }
 
+static uint64
+next_entry_generation(void)
+{
+	uint64		generation;
+
+	generation =
+		pg_atomic_fetch_add_u64(&pglc_shared->entry_generation, 1) + 1;
+	if (generation == 0)
+		generation =
+			pg_atomic_fetch_add_u64(&pglc_shared->entry_generation, 1) + 1;
+	return generation;
+}
+
+static int
+cache_load_lease_ms(void)
+{
+	return Max(1000, pglc_statement_timeout_ms * 2);
+}
+
+/*
+ * Return true only while the current owner still has a valid lease.  Revoking
+ * an orphaned lease also changes the entry generation, fencing a late owner
+ * from filling an entry that another worker has subsequently reclaimed.
+ */
+static bool
+cache_load_is_active_locked(PgLocalCacheCacheEntry *entry, TimestampTz now)
+{
+	if (!entry->loading)
+		return false;
+	if (!TimestampDifferenceExceeds(entry->load_started, now,
+								cache_load_lease_ms()))
+		return true;
+
+	entry->loading = false;
+	entry->load_id++;
+	entry->version = next_entry_generation();
+	return false;
+}
+
 static bool
 evict_one_cache_entry(void)
 {
@@ -495,6 +561,7 @@ evict_one_cache_entry(void)
 	uint64		oldest = PG_UINT64_MAX;
 	int			sampled = 0;
 	bool		have_victim = false;
+	TimestampTz now = GetCurrentTimestamp();
 
 	hash_seq_init(&sequence, pglc_cache_hash);
 	while ((entry = hash_seq_search(&sequence)) != NULL)
@@ -502,13 +569,15 @@ evict_one_cache_entry(void)
 		PgLocalCacheRelationState *relation_state;
 		uint64		last_access;
 
+		if (entry->dirty_writers != 0)
+			continue;
+		if (cache_load_is_active_locked(entry, now))
+			continue;
 		if (++sampled > PGLC_EVICTION_SAMPLE)
 		{
 			hash_seq_term(&sequence);
 			break;
 		}
-		if (entry->dirty_writers != 0)
-			continue;
 
 		relation_state = get_relation_state(entry->key.database_oid,
 											entry->relation_oid,
@@ -562,6 +631,7 @@ get_cache_entry(Oid database_oid, Oid relation_oid,
 		memset(entry, 0, sizeof(*entry));
 		entry->key = saved_key;
 		entry->relation_oid = relation_oid;
+		entry->version = next_entry_generation();
 		pg_atomic_init_u64(&entry->last_access, 0);
 	}
 	else if (entry != NULL && create && OidIsValid(relation_oid) &&
@@ -572,7 +642,9 @@ get_cache_entry(Oid database_oid, Oid relation_oid,
 		 * relation become a hit for the new relation.
 		 */
 		entry->valid = false;
-		entry->version++;
+		entry->version = next_entry_generation();
+		entry->loading = false;
+		entry->load_id++;
 		entry->relation_oid = relation_oid;
 	}
 	return entry;
@@ -614,7 +686,8 @@ static bool
 cache_lookup_locked(const PgLocalCacheMapping *mapping,
 					const char *canonical_key,
 					char *value, Size value_capacity, Size *value_len,
-					bool *negative, PgLocalCacheReadToken *token,
+					bool *negative, TransactionId *source_xmin,
+					PgLocalCacheReadToken *token,
 					bool create, bool *complete)
 {
 	PgLocalCacheRelationState *relation_state;
@@ -639,6 +712,8 @@ cache_lookup_locked(const PgLocalCacheMapping *mapping,
 	token->global_version = pglc_shared->global_version;
 	token->relation_version = relation_state ? relation_state->version : 0;
 	token->key_version = entry ? entry->version : 0;
+	token->source_observed_full_xid =
+		entry ? entry->source_observed_full_xid : 0;
 	token->has_entry = entry != NULL;
 	token->cacheable = mapping_matches && mapping_current &&
 		pglc_shared->global_dirty_writers == 0 &&
@@ -659,6 +734,7 @@ cache_lookup_locked(const PgLocalCacheMapping *mapping,
 		{
 			memcpy(value, entry->value, entry->value_len);
 			*value_len = entry->value_len;
+			*source_xmin = entry->source_xmin;
 			hit = true;
 		}
 		access_clock =
@@ -668,10 +744,14 @@ cache_lookup_locked(const PgLocalCacheMapping *mapping,
 	return hit;
 }
 
-bool
-pglc_cache_lookup(const PgLocalCacheMapping *mapping, const char *canonical_key,
-				 char *value, Size value_capacity, Size *value_len,
-				 bool *negative, PgLocalCacheReadToken *token)
+static bool
+pglc_cache_lookup_internal(const PgLocalCacheMapping *mapping,
+						   const char *canonical_key,
+						   char *value, Size value_capacity,
+						   Size *value_len, bool *negative,
+						   TransactionId *source_xmin,
+						   PgLocalCacheReadToken *token,
+						   bool count_stats)
 {
 	bool		complete = false;
 	bool		hit;
@@ -680,11 +760,13 @@ pglc_cache_lookup(const PgLocalCacheMapping *mapping, const char *canonical_key,
 	memset(token, 0, sizeof(*token));
 	*negative = false;
 	*value_len = 0;
+	*source_xmin = InvalidTransactionId;
 
 	LWLockAcquire(pglc_shared->lock, LW_SHARED);
 	hit = cache_lookup_locked(mapping, canonical_key,
 							  value, value_capacity, value_len,
-							  negative, token, false, &complete);
+							  negative, source_xmin, token,
+							  false, &complete);
 	LWLockRelease(pglc_shared->lock);
 
 	if (!complete)
@@ -694,34 +776,118 @@ pglc_cache_lookup(const PgLocalCacheMapping *mapping, const char *canonical_key,
 		LWLockAcquire(pglc_shared->lock, LW_EXCLUSIVE);
 		hit = cache_lookup_locked(mapping, canonical_key,
 								  value, value_capacity, value_len,
-								  negative, token, true, &complete);
+								  negative, source_xmin, token,
+								  true, &complete);
 		LWLockRelease(pglc_shared->lock);
 	}
 
-	if (hit)
+	if (count_stats && hit)
 	{
 		pg_atomic_fetch_add_u64(&pglc_shared->cache_hits, 1);
 		if (*negative)
 			pg_atomic_fetch_add_u64(&pglc_shared->negative_hits, 1);
 	}
-	else
+	else if (count_stats)
 		pg_atomic_fetch_add_u64(&pglc_shared->cache_misses, 1);
 	return hit;
 }
 
-void
-pglc_cache_store(const PgLocalCacheMapping *mapping, const char *canonical_key,
-				const PgLocalCacheReadToken *token, const char *value,
-				Size value_len, bool negative)
+bool
+pglc_cache_lookup(const PgLocalCacheMapping *mapping, const char *canonical_key,
+				 char *value, Size value_capacity, Size *value_len,
+				 bool *negative, TransactionId *source_xmin,
+				 PgLocalCacheReadToken *token)
+{
+	return pglc_cache_lookup_internal(mapping, canonical_key,
+								  value, value_capacity, value_len,
+								  negative, source_xmin, token, true);
+}
+
+bool
+pglc_cache_lookup_quiet(const PgLocalCacheMapping *mapping,
+						const char *canonical_key,
+						char *value, Size value_capacity, Size *value_len,
+						bool *negative, TransactionId *source_xmin,
+						PgLocalCacheReadToken *token)
+{
+	return pglc_cache_lookup_internal(mapping, canonical_key,
+								  value, value_capacity, value_len,
+									  negative, source_xmin, token, false);
+}
+
+bool
+pglc_cache_retire_positive(const PgLocalCacheMapping *mapping,
+						   const char *canonical_key,
+						   const PgLocalCacheReadToken *token,
+						   TransactionId expected_xmin)
 {
 	PgLocalCacheRelationState *relation_state;
 	PgLocalCacheCacheEntry *entry;
+	bool		retired = false;
+
+	pglc_require_preload();
+	if (!token->cacheable || !token->has_entry ||
+		mapping->config_generation != token->config_generation)
+		return false;
+
+	LWLockAcquire(pglc_shared->lock, LW_EXCLUSIVE);
+	relation_state = get_relation_state(MyDatabaseId, mapping->relation_oid,
+										mapping->nspace, false);
+	entry = get_cache_entry(MyDatabaseId, mapping->relation_oid,
+							mapping->nspace, canonical_key, false);
+	if (relation_state != NULL && entry != NULL &&
+		pg_atomic_read_u64(&pglc_shared->config_generation) ==
+			token->config_generation &&
+		relation_state->relation_oid == mapping->relation_oid &&
+		entry->relation_oid == mapping->relation_oid &&
+		pglc_shared->global_dirty_writers == 0 &&
+		relation_state->dirty_writers == 0 && entry->dirty_writers == 0 &&
+		pglc_shared->global_version == token->global_version &&
+		relation_state->version == token->relation_version &&
+		entry->version == token->key_version &&
+		cache_entry_is_current_locked(entry, relation_state) &&
+		!entry->negative &&
+		TransactionIdEquals(entry->source_xmin, expected_xmin) &&
+		entry->source_observed_full_xid == token->source_observed_full_xid)
+	{
+		entry->valid = false;
+		entry->loading = false;
+		entry->load_id++;
+		entry->version = next_entry_generation();
+		entry->source_xmin = InvalidTransactionId;
+		entry->source_observed_full_xid = 0;
+		retired = true;
+	}
+	LWLockRelease(pglc_shared->lock);
+	return retired;
+}
+
+bool
+pglc_cache_store(const PgLocalCacheMapping *mapping, const char *canonical_key,
+				const PgLocalCacheReadToken *token, const char *value,
+				Size value_len, bool negative, uint64 load_id,
+				TransactionId source_xmin)
+{
+	PgLocalCacheRelationState *relation_state;
+	PgLocalCacheCacheEntry *entry;
+	bool		stored = false;
+	uint64		observed_full_xid;
 
 	if (!token->cacheable || !token->has_entry || value_len > PGLC_VALUE_MAX ||
 		mapping->config_generation != token->config_generation ||
 		pg_atomic_read_u64(&pglc_shared->config_generation) !=
 		token->config_generation)
-		return;
+		return false;
+
+	/*
+	 * Read PostgreSQL's FullTransactionId horizon before taking our cache
+	 * LWLock.  ReadNextFullTransactionId() takes XidGenLock, so this ordering
+	 * avoids nesting PostgreSQL's transaction lock inside the extension lock.
+	 * The horizon lets SQL readers reject an entry before a 32-bit heap xmin
+	 * can become ambiguous after wraparound.
+	 */
+	observed_full_xid =
+		U64FromFullTransactionId(ReadNextFullTransactionId());
 
 	LWLockAcquire(pglc_shared->lock, LW_EXCLUSIVE);
 	relation_state = get_relation_state(MyDatabaseId, mapping->relation_oid,
@@ -737,22 +903,174 @@ pglc_cache_store(const PgLocalCacheMapping *mapping, const char *canonical_key,
 		pglc_shared->global_dirty_writers == 0 &&
 		relation_state->dirty_writers == 0 &&
 		entry->dirty_writers == 0 &&
+		load_id != 0 && entry->loading && entry->load_id == load_id &&
 		pglc_shared->global_version == token->global_version &&
 		relation_state->version == token->relation_version &&
 		entry->version == token->key_version)
 	{
 		entry->negative = negative;
 		entry->value_len = negative ? 0 : value_len;
+		entry->source_xmin = negative ? InvalidTransactionId : source_xmin;
+		entry->source_observed_full_xid = observed_full_xid;
 		if (!negative && value_len > 0)
 			memcpy(entry->value, value, value_len);
 		entry->global_epoch = pglc_shared->global_epoch;
 		entry->relation_version = relation_state->version;
+		/*
+		 * The first successful fill wins.  Moving to a fresh generation
+		 * prevents a timed-out or orphaned former loader from overwriting it.
+		 * The successful owner fill also completes its outstanding lease.
+		 */
+		entry->version = next_entry_generation();
+		entry->loading = false;
+		entry->load_id++;
 		entry->valid = true;
+		stored = true;
 		pg_atomic_write_u64(
 			&entry->last_access,
 			pg_atomic_fetch_add_u64(&pglc_shared->clock, 1) + 1);
 	}
 	LWLockRelease(pglc_shared->lock);
+	return stored;
+}
+
+PgLocalCacheLoadClaim
+pglc_cache_claim_load(const PgLocalCacheMapping *mapping,
+					  const char *canonical_key,
+					  const PgLocalCacheReadToken *token,
+					  uint64 *load_id)
+{
+	PgLocalCacheRelationState *relation_state;
+	PgLocalCacheCacheEntry *entry;
+	PgLocalCacheLoadClaim result = PGLC_LOAD_BYPASS;
+	TimestampTz now = GetCurrentTimestamp();
+
+	*load_id = 0;
+	if (!token->cacheable || !token->has_entry)
+		return result;
+
+	LWLockAcquire(pglc_shared->lock, LW_EXCLUSIVE);
+	relation_state = get_relation_state(MyDatabaseId, mapping->relation_oid,
+									   mapping->nspace, false);
+	entry = get_cache_entry(MyDatabaseId, mapping->relation_oid,
+							mapping->nspace, canonical_key, false);
+	if (relation_state == NULL || entry == NULL ||
+		mapping->config_generation != token->config_generation ||
+		pg_atomic_read_u64(&pglc_shared->config_generation) !=
+			token->config_generation ||
+		relation_state->relation_oid != mapping->relation_oid ||
+		entry->relation_oid != mapping->relation_oid ||
+		pglc_shared->global_dirty_writers != 0 ||
+		relation_state->dirty_writers != 0 || entry->dirty_writers != 0 ||
+		pglc_shared->global_version != token->global_version ||
+		relation_state->version != token->relation_version)
+		goto done;
+
+	/*
+	 * A follower can observe the miss and then be descheduled until the owner
+	 * publishes a value.  A successful publish advances entry->version, so the
+	 * follower's token is stale even though the entry is now usable.  Let the
+	 * caller repeat its quiet lookup instead of bypassing to a duplicate SQL
+	 * read.  An invalid entry with a changed generation reaches the explicit
+	 * version retry immediately below.  That retry must also happen before
+	 * loader cleanup: a stale follower must not cancel a newer owner.  Global/
+	 * relation and dirty-writer fences above stay conservative because they
+	 * represent transaction invalidation, not an owner completing this load.
+	 */
+	if (cache_entry_is_current_locked(entry, relation_state))
+	{
+		result = PGLC_LOAD_RETRY;
+		goto done;
+	}
+	if (entry->version != token->key_version)
+	{
+		result = PGLC_LOAD_RETRY;
+		goto done;
+	}
+
+	if (entry->loading &&
+		(entry->load_global_version != token->global_version ||
+		 entry->load_relation_version != token->relation_version ||
+		 entry->load_key_version != token->key_version))
+	{
+		entry->loading = false;
+		entry->load_id++;
+	}
+
+	if (cache_load_is_active_locked(entry, now))
+	{
+		result = PGLC_LOAD_WAIT;
+		goto done;
+	}
+
+	entry->loading = true;
+	entry->load_started = now;
+	entry->load_global_version = token->global_version;
+	entry->load_relation_version = token->relation_version;
+	entry->load_key_version = token->key_version;
+	entry->load_id++;
+	if (entry->load_id == 0)
+		entry->load_id = 1;
+	*load_id = entry->load_id;
+	result = PGLC_LOAD_OWNER;
+	pg_atomic_fetch_add_u64(&pglc_shared->singleflight_leaders, 1);
+
+done:
+	LWLockRelease(pglc_shared->lock);
+	return result;
+}
+
+void
+pglc_cache_release_load(const PgLocalCacheMapping *mapping,
+						const char *canonical_key,
+						const PgLocalCacheReadToken *claim_token,
+						uint64 load_id)
+{
+	PgLocalCacheCacheEntry *entry;
+
+	pglc_require_preload();
+	if (load_id == 0 || claim_token == NULL ||
+		!claim_token->cacheable || !claim_token->has_entry)
+		return;
+	LWLockAcquire(pglc_shared->lock, LW_EXCLUSIVE);
+	entry = get_cache_entry(MyDatabaseId, mapping->relation_oid,
+							mapping->nspace, canonical_key, false);
+	if (entry != NULL &&
+		entry->key.database_oid == MyDatabaseId &&
+		strcmp(entry->key.nspace, mapping->nspace) == 0 &&
+		strcmp(entry->key.key, canonical_key) == 0 &&
+		entry->relation_oid == mapping->relation_oid &&
+		entry->version == claim_token->key_version &&
+		entry->loading && entry->load_id == load_id &&
+		entry->load_global_version == claim_token->global_version &&
+		entry->load_relation_version == claim_token->relation_version &&
+		entry->load_key_version == claim_token->key_version)
+		entry->loading = false;
+	LWLockRelease(pglc_shared->lock);
+}
+
+void
+pglc_note_singleflight_waiter(void)
+{
+	pg_atomic_fetch_add_u64(&pglc_shared->singleflight_waiters, 1);
+}
+
+void
+pglc_note_singleflight_reuse(void)
+{
+	pg_atomic_fetch_add_u64(&pglc_shared->singleflight_reuses, 1);
+}
+
+void
+pglc_note_singleflight_timeout(void)
+{
+	pg_atomic_fetch_add_u64(&pglc_shared->singleflight_timeouts, 1);
+}
+
+bool
+pglc_current_transaction_is_dirty(void)
+{
+	return local_dirty_hash != NULL || local_global_fallback;
 }
 
 uint64
@@ -992,6 +1310,9 @@ pglc_publish_dirty(void)
 
 	if (local_dirty_hash == NULL || local_dirty_published)
 		return;
+	/* A statement guard alone is a backend-local fence, not an invalidation. */
+	if (hash_get_num_entries(local_dirty_hash) == 0)
+		return;
 
 	LWLockAcquire(pglc_shared->lock, LW_EXCLUSIVE);
 	pglc_shared->global_version++;
@@ -1020,7 +1341,9 @@ pglc_publish_dirty(void)
 				if (entry->valid)
 					invalidated++;
 				entry->valid = false;
-				entry->version++;
+				entry->loading = false;
+				entry->load_id++;
+				entry->version = next_entry_generation();
 			}
 			else if (local->key.kind == PGLC_DIRTY_RELATION ||
 					 local->key.kind == PGLC_DIRTY_FORGET_RELATION)
@@ -1252,6 +1575,37 @@ collect_tuple_key(TriggerData *trigger_data, HeapTuple tuple,
 }
 
 Datum
+pg_local_cache_statement_guard(PG_FUNCTION_ARGS)
+{
+	TriggerData *trigger_data;
+	int16		expected_type;
+
+	if (!CALLED_AS_TRIGGER(fcinfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("pg_local_cache statement guard must be called as a trigger")));
+
+	trigger_data = (TriggerData *) fcinfo->context;
+	expected_type = TRIGGER_TYPE_BEFORE | TRIGGER_TYPE_INSERT |
+		TRIGGER_TYPE_UPDATE | TRIGGER_TYPE_DELETE | TRIGGER_TYPE_TRUNCATE;
+	if (!TRIGGER_FIRED_BEFORE(trigger_data->tg_event) ||
+		!TRIGGER_FIRED_FOR_STATEMENT(trigger_data->tg_event) ||
+		trigger_data->tg_trigger->tgtype != expected_type ||
+		trigger_data->tg_trigger->tgnargs != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("invalid pg_local_cache statement guard definition")));
+
+	/*
+	 * The empty transaction-local hash is a read-your-writes and 2PC fence.
+	 * Exact keys remain the responsibility of the AFTER invalidators, so this
+	 * does not invalidate shared entries or broaden commit invalidation.
+	 */
+	(void) get_local_dirty_hash();
+	PG_RETURN_POINTER(NULL);
+}
+
+Datum
 pg_local_cache_row_invalidate(PG_FUNCTION_ARGS)
 {
 	TriggerData *trigger_data;
@@ -1432,6 +1786,8 @@ pglc_stats_json(void)
 	uint64		positive = 0;
 	uint64		negative = 0;
 	uint64		dirty = 0;
+	uint64		loading = 0;
+	uint64		expired_loading = 0;
 	uint64		dirty_relations = 0;
 	uint64		relation_states = 0;
 	uint64		pending_forget = 0;
@@ -1439,10 +1795,18 @@ pglc_stats_json(void)
 	uint64		cache_hits;
 	uint64		cache_misses;
 	uint64		negative_hits;
+	uint64		sql_cache_hits;
+	uint64		sql_cache_misses;
+	uint64		sql_cache_fills;
+	uint64		sql_cache_bypasses;
 	uint64		database_reads;
 	uint64		database_writes;
 	uint64		invalidations;
 	uint64		evictions;
+	uint64		singleflight_leaders;
+	uint64		singleflight_waiters;
+	uint64		singleflight_reuses;
+	uint64		singleflight_timeouts;
 	uint64		active_clients;
 	uint64		rejected_connections;
 	uint64		authentication_failures;
@@ -1453,6 +1817,7 @@ pglc_stats_json(void)
 	HASH_SEQ_STATUS relation_sequence;
 	PgLocalCacheRelationState *relation_state;
 	uint32		global_dirty_writers;
+	TimestampTz now = GetCurrentTimestamp();
 
 	pglc_require_preload();
 	LWLockAcquire(pglc_shared->lock, LW_SHARED);
@@ -1470,6 +1835,14 @@ pglc_stats_json(void)
 			positive++;
 		if (entry->dirty_writers > 0)
 			dirty++;
+		if (entry->loading)
+		{
+			if (TimestampDifferenceExceeds(entry->load_started, now,
+									   cache_load_lease_ms()))
+				expired_loading++;
+			else
+				loading++;
+		}
 	}
 	hash_seq_init(&relation_sequence, pglc_relation_hash);
 	while ((relation_state = hash_seq_search(&relation_sequence)) != NULL)
@@ -1486,10 +1859,22 @@ pglc_stats_json(void)
 	cache_hits = pg_atomic_read_u64(&pglc_shared->cache_hits);
 	cache_misses = pg_atomic_read_u64(&pglc_shared->cache_misses);
 	negative_hits = pg_atomic_read_u64(&pglc_shared->negative_hits);
+	sql_cache_hits = pg_atomic_read_u64(&pglc_shared->sql_cache_hits);
+	sql_cache_misses = pg_atomic_read_u64(&pglc_shared->sql_cache_misses);
+	sql_cache_fills = pg_atomic_read_u64(&pglc_shared->sql_cache_fills);
+	sql_cache_bypasses = pg_atomic_read_u64(&pglc_shared->sql_cache_bypasses);
 	database_reads = pg_atomic_read_u64(&pglc_shared->database_reads);
 	database_writes = pg_atomic_read_u64(&pglc_shared->database_writes);
 	invalidations = pg_atomic_read_u64(&pglc_shared->invalidations);
 	evictions = pg_atomic_read_u64(&pglc_shared->evictions);
+	singleflight_leaders =
+		pg_atomic_read_u64(&pglc_shared->singleflight_leaders);
+	singleflight_waiters =
+		pg_atomic_read_u64(&pglc_shared->singleflight_waiters);
+	singleflight_reuses =
+		pg_atomic_read_u64(&pglc_shared->singleflight_reuses);
+	singleflight_timeouts =
+		pg_atomic_read_u64(&pglc_shared->singleflight_timeouts);
 	active_clients = pg_atomic_read_u64(&pglc_shared->active_clients);
 	rejected_connections =
 		pg_atomic_read_u64(&pglc_shared->rejected_connections);
@@ -1507,6 +1892,8 @@ pglc_stats_json(void)
 		",\"positive_entries\":" UINT64_FORMAT
 		",\"negative_entries\":" UINT64_FORMAT
 		",\"dirty_entries\":" UINT64_FORMAT
+		",\"loading_entries\":" UINT64_FORMAT
+		",\"expired_loading_entries\":" UINT64_FORMAT
 		",\"dirty_relations\":" UINT64_FORMAT
 		",\"relation_states\":" UINT64_FORMAT
 		",\"pending_forget\":" UINT64_FORMAT
@@ -1515,10 +1902,18 @@ pglc_stats_json(void)
 		",\"cache_hits\":" UINT64_FORMAT
 		",\"cache_misses\":" UINT64_FORMAT
 		",\"negative_hits\":" UINT64_FORMAT
+		",\"sql_cache_hits\":" UINT64_FORMAT
+		",\"sql_cache_misses\":" UINT64_FORMAT
+		",\"sql_cache_fills\":" UINT64_FORMAT
+		",\"sql_cache_bypasses\":" UINT64_FORMAT
 		",\"database_reads\":" UINT64_FORMAT
 		",\"database_writes\":" UINT64_FORMAT
 		",\"invalidations\":" UINT64_FORMAT
 		",\"evictions\":" UINT64_FORMAT
+		",\"singleflight_leaders\":" UINT64_FORMAT
+		",\"singleflight_waiters\":" UINT64_FORMAT
+		",\"singleflight_reuses\":" UINT64_FORMAT
+		",\"singleflight_timeouts\":" UINT64_FORMAT
 		",\"active_clients\":" UINT64_FORMAT
 		",\"rejected_connections\":" UINT64_FORMAT
 		",\"authentication_failures\":" UINT64_FORMAT
@@ -1530,11 +1925,16 @@ pglc_stats_json(void)
 		",\"cache_miss\":" UINT64_FORMAT
 		",\"cache_evict\":" UINT64_FORMAT
 		",\"sql_gets\":" UINT64_FORMAT "}",
-		total, positive, negative, dirty, dirty_relations,
+		total, positive, negative, dirty, loading, expired_loading,
+		dirty_relations,
 		relation_states, pending_forget,
 		global_dirty_writers, positive + negative,
 		cache_hits, cache_misses, negative_hits,
+		sql_cache_hits, sql_cache_misses, sql_cache_fills,
+		sql_cache_bypasses,
 		database_reads, database_writes, invalidations, evictions,
+		singleflight_leaders, singleflight_waiters,
+		singleflight_reuses, singleflight_timeouts,
 		active_clients, rejected_connections, authentication_failures,
 		protocol_errors, output_backpressure_events, slow_client_drops,
 		worker_starts,

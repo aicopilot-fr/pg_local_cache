@@ -45,6 +45,10 @@ Individual RESP runs:
 
 ## Direct stock PostgreSQL reference
 
+> Invalid historical lane: the harness passed `pgbench -d`, enabling
+> per-command debug logging. Do not use the PostgreSQL throughput below;
+> the RESP results above are unaffected.
+
 This section is deliberately separate: pgbench uses the PostgreSQL extended protocol against a separate stock PostgreSQL container and validates SQL errors, while the RESP harness validates every returned value. Statements in one pgbench pipeline share an implicit transaction/snapshot, so this amortizes more SQL overhead than independent transactions.
 
 | Client | Median value lookups/s | Min–max lookups/s | CV | Operations per pipeline batch |

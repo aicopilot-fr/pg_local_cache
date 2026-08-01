@@ -46,10 +46,18 @@ rm -f -- \
     "${output_directory}/failure.json" \
     "${output_directory}/failure.md" \
     "${output_directory}/process-failure.txt" \
+    "${output_directory}/scenarios.json" \
+    "${output_directory}/scenarios.md" \
+    "${output_directory}/scenarios-failure.json" \
+    "${output_directory}/scenarios-failure.md" \
     "${output_directory}/.comparison.json.tmp" \
     "${output_directory}/.comparison.md.tmp" \
     "${output_directory}/.failure.json.tmp" \
-    "${output_directory}/.failure.md.tmp"
+    "${output_directory}/.failure.md.tmp" \
+    "${output_directory}/.scenarios.json.tmp" \
+    "${output_directory}/.scenarios.md.tmp" \
+    "${output_directory}/.scenarios-failure.json.tmp" \
+    "${output_directory}/.scenarios-failure.md.tmp"
 
 postgres_password="$(openssl rand -hex 32)"
 auth_token="$(openssl rand -hex 32)"
@@ -105,6 +113,10 @@ read -r PGLC_BENCH_HARNESS_SHA256 _ < <(
     openssl dgst -sha256 -r "${script_directory}/compare.py"
 )
 export PGLC_BENCH_HARNESS_SHA256
+read -r PGLC_BENCH_SCENARIO_HARNESS_SHA256 _ < <(
+    openssl dgst -sha256 -r "${script_directory}/scenarios.py"
+)
+export PGLC_BENCH_SCENARIO_HARNESS_SHA256
 PGLC_BENCH_SOURCE_REVISION="unknown"
 if command -v git >/dev/null; then
     PGLC_BENCH_SOURCE_REVISION="$(
@@ -127,9 +139,20 @@ if ((benchmark_status != 0)) && \
     printf 'benchmark process exited with status %s before writing a report\n' \
         "$benchmark_status" > "${output_directory}/process-failure.txt"
 fi
+
+scenario_status=0
+if [[ "${PGLC_BENCH_RUN_SCENARIOS:-1}" != "0" ]]; then
+    "${compose[@]}" run --rm \
+        --entrypoint python3 \
+        benchmark \
+        /usr/local/lib/pg_local_cache/scenarios.py || scenario_status="$?"
+fi
+
 if ((benchmark_status != 0)); then
     exit "$benchmark_status"
 fi
+if ((scenario_status != 0)); then
+    exit "$scenario_status"
+fi
 
-printf 'Benchmark reports: %s/comparison.json and %s/comparison.md\n' \
-    "$output_directory" "$output_directory"
+printf 'Benchmark reports are in %s\n' "$output_directory"

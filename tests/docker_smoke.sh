@@ -17,6 +17,7 @@ mismatch_database="postgres"
 worker_role="${PG_LOCAL_CACHE_SMOKE_ROLE:-local_cache_worker}"
 app_role="${PG_LOCAL_CACHE_SMOKE_APP_ROLE:-app_user}"
 app_password="${PG_LOCAL_CACHE_SMOKE_APP_PASSWORD:-SmokeAppPassword_0123456789}"
+cache_admin_role="${PG_LOCAL_CACHE_SMOKE_ADMIN_ROLE:-local_cache_admin}"
 cache_entries="${PG_LOCAL_CACHE_SMOKE_CACHE_ENTRIES:-65536}"
 max_prepared_transactions="${PG_LOCAL_CACHE_SMOKE_MAX_PREPARED_TRANSACTIONS:-0}"
 require_small_cache="${PG_LOCAL_CACHE_SMOKE_REQUIRE_SMALL_CACHE:-0}"
@@ -25,6 +26,7 @@ require_2pc="${PG_LOCAL_CACHE_SMOKE_REQUIRE_2PC:-0}"
 [[ "$database" =~ ^[A-Za-z_][A-Za-z0-9_$]{0,62}$ ]]
 [[ "$worker_role" =~ ^[A-Za-z_][A-Za-z0-9_$]{0,62}$ ]]
 [[ "$app_role" =~ ^[A-Za-z_][A-Za-z0-9_$]{0,62}$ ]]
+[[ "$cache_admin_role" =~ ^[A-Za-z_][A-Za-z0-9_$]{0,62}$ ]]
 [[ ${#app_password} -ge 16 ]]
 [[ "$cache_entries" =~ ^[0-9]+$ ]]
 [[ "$max_prepared_transactions" =~ ^[0-9]+$ ]]
@@ -133,9 +135,9 @@ app_acl="$(
         --host 127.0.0.1 --username "$app_role" --dbname "$database" \
         --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
         --command \
-        "SELECT pg_catalog.has_schema_privilege(current_user, 'local_cache', 'USAGE'), COALESCE((SELECT pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT') FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'local_cache' AND c.relname = 'mapping'), false), COALESCE((SELECT bool_or(pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'local_cache' AND p.proname = 'register_mapping'), false), COALESCE((SELECT bool_or(pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'local_cache' AND p.proname = 'unregister_mapping'), false), COALESCE((SELECT bool_or(pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'local_cache' AND p.proname = 'invalidate'), false)"
+        "SELECT pg_catalog.has_schema_privilege(current_user, 'local_cache', 'USAGE'), COALESCE((SELECT pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT') FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'local_cache' AND c.relname = 'mapping'), false), COALESCE((SELECT bool_or(pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'local_cache' AND p.proname = 'register_mapping'), false), COALESCE((SELECT bool_or(pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'local_cache' AND p.proname = 'unregister_mapping'), false), COALESCE((SELECT bool_or(pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'local_cache' AND p.proname = 'invalidate'), false), COALESCE((SELECT bool_or(pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'local_cache' AND p.proname = 'attach_table'), false)"
 )"
-[[ "$app_acl" == "f|f|f|f|f" ]]
+[[ "$app_acl" == "f|f|f|f|f|f" ]]
 
 compose exec -T postgres \
     psql --username postgres --dbname "$database" --no-psqlrc \
@@ -155,7 +157,71 @@ CREATE TABLE public.pglc_attach_other_smoke (
     id bigint PRIMARY KEY,
     value text NOT NULL
 );
+CREATE TABLE public.pglc_attach_native_smoke (
+    id bigint PRIMARY KEY,
+    value text NOT NULL
+);
+CREATE TABLE public.pglc_attach_no_pk_smoke (
+    id bigint NOT NULL,
+    value text NOT NULL
+);
+CREATE TABLE public.pglc_attach_rls_smoke (
+    id bigint PRIMARY KEY,
+    value text NOT NULL
+);
+ALTER TABLE public.pglc_attach_rls_smoke ENABLE ROW LEVEL SECURITY;
 SQL
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --set cache_admin_role="$cache_admin_role" <<'SQL'
+SELECT pg_catalog.format(
+    'CREATE ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS',
+    :'cache_admin_role'
+)
+WHERE NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = :'cache_admin_role'
+)
+\gexec
+GRANT USAGE ON SCHEMA local_cache TO :"cache_admin_role";
+GRANT EXECUTE ON FUNCTION local_cache.attach_table(
+    regclass, name, text, boolean
+) TO :"cache_admin_role";
+SET ROLE :"cache_admin_role";
+SELECT local_cache.attach_table('public.pglc_attach_native_smoke'::regclass);
+RESET ROLE;
+SQL
+
+native_attach_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+		"SELECT m.key_column, m.value_column, m.writable, (SELECT count(*) FROM pg_catalog.pg_trigger t WHERE t.tgrelid = m.relation AND t.tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate') AND t.tgenabled = 'A'), pg_catalog.has_table_privilege('$worker_role', m.relation, 'SELECT') FROM local_cache.mapping m WHERE m.namespace = 'pglc_attach_native_smoke'"
+)"
+[[ "$native_attach_state" == "id|value|f|3|t" ]]
+
+for rejected_relation in pglc_attach_no_pk_smoke pglc_attach_rls_smoke; do
+    native_attach_error="${temporary_directory}/${rejected_relation}.error"
+    if compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --set ON_ERROR_STOP=1 --set cache_admin_role="$cache_admin_role" \
+        --command \
+        "SET ROLE \"$cache_admin_role\"; SELECT local_cache.attach_table('public.${rejected_relation}'::regclass);" \
+        >"$native_attach_error" 2>&1; then
+        printf 'native attach unexpectedly accepted %s\n' "$rejected_relation" >&2
+        exit 1
+    fi
+done
+
+native_failure_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT (SELECT count(*) FROM local_cache.mapping WHERE relation IN ('public.pglc_attach_no_pk_smoke'::regclass, 'public.pglc_attach_rls_smoke'::regclass)), pg_catalog.has_table_privilege('$worker_role', 'public.pglc_attach_no_pk_smoke', 'SELECT'), pg_catalog.has_table_privilege('$worker_role', 'public.pglc_attach_rls_smoke', 'SELECT')"
+)"
+[[ "$native_failure_state" == "0|f|f" ]]
 
 database_mismatch_error="${temporary_directory}/attach-database.error"
 if compose exec -T postgres pg_local_cache_attach \
@@ -201,9 +267,9 @@ attach_state="$(
         psql --username postgres --dbname "$database" --no-psqlrc \
         --tuples-only --no-align --set ON_ERROR_STOP=1 \
         --command \
-        "SELECT m.key_column, m.value_column, m.writable, (SELECT count(*) FROM pg_catalog.pg_trigger t WHERE t.tgrelid = m.relation AND t.tgname IN ('pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate') AND t.tgenabled = 'A'), pg_catalog.has_schema_privilege('$worker_role', 'public', 'USAGE'), pg_catalog.has_table_privilege('$worker_role', m.relation, 'SELECT') AND pg_catalog.has_table_privilege('$worker_role', m.relation, 'INSERT') AND pg_catalog.has_table_privilege('$worker_role', m.relation, 'UPDATE') AND pg_catalog.has_table_privilege('$worker_role', m.relation, 'DELETE') FROM local_cache.mapping m WHERE m.namespace = 'pglc_attach_smoke'"
+		"SELECT m.key_column, m.value_column, m.writable, (SELECT count(*) FROM pg_catalog.pg_trigger t WHERE t.tgrelid = m.relation AND t.tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate') AND t.tgenabled = 'A'), pg_catalog.has_schema_privilege('$worker_role', 'public', 'USAGE'), pg_catalog.has_table_privilege('$worker_role', m.relation, 'SELECT') AND pg_catalog.has_table_privilege('$worker_role', m.relation, 'INSERT') AND pg_catalog.has_table_privilege('$worker_role', m.relation, 'UPDATE') AND pg_catalog.has_table_privilege('$worker_role', m.relation, 'DELETE') FROM local_cache.mapping m WHERE m.namespace = 'pglc_attach_smoke'"
 )"
-[[ "$attach_state" == "id|value|t|2|t|t" ]]
+[[ "$attach_state" == "id|value|t|3|t|t" ]]
 
 namespace_conflict_error="${temporary_directory}/attach-namespace.error"
 if compose exec -T postgres pg_local_cache_attach \
@@ -255,7 +321,7 @@ grep -Fq 'table must have exactly one primary-key column' "$composite_error"
 compose exec -T postgres \
     psql --username postgres --dbname "$database" --no-psqlrc \
     --set ON_ERROR_STOP=1 --command \
-    "SELECT local_cache.unregister_mapping('pglc_attach_smoke'); DROP TABLE public.pglc_attach_smoke, public.pglc_attach_composite_smoke, public.pglc_attach_other_smoke"
+    "SELECT local_cache.unregister_mapping('pglc_attach_smoke'); SELECT local_cache.unregister_mapping('pglc_attach_native_smoke'); DROP TABLE public.pglc_attach_smoke, public.pglc_attach_composite_smoke, public.pglc_attach_other_smoke, public.pglc_attach_native_smoke, public.pglc_attach_no_pk_smoke, public.pglc_attach_rls_smoke"
 
 extension_version="$(
     compose exec -T postgres \
@@ -300,6 +366,18 @@ PG_LOCAL_CACHE_TEST_WRITER_ROLE="$app_role" \
 PG_LOCAL_CACHE_TEST_WRITER_PASSWORD="$app_password" \
 PG_LOCAL_CACHE_TEST_WRITER_HOST="127.0.0.1" \
     python3 -B "${repository_directory}/tests/pipeline_integration.py"
+
+PG_LOCAL_CACHE_PSQL="$psql_wrapper" \
+PGHOST="/var/run/postgresql" \
+PGPORT="5432" \
+PGDATABASE="$database" \
+PG_LOCAL_CACHE_RESP_HOST="127.0.0.1" \
+PG_LOCAL_CACHE_RESP_PORT="$cache_host_port" \
+PG_LOCAL_CACHE_AUTH_TOKEN="$auth_token" \
+PG_LOCAL_CACHE_TEST_APP_ROLE="$app_role" \
+PG_LOCAL_CACHE_TEST_APP_PASSWORD="$app_password" \
+PG_LOCAL_CACHE_TEST_APP_HOST="127.0.0.1" \
+    python3 -B "${repository_directory}/tests/sql_fastpath_integration.py"
 
 PG_LOCAL_CACHE_PSQL="$psql_wrapper" \
 PGHOST="/var/run/postgresql" \
