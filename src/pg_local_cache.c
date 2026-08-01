@@ -13,6 +13,7 @@
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
+#include "storage/lmgr.h"
 #include "storage/shmem.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -90,6 +91,7 @@ void		_PG_init(void);
 PG_FUNCTION_INFO_V1(pg_local_cache_row_invalidate);
 PG_FUNCTION_INFO_V1(pg_local_cache_truncate_invalidate);
 PG_FUNCTION_INFO_V1(pg_local_cache_statement_guard);
+PG_FUNCTION_INFO_V1(pg_local_cache_lock_relation);
 PG_FUNCTION_INFO_V1(pg_local_cache_reload);
 PG_FUNCTION_INFO_V1(pg_local_cache_invalidate);
 PG_FUNCTION_INFO_V1(pg_local_cache_stats);
@@ -2073,6 +2075,28 @@ pg_local_cache_truncate_invalidate(PG_FUNCTION_ARGS)
 						 RelationGetRelid(trigger_data->tg_relation),
 						 nspace);
 	PG_RETURN_POINTER(NULL);
+}
+
+Datum
+pg_local_cache_lock_relation(PG_FUNCTION_ARGS)
+{
+	Oid			relation_oid = PG_GETARG_OID(0);
+
+	/*
+	 * Administrative SQL must address tables by their already-resolved OID.
+	 * Holding the same lock mode used by CREATE TRIGGER closes rename/drop and
+	 * catalog-shape races until the surrounding transaction finishes.
+	 */
+	if (!OidIsValid(relation_oid))
+		PG_RETURN_BOOL(false);
+	LockRelationOid(relation_oid, ShareRowExclusiveLock);
+	if (get_rel_name(relation_oid) == NULL)
+	{
+		UnlockRelationOid(relation_oid, ShareRowExclusiveLock);
+		PG_RETURN_BOOL(false);
+	}
+
+	PG_RETURN_BOOL(true);
 }
 
 Datum

@@ -147,9 +147,50 @@ app_acl="$(
         --host 127.0.0.1 --username "$app_role" --dbname "$database" \
         --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
         --command \
-        "SELECT pg_catalog.has_schema_privilege(current_user, 'local_cache', 'USAGE'), COALESCE((SELECT pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT') FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'local_cache' AND c.relname = 'mapping'), false), COALESCE((SELECT bool_or(pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'local_cache' AND p.proname = 'register_mapping'), false), COALESCE((SELECT bool_or(pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'local_cache' AND p.proname = 'unregister_mapping'), false), COALESCE((SELECT bool_or(pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'local_cache' AND p.proname = 'invalidate'), false), COALESCE((SELECT bool_or(pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'local_cache' AND p.proname = 'attach_table'), false)"
+        "SELECT pg_catalog.has_schema_privilege(current_user, 'local_cache', 'USAGE'), COALESCE((SELECT pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT') FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'local_cache' AND c.relname = 'mapping'), false), COALESCE((SELECT bool_or(pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'local_cache' AND p.proname = 'detach_table'), false), COALESCE((SELECT bool_or(pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'local_cache' AND p.proname = 'unregister_mapping'), false), COALESCE((SELECT bool_or(pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'local_cache' AND p.proname = 'invalidate'), false), COALESCE((SELECT bool_or(pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'local_cache' AND p.proname = 'attach_table'), false)"
 )"
 [[ "$app_acl" == "f|f|f|f|f|f" ]]
+
+protected_table_state_before="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT (SELECT count(*) FROM local_cache.mapping), pg_catalog.has_table_privilege('$worker_role', 'local_cache.mapping', 'SELECT'), pg_catalog.has_table_privilege('$worker_role', 'local_cache.mapping', 'INSERT'), pg_catalog.has_table_privilege('$worker_role', 'local_cache.mapping', 'UPDATE'), pg_catalog.has_table_privilege('$worker_role', 'local_cache.mapping', 'DELETE'), (SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgrelid = 'local_cache.mapping'::regclass AND tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate')), (SELECT pg_catalog.string_agg(oid::text || ':' || tgname, ',' ORDER BY oid) FROM pg_catalog.pg_trigger WHERE tgrelid = 'local_cache.mapping'::regclass)"
+)"
+
+protected_whole_error="${temporary_directory}/attach-protected-whole.error"
+if compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "SELECT local_cache.attach_table('local_cache.mapping'::regclass, true, 'forbidden-system-whole')" \
+    >"$protected_whole_error" 2>&1; then
+    printf 'extension-owned mapping table was unexpectedly accepted for whole-row attach\n' >&2
+    exit 1
+fi
+grep -Fq 'cannot attach extension or system table' "$protected_whole_error"
+
+protected_scalar_error="${temporary_directory}/attach-protected-scalar.error"
+if compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "SELECT local_cache.attach_value('local_cache.mapping'::regclass, 'writable', 'forbidden-system-scalar', true)" \
+    >"$protected_scalar_error" 2>&1; then
+    printf 'extension-owned mapping table was unexpectedly accepted for scalar attach\n' >&2
+    exit 1
+fi
+grep -Fq 'cannot attach extension or system table' "$protected_scalar_error"
+
+protected_table_state_after="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT (SELECT count(*) FROM local_cache.mapping), pg_catalog.has_table_privilege('$worker_role', 'local_cache.mapping', 'SELECT'), pg_catalog.has_table_privilege('$worker_role', 'local_cache.mapping', 'INSERT'), pg_catalog.has_table_privilege('$worker_role', 'local_cache.mapping', 'UPDATE'), pg_catalog.has_table_privilege('$worker_role', 'local_cache.mapping', 'DELETE'), (SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgrelid = 'local_cache.mapping'::regclass AND tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate')), (SELECT pg_catalog.string_agg(oid::text || ':' || tgname, ',' ORDER BY oid) FROM pg_catalog.pg_trigger WHERE tgrelid = 'local_cache.mapping'::regclass)"
+)"
+[[ "$protected_table_state_after" == "$protected_table_state_before" ]]
+[[ "$protected_table_state_after" == 0\|t\|f\|f\|f\|0\|* ]]
+[[ "$protected_table_state_after" == *':pg_local_cache_mapping_reload'* ]]
 
 compose exec -T postgres \
     psql --username postgres --dbname "$database" --no-psqlrc \
@@ -200,7 +241,7 @@ WHERE NOT EXISTS (
 )
 \gexec
 GRANT USAGE ON SCHEMA local_cache TO :"cache_admin_role";
-GRANT EXECUTE ON FUNCTION local_cache.attach_table(regclass)
+GRANT EXECUTE ON FUNCTION local_cache.attach_table(regclass, boolean, text)
     TO :"cache_admin_role";
 SET ROLE :"cache_admin_role";
 SELECT local_cache.attach_table('public.pglc_attach_native_smoke'::regclass);
@@ -212,9 +253,9 @@ native_attach_state="$(
         psql --username postgres --dbname "$database" --no-psqlrc \
         --tuples-only --no-align --set ON_ERROR_STOP=1 \
         --command \
-		"SELECT m.key_column, m.value_column, m.writable, (SELECT count(*) FROM pg_catalog.pg_trigger t WHERE t.tgrelid = m.relation AND t.tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate') AND t.tgenabled = 'A'), pg_catalog.has_table_privilege('$worker_role', m.relation, 'SELECT') FROM local_cache.mapping m WHERE m.namespace = 'public.pglc_attach_native_smoke'"
+		"SELECT m.key_columns::text, m.value_column, m.writable, (SELECT count(*) FROM pg_catalog.pg_trigger t WHERE t.tgrelid = m.relation AND t.tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate') AND t.tgenabled = 'A'), pg_catalog.has_table_privilege('$worker_role', m.relation, 'SELECT') FROM local_cache.mapping m WHERE m.namespace = 'public.pglc_attach_native_smoke'"
 )"
-[[ "$native_attach_state" == "id||f|3|t" ]]
+[[ "$native_attach_state" == "{id}||f|3|t" ]]
 
 for rejected_relation in pglc_attach_no_pk_smoke pglc_attach_rls_smoke; do
     native_attach_error="${temporary_directory}/${rejected_relation}.error"
@@ -238,22 +279,11 @@ native_failure_state="$(
 )"
 [[ "$native_failure_state" == "0|f|f" ]]
 
-bad_key_error="${temporary_directory}/attach-bad-key.error"
-if compose exec -T postgres \
-    psql --username postgres --dbname "$database" --no-psqlrc \
-    --set ON_ERROR_STOP=1 --command \
-    "SELECT local_cache.register_value_mapping('pglc_bad_key', 'public.pglc_attach_bad_key_smoke'::regclass, 'missing_key', 'value', false)" \
-    >"$bad_key_error" 2>&1; then
-    printf 'nonexistent key column was unexpectedly accepted\n' >&2
-    exit 1
-fi
-grep -Fq 'one or more key columns' "$bad_key_error"
-
 reserved_namespace_error="${temporary_directory}/attach-reserved-namespace.error"
 if compose exec -T postgres \
     psql --username postgres --dbname "$database" --no-psqlrc \
     --set ON_ERROR_STOP=1 --command \
-    "SELECT local_cache.register_value_mapping('CRUD', 'public.pglc_attach_bad_key_smoke'::regclass, 'id', 'value', false)" \
+    "SELECT local_cache.attach_value('public.pglc_attach_bad_key_smoke'::regclass, 'value', 'CRUD', false)" \
     >"$reserved_namespace_error" 2>&1; then
     printf 'reserved CRUD namespace was unexpectedly accepted\n' >&2
     exit 1
@@ -269,48 +299,13 @@ bad_registration_state="$(
 )"
 [[ "$bad_registration_state" == "0|0|f" ]]
 
-legacy_two_args="$(
+scalar_attach="$(
     compose exec -T postgres \
         psql --username postgres --dbname "$database" --no-psqlrc \
         --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
-        "SELECT (result->>'whole_row')::boolean, result->'templates'->>'get' FROM (SELECT local_cache.attach_table('public.pglc_attach_smoke'::regclass, 'value') AS result) AS attached; SELECT local_cache.unregister_mapping('public.pglc_attach_smoke')"
+        "SELECT (result->>'whole_row')::boolean, result->'templates'->>'get', (result->>'writable')::boolean FROM (SELECT local_cache.attach_value('public.pglc_attach_smoke'::regclass, 'value', 'scalar-smoke', true) AS result) AS attached; SELECT local_cache.unregister_mapping('scalar-smoke')"
 )"
-[[ "$legacy_two_args" == "f|GET public.pglc_attach_smoke:<id>" ]]
-
-legacy_inferred_value="$(
-    compose exec -T postgres \
-        psql --username postgres --dbname "$database" --no-psqlrc \
-        --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
-        "SELECT (result->>'whole_row')::boolean, result->>'value_column' FROM (SELECT local_cache.attach_value('public.pglc_attach_smoke'::regclass, NULL::name, 'legacy-inferred') AS result) AS attached; SELECT local_cache.unregister_mapping('legacy-inferred')"
-)"
-[[ "$legacy_inferred_value" == "f|value" ]]
-
-legacy_named_writable_error="${temporary_directory}/legacy-named-writable.error"
-if compose exec -T postgres \
-    psql --username postgres --dbname "$database" --no-psqlrc \
-    --set ON_ERROR_STOP=1 --command \
-    "SELECT local_cache.attach_table('public.pglc_attach_smoke'::regclass, p_writable => true)" \
-    >"$legacy_named_writable_error" 2>&1; then
-    printf 'legacy named p_writable unexpectedly changed to whole-row mode\n' >&2
-    exit 1
-fi
-grep -Fq 'p_writable => boolean' "$legacy_named_writable_error"
-
-legacy_three_args="$(
-    compose exec -T postgres \
-        psql --username postgres --dbname "$database" --no-psqlrc \
-        --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
-        "SELECT (result->>'whole_row')::boolean, result->>'namespace' FROM (SELECT local_cache.attach_table('public.pglc_attach_smoke'::regclass, 'value', 'legacy-three') AS result) AS attached; SELECT local_cache.unregister_mapping('legacy-three')"
-)"
-[[ "$legacy_three_args" == "f|legacy-three" ]]
-
-legacy_four_args="$(
-    compose exec -T postgres \
-        psql --username postgres --dbname "$database" --no-psqlrc \
-        --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
-        "SELECT (result->>'whole_row')::boolean, (result->>'writable')::boolean FROM (SELECT local_cache.attach_table('public.pglc_attach_smoke'::regclass, 'value', 'legacy-four', true) AS result) AS attached; SELECT local_cache.unregister_mapping('legacy-four')"
-)"
-[[ "$legacy_four_args" == "f|t" ]]
+[[ "$scalar_attach" == "f|GET scalar-smoke:<id>|t" ]]
 
 whole_two_args="$(
     compose exec -T postgres \
@@ -324,9 +319,9 @@ whole_three_args="$(
     compose exec -T postgres \
         psql --username postgres --dbname "$database" --no-psqlrc \
         --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
-        "SELECT (result->>'whole_row')::boolean, result->>'namespace', (result->>'writable')::boolean FROM (SELECT local_cache.attach_table('public.pglc_attach_smoke'::regclass, true, 'whole-three') AS result) AS attached; SELECT local_cache.unregister_mapping('whole-three')"
+        "SELECT (result->>'whole_row')::boolean, result->>'namespace', (result->>'writable')::boolean FROM (SELECT local_cache.attach_table('public.pglc_attach_smoke'::regclass, p_writable => true, p_namespace => 'whole-three') AS result) AS attached; SELECT local_cache.detach_table('public.pglc_attach_smoke'::regclass); SELECT local_cache.detach_table('public.pglc_attach_smoke'::regclass)"
 )"
-[[ "$whole_three_args" == "t|whole-three|t" ]]
+[[ "$whole_three_args" == $'t|whole-three|t\nt\nf' ]]
 
 database_mismatch_error="${temporary_directory}/attach-database.error"
 if compose exec -T postgres pg_local_cache_attach \
@@ -374,9 +369,9 @@ attach_state="$(
         psql --username postgres --dbname "$database" --no-psqlrc \
         --tuples-only --no-align --set ON_ERROR_STOP=1 \
         --command \
-		"SELECT m.key_column, m.value_column, m.writable, (SELECT count(*) FROM pg_catalog.pg_trigger t WHERE t.tgrelid = m.relation AND t.tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate') AND t.tgenabled = 'A'), pg_catalog.has_schema_privilege('$worker_role', 'public', 'USAGE'), pg_catalog.has_table_privilege('$worker_role', m.relation, 'SELECT') AND pg_catalog.has_table_privilege('$worker_role', m.relation, 'INSERT') AND pg_catalog.has_table_privilege('$worker_role', m.relation, 'UPDATE') AND pg_catalog.has_table_privilege('$worker_role', m.relation, 'DELETE') FROM local_cache.mapping m WHERE m.namespace = 'pglc_attach_smoke'"
+		"SELECT m.key_columns::text, m.value_column, m.writable, (SELECT count(*) FROM pg_catalog.pg_trigger t WHERE t.tgrelid = m.relation AND t.tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate') AND t.tgenabled = 'A'), pg_catalog.has_schema_privilege('$worker_role', 'public', 'USAGE'), pg_catalog.has_table_privilege('$worker_role', m.relation, 'SELECT') AND pg_catalog.has_table_privilege('$worker_role', m.relation, 'INSERT') AND pg_catalog.has_table_privilege('$worker_role', m.relation, 'UPDATE') AND pg_catalog.has_table_privilege('$worker_role', m.relation, 'DELETE') FROM local_cache.mapping m WHERE m.namespace = 'pglc_attach_smoke'"
 )"
-[[ "$attach_state" == "id||t|3|t|t" ]]
+[[ "$attach_state" == "{id}||t|3|t|t" ]]
 
 namespace_conflict_error="${temporary_directory}/attach-namespace.error"
 if compose exec -T postgres pg_local_cache_attach \
@@ -443,6 +438,672 @@ composite_state="$(
 )"
 [[ "$composite_state" == "{tenant_id,id}|t|f" ]]
 
+owned_trigger_oids_before="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT pg_catalog.string_agg(t.oid::text, ',' ORDER BY t.tgname) FROM pg_catalog.pg_trigger AS t WHERE t.tgrelid = 'public.pglc_attach_other_smoke'::regclass AND t.tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate')"
+)"
+[[ -n "$owned_trigger_oids_before" ]]
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --tuples-only --no-align --set ON_ERROR_STOP=1 \
+    --command \
+    "SELECT local_cache.attach_table('public.pglc_attach_other_smoke'::regclass, false, 'pglc_attach_smoke')" \
+    >/dev/null
+
+owned_trigger_oids_after="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT pg_catalog.string_agg(t.oid::text, ',' ORDER BY t.tgname) FROM pg_catalog.pg_trigger AS t WHERE t.tgrelid = 'public.pglc_attach_other_smoke'::regclass AND t.tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate')"
+)"
+[[ "$owned_trigger_oids_after" == "$owned_trigger_oids_before" ]]
+
+owned_trigger_dependencies="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "WITH managed AS (SELECT t.oid FROM pg_catalog.pg_trigger AS t WHERE t.tgrelid = 'public.pglc_attach_other_smoke'::regclass AND t.tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate')), dependency_counts AS (SELECT managed.oid, pg_catalog.count(dep.objid) AS dependency_count FROM managed LEFT JOIN (SELECT d.objid FROM pg_catalog.pg_depend AS d JOIN pg_catalog.pg_extension AS e ON e.oid = d.refobjid AND e.extname = 'pg_local_cache' WHERE d.classid = 'pg_catalog.pg_trigger'::regclass AND d.objsubid = 0 AND d.refclassid = 'pg_catalog.pg_extension'::regclass AND d.refobjsubid = 0 AND d.deptype = 'x') AS dep ON dep.objid = managed.oid GROUP BY managed.oid) SELECT pg_catalog.count(*), pg_catalog.sum(dependency_count), pg_catalog.min(dependency_count), pg_catalog.max(dependency_count) FROM dependency_counts"
+)"
+[[ "$owned_trigger_dependencies" == "3|3|1|1" ]]
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 <<'SQL'
+CREATE FUNCTION public.pglc_foreign_reserved_trigger()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+    RETURN NULL;
+END;
+$function$;
+CREATE TABLE public.pglc_foreign_trigger_smoke (
+    id bigint PRIMARY KEY,
+    value text NOT NULL
+);
+CREATE TRIGGER pg_local_cache_statement_guard
+    BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE
+    ON public.pglc_foreign_trigger_smoke
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION public.pglc_foreign_reserved_trigger();
+SQL
+
+foreign_trigger_oid_before="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT oid FROM pg_catalog.pg_trigger WHERE tgrelid = 'public.pglc_foreign_trigger_smoke'::regclass AND tgname = 'pg_local_cache_statement_guard'"
+)"
+[[ -n "$foreign_trigger_oid_before" ]]
+
+foreign_trigger_error="${temporary_directory}/attach-foreign-trigger.error"
+if compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "SELECT local_cache.attach_table('public.pglc_foreign_trigger_smoke'::regclass, false, 'foreign-trigger-smoke')" \
+    >"$foreign_trigger_error" 2>&1; then
+    printf 'foreign reserved trigger was unexpectedly accepted\n' >&2
+    exit 1
+fi
+grep -Fq 'reserved pg_local_cache trigger name' "$foreign_trigger_error"
+
+foreign_trigger_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT (SELECT count(*) FROM local_cache.mapping WHERE namespace = 'foreign-trigger-smoke'), t.oid = ${foreign_trigger_oid_before}::oid, t.tgfoid = 'public.pglc_foreign_reserved_trigger()'::regprocedure, (SELECT count(*) FROM pg_catalog.pg_depend AS d JOIN pg_catalog.pg_extension AS e ON e.oid = d.refobjid AND e.extname = 'pg_local_cache' WHERE d.classid = 'pg_catalog.pg_trigger'::regclass AND d.objid = t.oid AND d.deptype = 'x'), pg_catalog.has_table_privilege('$worker_role', t.tgrelid, 'SELECT') FROM pg_catalog.pg_trigger AS t WHERE t.tgrelid = 'public.pglc_foreign_trigger_smoke'::regclass AND t.tgname = 'pg_local_cache_statement_guard'"
+)"
+[[ "$foreign_trigger_state" == "0|t|t|0|f" ]]
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "DROP TABLE public.pglc_foreign_trigger_smoke; DROP FUNCTION public.pglc_foreign_reserved_trigger()"
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE TABLE public.pglc_unmarked_trigger_smoke (id bigint PRIMARY KEY, value text NOT NULL); SELECT local_cache.attach_table('public.pglc_unmarked_trigger_smoke'::regclass, false, 'unmarked-trigger-smoke'); DROP TRIGGER pg_local_cache_statement_guard ON public.pglc_unmarked_trigger_smoke; CREATE TRIGGER pg_local_cache_statement_guard BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON public.pglc_unmarked_trigger_smoke FOR EACH STATEMENT EXECUTE FUNCTION local_cache._statement_guard()" \
+    >/dev/null
+
+unmarked_trigger_oid_before="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT oid FROM pg_catalog.pg_trigger WHERE tgrelid = 'public.pglc_unmarked_trigger_smoke'::regclass AND tgname = 'pg_local_cache_statement_guard'"
+)"
+[[ -n "$unmarked_trigger_oid_before" ]]
+
+unmarked_trigger_error="${temporary_directory}/reconcile-unmarked-trigger.error"
+if compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "SELECT local_cache.reconcile_table('public.pglc_unmarked_trigger_smoke'::regclass)" \
+    >"$unmarked_trigger_error" 2>&1; then
+    printf 'unmarked replacement trigger was unexpectedly accepted\n' >&2
+    exit 1
+fi
+grep -Fq 'reserved pg_local_cache trigger name' "$unmarked_trigger_error"
+
+unmarked_trigger_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT (SELECT count(*) FROM local_cache.mapping WHERE namespace = 'unmarked-trigger-smoke'), t.oid = ${unmarked_trigger_oid_before}::oid, t.tgfoid = 'local_cache._statement_guard()'::regprocedure, (SELECT count(*) FROM pg_catalog.pg_depend AS d JOIN pg_catalog.pg_extension AS e ON e.oid = d.refobjid AND e.extname = 'pg_local_cache' WHERE d.classid = 'pg_catalog.pg_trigger'::regclass AND d.objid = t.oid AND d.deptype = 'x') FROM pg_catalog.pg_trigger AS t WHERE t.tgrelid = 'public.pglc_unmarked_trigger_smoke'::regclass AND t.tgname = 'pg_local_cache_statement_guard'"
+)"
+[[ "$unmarked_trigger_state" == "1|t|t|0" ]]
+
+unmarked_detach_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT local_cache.detach_table('public.pglc_unmarked_trigger_smoke'::regclass); SELECT (SELECT count(*) FROM local_cache.mapping WHERE namespace = 'unmarked-trigger-smoke'), (SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgrelid = 'public.pglc_unmarked_trigger_smoke'::regclass AND tgname LIKE 'pg_local_cache_%'), (SELECT oid = ${unmarked_trigger_oid_before}::oid FROM pg_catalog.pg_trigger WHERE tgrelid = 'public.pglc_unmarked_trigger_smoke'::regclass AND tgname = 'pg_local_cache_statement_guard'), pg_catalog.has_table_privilege('$worker_role', 'public.pglc_unmarked_trigger_smoke', 'SELECT')"
+)"
+[[ "$unmarked_detach_state" == $'t\n0|1|t|f' ]]
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "DROP TABLE public.pglc_unmarked_trigger_smoke"
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE TABLE public.pglc_drop_cleanup_smoke (id bigint PRIMARY KEY, value text NOT NULL); SELECT local_cache.attach_table('public.pglc_drop_cleanup_smoke'::regclass, false, 'drop-cleanup-smoke')" \
+    >/dev/null
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "DROP TABLE public.pglc_drop_cleanup_smoke"
+
+drop_cleanup_count="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT count(*) FROM local_cache.mapping WHERE namespace = 'drop-cleanup-smoke'"
+)"
+[[ "$drop_cleanup_count" == "0" ]]
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE TABLE public.pglc_drop_cleanup_smoke (id bigint PRIMARY KEY, value text NOT NULL)"
+drop_namespace_reuse="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT result->>'namespace' FROM (SELECT local_cache.attach_table('public.pglc_drop_cleanup_smoke'::regclass, false, 'drop-cleanup-smoke') AS result) AS attached"
+)"
+[[ "$drop_namespace_reuse" == "drop-cleanup-smoke" ]]
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "SELECT local_cache.detach_table('public.pglc_drop_cleanup_smoke'::regclass); DROP TABLE public.pglc_drop_cleanup_smoke" \
+    >/dev/null
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE TABLE public.pglc_drop_rollback_smoke (id bigint PRIMARY KEY, value text NOT NULL); SELECT local_cache.attach_table('public.pglc_drop_rollback_smoke'::regclass, false, 'drop-rollback-smoke')" \
+    >/dev/null
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "BEGIN; DROP TABLE public.pglc_drop_rollback_smoke; ROLLBACK" \
+    >/dev/null
+
+drop_rollback_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT pg_catalog.to_regclass('public.pglc_drop_rollback_smoke') IS NOT NULL, (SELECT count(*) FROM local_cache.mapping WHERE namespace = 'drop-rollback-smoke'), (SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgrelid = 'public.pglc_drop_rollback_smoke'::regclass AND tgname LIKE 'pg_local_cache_%')"
+)"
+[[ "$drop_rollback_state" == "t|1|3" ]]
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "SELECT local_cache.detach_table('public.pglc_drop_rollback_smoke'::regclass); DROP TABLE public.pglc_drop_rollback_smoke" \
+    >/dev/null
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "DROP TRIGGER pg_local_cache_row_invalidate ON public.pglc_attach_composite_smoke; REVOKE ALL PRIVILEGES ON TABLE public.pglc_attach_composite_smoke FROM \"$worker_role\"" \
+    >/dev/null
+
+reconcile_precondition="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT (SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgrelid = 'public.pglc_attach_composite_smoke'::regclass AND tgname LIKE 'pg_local_cache_%'), pg_catalog.has_table_privilege('$worker_role', 'public.pglc_attach_composite_smoke', 'SELECT')"
+)"
+[[ "$reconcile_precondition" == "2|f" ]]
+
+reconcile_result="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT result->>'namespace' FROM (SELECT local_cache.reconcile_table('public.pglc_attach_composite_smoke'::regclass) AS result) AS reconciled"
+)"
+[[ "$reconcile_result" == "pglc_attach_composite_smoke" ]]
+
+reconcile_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT (SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgrelid = 'public.pglc_attach_composite_smoke'::regclass AND tgname LIKE 'pg_local_cache_%'), (SELECT count(*) FROM pg_catalog.pg_depend AS d JOIN pg_catalog.pg_extension AS e ON e.oid = d.refobjid AND e.extname = 'pg_local_cache' JOIN pg_catalog.pg_trigger AS t ON t.oid = d.objid WHERE d.classid = 'pg_catalog.pg_trigger'::regclass AND d.deptype = 'x' AND t.tgrelid = 'public.pglc_attach_composite_smoke'::regclass AND t.tgname LIKE 'pg_local_cache_%'), pg_catalog.has_table_privilege('$worker_role', 'public.pglc_attach_composite_smoke', 'SELECT')"
+)"
+[[ "$reconcile_state" == "3|3|t" ]]
+
+reconcile_all_oids_before="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT pg_catalog.string_agg(t.oid::text, ',' ORDER BY t.oid) FROM pg_catalog.pg_trigger AS t JOIN local_cache.mapping AS m ON m.relation = t.tgrelid WHERE t.tgname LIKE 'pg_local_cache_%'"
+)"
+reconcile_all_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT local_cache.reconcile_all(), (SELECT count(*) FROM local_cache.mapping); SELECT local_cache.reconcile_all(), (SELECT count(*) FROM local_cache.mapping)"
+)"
+reconcile_all_oids_after="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT pg_catalog.string_agg(t.oid::text, ',' ORDER BY t.oid) FROM pg_catalog.pg_trigger AS t JOIN local_cache.mapping AS m ON m.relation = t.tgrelid WHERE t.tgname LIKE 'pg_local_cache_%'"
+)"
+mapping_count="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command "SELECT count(*) FROM local_cache.mapping"
+)"
+[[ "$reconcile_all_state" == "${mapping_count}|${mapping_count}"$'\n'"${mapping_count}|${mapping_count}" ]]
+[[ "$reconcile_all_oids_after" == "$reconcile_all_oids_before" ]]
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE TABLE public.pglc_owned_trigger_rename_smoke (id bigint PRIMARY KEY, value text NOT NULL); SELECT local_cache.attach_table('public.pglc_owned_trigger_rename_smoke'::regclass, false, 'owned-trigger-rename-smoke')" \
+    >/dev/null
+owned_row_trigger_oid="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT oid FROM pg_catalog.pg_trigger WHERE tgrelid = 'public.pglc_owned_trigger_rename_smoke'::regclass AND tgname = 'pg_local_cache_row_invalidate'"
+)"
+[[ "$owned_row_trigger_oid" =~ ^[0-9]+$ ]]
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "ALTER TRIGGER pg_local_cache_row_invalidate ON public.pglc_owned_trigger_rename_smoke RENAME TO pglc_renamed_owned_row_invalidate; SELECT local_cache.reconcile_table('public.pglc_owned_trigger_rename_smoke'::regclass)" \
+    >/dev/null
+
+owned_trigger_repair_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "WITH owned AS (SELECT t.*, d.objid AS extension_dependency FROM pg_catalog.pg_trigger AS t JOIN pg_catalog.pg_depend AS d ON d.classid = 'pg_catalog.pg_trigger'::regclass AND d.objid = t.oid AND d.objsubid = 0 AND d.refclassid = 'pg_catalog.pg_extension'::regclass AND d.refobjsubid = 0 AND d.deptype = 'x' JOIN pg_catalog.pg_extension AS e ON e.oid = d.refobjid AND e.extname = 'pg_local_cache' WHERE t.tgrelid = 'public.pglc_owned_trigger_rename_smoke'::regclass AND t.tgfoid IN ('local_cache._statement_guard()'::regprocedure, 'local_cache._row_invalidate()'::regprocedure, 'local_cache._truncate_invalidate()'::regprocedure)) SELECT count(DISTINCT oid), count(DISTINCT oid) FILTER (WHERE tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate')), (SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgrelid = 'public.pglc_owned_trigger_rename_smoke'::regclass AND tgname = 'pglc_renamed_owned_row_invalidate'), bool_and(tgenabled = 'A'), count(extension_dependency), count(*) FILTER (WHERE tgname = 'pg_local_cache_row_invalidate' AND tgfoid = 'local_cache._row_invalidate()'::regprocedure AND tgtype = 29 AND oid <> ${owned_row_trigger_oid}::oid) FROM owned"
+)"
+[[ "$owned_trigger_repair_state" == "3|3|0|t|3|1" ]]
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "ALTER TRIGGER pg_local_cache_truncate_invalidate ON public.pglc_owned_trigger_rename_smoke RENAME TO pglc_renamed_owned_truncate_invalidate"
+owned_trigger_detach_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT local_cache.detach_table('public.pglc_owned_trigger_rename_smoke'::regclass); SELECT (SELECT count(*) FROM local_cache.mapping WHERE namespace = 'owned-trigger-rename-smoke'), (SELECT count(*) FROM pg_catalog.pg_trigger AS t JOIN pg_catalog.pg_depend AS d ON d.classid = 'pg_catalog.pg_trigger'::regclass AND d.objid = t.oid AND d.deptype = 'x' JOIN pg_catalog.pg_extension AS e ON e.oid = d.refobjid AND e.extname = 'pg_local_cache' WHERE t.tgrelid = 'public.pglc_owned_trigger_rename_smoke'::regclass AND t.tgfoid IN ('local_cache._statement_guard()'::regprocedure, 'local_cache._row_invalidate()'::regprocedure, 'local_cache._truncate_invalidate()'::regprocedure)), (SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgrelid = 'public.pglc_owned_trigger_rename_smoke'::regclass AND tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate', 'pglc_renamed_owned_truncate_invalidate')), pg_catalog.has_table_privilege('$worker_role', 'public.pglc_owned_trigger_rename_smoke', 'SELECT')"
+)"
+[[ "$owned_trigger_detach_state" == $'t\n0|0|0|f' ]]
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "DROP TABLE public.pglc_owned_trigger_rename_smoke"
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE SCHEMA pglc_schema_rename_smoke; CREATE TABLE pglc_schema_rename_smoke.pglc_schema_table_smoke (id bigint PRIMARY KEY, value text NOT NULL); INSERT INTO pglc_schema_rename_smoke.pglc_schema_table_smoke VALUES (1, 'schema-row'); SELECT local_cache.attach_table('pglc_schema_rename_smoke.pglc_schema_table_smoke'::regclass, false, 'schema-rename-smoke')" \
+    >/dev/null
+schema_relation_oid="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT 'pglc_schema_rename_smoke.pglc_schema_table_smoke'::regclass::oid"
+)"
+schema_trigger_oids_before="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT pg_catalog.string_agg(t.oid::text, ',' ORDER BY t.tgname) FROM pg_catalog.pg_trigger AS t WHERE t.tgrelid = ${schema_relation_oid}::oid AND t.tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate')"
+)"
+[[ "$schema_relation_oid" =~ ^[0-9]+$ ]]
+[[ -n "$schema_trigger_oids_before" ]]
+
+check_schema_wire_name() {
+    local expected_schema="$1"
+    local rejected_schema="${2:-}"
+    PGLC_RESP_HELPER="${repository_directory}/tests/whole_row_integration.py" \
+    PGLC_EXPECTED_SCHEMA="$expected_schema" \
+    PGLC_REJECTED_SCHEMA="$rejected_schema" \
+    PGDATABASE="$database" \
+    PG_LOCAL_CACHE_RESP_HOST="127.0.0.1" \
+    PG_LOCAL_CACHE_RESP_PORT="$cache_host_port" \
+    PG_LOCAL_CACHE_AUTH_TOKEN="$auth_token" \
+    PG_LOCAL_CACHE_TEST_APP_ROLE="$app_role" \
+    PG_LOCAL_CACHE_TEST_APP_PASSWORD="$app_password" \
+        python3 -B - <<'PY'
+import importlib.util
+import json
+import os
+import time
+
+spec = importlib.util.spec_from_file_location(
+    "pglc_whole_row_helper", os.environ["PGLC_RESP_HELPER"]
+)
+assert spec is not None and spec.loader is not None
+helper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(helper)
+
+database = os.environ["PGDATABASE"]
+expected_schema = os.environ["PGLC_EXPECTED_SCHEMA"]
+rejected_schema = os.environ["PGLC_REJECTED_SCHEMA"]
+
+
+def key(schema: str) -> str:
+    return (
+        f"CRUD:{database}.{schema}.pglc_schema_table_smoke:"
+        + json.dumps({"id": 1}, separators=(",", ":"))
+    )
+
+
+client = helper.RespClient()
+try:
+    deadline = time.monotonic() + 10
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            last = client.command("GET", key(expected_schema))
+            if isinstance(last, str) and json.loads(last).get("value") == "schema-row":
+                break
+        except (helper.RespError, json.JSONDecodeError) as error:
+            last = error
+        time.sleep(0.05)
+    else:
+        raise AssertionError(
+            f"whole-row mapping did not load schema {expected_schema!r}: {last!r}"
+        )
+
+    if rejected_schema:
+        deadline = time.monotonic() + 10
+        last = None
+        while time.monotonic() < deadline:
+            try:
+                last = client.command("GET", key(rejected_schema))
+            except helper.RespError as error:
+                last = error
+                if "unknown KVik table mapping" in str(error):
+                    break
+            time.sleep(0.05)
+        else:
+            raise AssertionError(
+                f"stale whole-row mapping remained for schema {rejected_schema!r}: "
+                f"{last!r}"
+            )
+finally:
+    client.close()
+PY
+}
+
+wait_for_mapping_health() {
+    local mapping_health=""
+    for _attempt in {1..60}; do
+        mapping_health="$(
+            compose exec -T postgres \
+                psql --username postgres --dbname "$database" --no-psqlrc \
+                --tuples-only --no-align --set ON_ERROR_STOP=1 \
+                --command \
+                "SELECT (local_cache.health()->>'ready')::boolean, (local_cache.health()->>'workers_with_incomplete_mappings')::bigint"
+        )"
+        if [[ "$mapping_health" == "t|0" ]]; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    printf 'mapping health did not recover after DDL: %s\n' \
+        "$mapping_health" >&2
+    return 1
+}
+
+wait_for_mapping_incomplete() {
+    local mapping_health=""
+    for _attempt in {1..60}; do
+        mapping_health="$(
+            compose exec -T postgres \
+                psql --username postgres --dbname "$database" --no-psqlrc \
+                --tuples-only --no-align --set ON_ERROR_STOP=1 \
+                --command \
+                "SELECT (local_cache.health()->>'ready')::boolean, (local_cache.health()->>'workers_with_incomplete_mappings')::bigint"
+        )"
+        if [[ "$mapping_health" =~ ^f\|[1-9][0-9]*$ ]]; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    printf 'mapping health did not fail closed after invalid DDL: %s\n' \
+        "$mapping_health" >&2
+    return 1
+}
+
+check_schema_wire_name pglc_schema_rename_smoke
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "ALTER SCHEMA pglc_schema_rename_smoke RENAME TO pglc_schema_renamed_smoke"
+check_schema_wire_name pglc_schema_renamed_smoke pglc_schema_rename_smoke
+wait_for_mapping_health
+
+schema_rename_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT m.relation::oid = ${schema_relation_oid}::oid, pg_catalog.to_regclass('pglc_schema_renamed_smoke.pglc_schema_table_smoke')::oid = ${schema_relation_oid}::oid, (SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgrelid = ${schema_relation_oid}::oid AND tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate')), (SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgrelid = ${schema_relation_oid}::oid AND tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate') AND tgenabled = 'A'), (SELECT count(*) FROM pg_catalog.pg_trigger AS t JOIN pg_catalog.pg_depend AS d ON d.classid = 'pg_catalog.pg_trigger'::regclass AND d.objid = t.oid AND d.deptype = 'x' JOIN pg_catalog.pg_extension AS e ON e.oid = d.refobjid AND e.extname = 'pg_local_cache' WHERE t.tgrelid = ${schema_relation_oid}::oid), pg_catalog.has_schema_privilege('$worker_role', 'pglc_schema_renamed_smoke', 'USAGE'), pg_catalog.has_table_privilege('$worker_role', ${schema_relation_oid}::oid, 'SELECT'), (local_cache.health()->>'ready')::boolean, (local_cache.health()->>'workers_with_incomplete_mappings')::bigint FROM local_cache.mapping AS m WHERE m.namespace = 'schema-rename-smoke'"
+)"
+[[ "$schema_rename_state" == "t|t|3|3|3|t|t|t|0" ]]
+
+schema_reconcile_result="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT result->>'relation' FROM (SELECT local_cache.reconcile_table(${schema_relation_oid}::oid::regclass) AS result) AS reconciled"
+)"
+[[ "$schema_reconcile_result" == "pglc_schema_renamed_smoke.pglc_schema_table_smoke" ]]
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "BEGIN; ALTER SCHEMA pglc_schema_renamed_smoke RENAME TO pglc_schema_rollback_smoke; ROLLBACK" \
+    >/dev/null
+check_schema_wire_name pglc_schema_renamed_smoke pglc_schema_rollback_smoke
+wait_for_mapping_health
+
+schema_trigger_oids_after="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT pg_catalog.string_agg(t.oid::text, ',' ORDER BY t.tgname) FROM pg_catalog.pg_trigger AS t WHERE t.tgrelid = ${schema_relation_oid}::oid AND t.tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate')"
+)"
+schema_rollback_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT pg_catalog.to_regnamespace('pglc_schema_renamed_smoke') IS NOT NULL, pg_catalog.to_regnamespace('pglc_schema_rollback_smoke') IS NULL, (SELECT relation::oid = ${schema_relation_oid}::oid FROM local_cache.mapping WHERE namespace = 'schema-rename-smoke'), pg_catalog.has_schema_privilege('$worker_role', 'pglc_schema_renamed_smoke', 'USAGE'), pg_catalog.has_table_privilege('$worker_role', ${schema_relation_oid}::oid, 'SELECT'), (local_cache.health()->>'ready')::boolean, (local_cache.health()->>'workers_with_incomplete_mappings')::bigint"
+)"
+[[ "$schema_trigger_oids_after" == "$schema_trigger_oids_before" ]]
+[[ "$schema_rollback_state" == "t|t|t|t|t|t|0" ]]
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "SELECT local_cache.detach_table(${schema_relation_oid}::oid::regclass); DROP TABLE pglc_schema_renamed_smoke.pglc_schema_table_smoke; DROP SCHEMA pglc_schema_renamed_smoke" \
+    >/dev/null
+
+# Worker-side catalog validation must fail closed if privileges, ownership, or
+# extension membership drift after a successful attach.  Each recovery path
+# keeps the mapping and restores readiness only after the invariant is fixed.
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE TABLE public.pglc_worker_drift_smoke (id bigint PRIMARY KEY, value text NOT NULL); SELECT local_cache.attach_table('public.pglc_worker_drift_smoke'::regclass, false, 'worker-drift-smoke')" \
+    >/dev/null
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT INSERT ON TABLE public.pglc_worker_drift_smoke TO \"$worker_role\""
+wait_for_mapping_incomplete
+
+read_only_drift_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT count(*), pg_catalog.has_table_privilege('$worker_role', relation, 'INSERT') FROM local_cache.mapping WHERE namespace = 'worker-drift-smoke' GROUP BY relation"
+)"
+[[ "$read_only_drift_state" == "1|t" ]]
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "SELECT local_cache.reconcile_table('public.pglc_worker_drift_smoke'::regclass)" \
+    >/dev/null
+wait_for_mapping_health
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "ALTER TABLE public.pglc_worker_drift_smoke OWNER TO \"$worker_role\""
+wait_for_mapping_incomplete
+
+worker_owner_drift_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT count(*), c.relowner = '$worker_role'::regrole FROM local_cache.mapping AS m JOIN pg_catalog.pg_class AS c ON c.oid = m.relation WHERE m.namespace = 'worker-drift-smoke' GROUP BY c.relowner"
+)"
+[[ "$worker_owner_drift_state" == "1|t" ]]
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "ALTER TABLE public.pglc_worker_drift_smoke OWNER TO postgres; SELECT local_cache.reconcile_table('public.pglc_worker_drift_smoke'::regclass)" \
+    >/dev/null
+wait_for_mapping_health
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "ALTER EXTENSION plpgsql ADD TABLE public.pglc_worker_drift_smoke"
+wait_for_mapping_incomplete
+
+extension_member_plan="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "EXPLAIN (COSTS OFF) SELECT * FROM public.pglc_worker_drift_smoke WHERE id = 1"
+)"
+[[ "$extension_member_plan" != *"Custom Scan (pg_local_cache_sql)"* ]]
+
+extension_member_drift_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT count(*), EXISTS (SELECT 1 FROM pg_catalog.pg_depend AS d JOIN pg_catalog.pg_extension AS e ON e.oid = d.refobjid AND e.extname = 'plpgsql' WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = 'public.pglc_worker_drift_smoke'::regclass AND d.deptype = 'e') FROM local_cache.mapping WHERE namespace = 'worker-drift-smoke'"
+)"
+[[ "$extension_member_drift_state" == "1|t" ]]
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "ALTER EXTENSION plpgsql DROP TABLE public.pglc_worker_drift_smoke"
+wait_for_mapping_health
+
+
+extension_member_recovered_plan="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "EXPLAIN (COSTS OFF) SELECT * FROM public.pglc_worker_drift_smoke WHERE id = 1"
+)"
+[[ "$extension_member_recovered_plan" == *"Custom Scan (pg_local_cache_sql)"* ]]
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "SELECT local_cache.detach_table('public.pglc_worker_drift_smoke'::regclass); DROP TABLE public.pglc_worker_drift_smoke" \
+    >/dev/null
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE TABLE public.pglc_oid_race_smoke (id bigint PRIMARY KEY, value text NOT NULL)"
+race_original_oid="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command "SELECT 'public.pglc_oid_race_smoke'::regclass::oid"
+)"
+[[ "$race_original_oid" =~ ^[0-9]+$ ]]
+
+race_ddl_log="${temporary_directory}/oid-race-ddl.log"
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "BEGIN; ALTER TABLE public.pglc_oid_race_smoke RENAME TO pglc_oid_race_original_smoke; CREATE TABLE public.pglc_oid_race_smoke (id bigint PRIMARY KEY, value text NOT NULL); SELECT pg_catalog.pg_sleep(3); COMMIT" \
+    >"$race_ddl_log" 2>&1 &
+race_ddl_pid=$!
+
+race_lock_observed=false
+for _attempt in {1..30}; do
+    race_lock_state="$(
+        compose exec -T postgres \
+            psql --username postgres --dbname "$database" --no-psqlrc \
+            --tuples-only --no-align --set ON_ERROR_STOP=1 \
+            --command \
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks WHERE relation = ${race_original_oid}::oid AND mode = 'AccessExclusiveLock' AND granted)"
+    )"
+    if [[ "$race_lock_state" == "t" ]]; then
+        race_lock_observed=true
+        break
+    fi
+    sleep 0.1
+done
+if [[ "$race_lock_observed" != true ]]; then
+    wait "$race_ddl_pid" || true
+    cat "$race_ddl_log" >&2
+    printf 'did not observe the concurrent rename lock\n' >&2
+    exit 1
+fi
+
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "SELECT local_cache.attach_table(${race_original_oid}::oid::regclass, false, 'oid-race-smoke')" \
+    >/dev/null
+wait "$race_ddl_pid"
+
+race_attach_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT m.relation::oid = ${race_original_oid}::oid, (SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgrelid = ${race_original_oid}::oid AND tgname LIKE 'pg_local_cache_%'), pg_catalog.has_table_privilege('$worker_role', ${race_original_oid}::oid, 'SELECT'), (SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgrelid = 'public.pglc_oid_race_smoke'::regclass AND tgname LIKE 'pg_local_cache_%'), pg_catalog.has_table_privilege('$worker_role', 'public.pglc_oid_race_smoke', 'SELECT') FROM local_cache.mapping AS m WHERE m.namespace = 'oid-race-smoke'"
+)"
+[[ "$race_attach_state" == "t|3|t|0|f" ]]
+compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "SELECT local_cache.detach_table(${race_original_oid}::oid::regclass); DROP TABLE public.pglc_oid_race_original_smoke, public.pglc_oid_race_smoke" \
+    >/dev/null
+
 mapping_dump="$(
     compose exec -T postgres pg_dump --username postgres --dbname "$database" \
         --data-only --no-owner --no-privileges
@@ -455,16 +1116,6 @@ compose exec -T postgres \
     --set ON_ERROR_STOP=1 --command \
     "SELECT local_cache.unregister_mapping('pglc_attach_smoke'); SELECT local_cache.unregister_mapping('public.pglc_attach_native_smoke'); SELECT local_cache.unregister_mapping('pglc_attach_composite_smoke'); DROP TABLE public.pglc_attach_smoke, public.pglc_attach_composite_smoke, public.pglc_attach_other_smoke, public.pglc_attach_native_smoke, public.pglc_attach_no_pk_smoke, public.pglc_attach_bad_key_smoke, public.pglc_attach_rls_smoke"
 
-PG_LOCAL_CACHE_PSQL="$psql_wrapper" \
-PGHOST="/var/run/postgresql" \
-PGPORT="5432" \
-PGDATABASE="$database" \
-PG_LOCAL_CACHE_RESP_HOST="127.0.0.1" \
-PG_LOCAL_CACHE_RESP_PORT="$cache_host_port" \
-PG_LOCAL_CACHE_AUTH_TOKEN="$auth_token" \
-PG_LOCAL_CACHE_TEST_ROLE="$worker_role" \
-    python3 -B "${repository_directory}/tests/upgrade_integration.py"
-
 extension_version="$(
     compose exec -T postgres \
         psql --username postgres --dbname "$database" --no-psqlrc \
@@ -472,7 +1123,7 @@ extension_version="$(
         --command \
         "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_local_cache'"
 )"
-[[ "$extension_version" == "1.1.0" ]]
+[[ "$extension_version" == "1.0.0" ]]
 
 worker_count="$(
     compose exec -T postgres \

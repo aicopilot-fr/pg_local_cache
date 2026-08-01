@@ -8,13 +8,16 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "catalog/dependency.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_index.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type_d.h"
 #include "commands/explain.h"
+#include "commands/extension.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "fmgr.h"
@@ -37,6 +40,7 @@
 #include "utils/rel.h"
 #include "utils/reltrigger.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/typcache.h"
 
 #include "pg_local_cache.h"
@@ -48,7 +52,7 @@
  *
  *     SELECT <direct columns> FROM mapped_table WHERE primary_key = Const/$1
  *
- * and wraps the exact unique IndexPath that PostgreSQL would otherwise use.
+ * and wraps the exact primary-key IndexPath PostgreSQL would otherwise use.
  * The original IndexScan remains a child and is used for every miss or safety
  * fallback, so clients keep using ordinary SQL and ordinary PostgreSQL ACLs.
  */
@@ -248,7 +252,6 @@ pglc_sql_read_mapping_once(Oid relation_oid, uint64 generation,
 	AttrNumber namespace_attno;
 	AttrNumber relation_attno;
 	AttrNumber key_columns_attno;
-	AttrNumber legacy_key_attno;
 	AttrNumber value_attno;
 	bool		found = false;
 
@@ -265,12 +268,10 @@ pglc_sql_read_mapping_once(Oid relation_oid, uint64 generation,
 	namespace_attno = get_attnum(mapping_oid, "namespace");
 	relation_attno = get_attnum(mapping_oid, "relation");
 	key_columns_attno = get_attnum(mapping_oid, "key_columns");
-	legacy_key_attno = get_attnum(mapping_oid, "key_column");
 	value_attno = get_attnum(mapping_oid, "value_column");
 	if (namespace_attno == InvalidAttrNumber ||
 		relation_attno == InvalidAttrNumber ||
-		(key_columns_attno == InvalidAttrNumber &&
-		 legacy_key_attno == InvalidAttrNumber) ||
+		key_columns_attno == InvalidAttrNumber ||
 		value_attno == InvalidAttrNumber)
 	{
 		table_close(mapping_relation, AccessShareLock);
@@ -307,7 +308,6 @@ pglc_sql_read_mapping_once(Oid relation_oid, uint64 generation,
 			meta->relation_oid = relation_oid;
 			meta->config_generation = generation;
 
-			if (key_columns_attno != InvalidAttrNumber)
 			{
 				ArrayType  *key_array;
 				Datum	   *key_datums;
@@ -322,7 +322,7 @@ pglc_sql_read_mapping_once(Oid relation_oid, uint64 generation,
 					break;
 				key_array = DatumGetArrayTypeP(datum);
 				get_typlenbyvalalign(NAMEOID, &type_length, &type_by_value,
-									 &type_alignment);
+								 &type_alignment);
 				deconstruct_array(key_array, NAMEOID, type_length,
 							  type_by_value, type_alignment,
 							  &key_datums, &key_nulls, &key_count);
@@ -342,17 +342,6 @@ pglc_sql_read_mapping_once(Oid relation_oid, uint64 generation,
 				}
 				if (key_index != key_count)
 					break;
-			}
-			else
-			{
-				Name		key_name;
-
-				datum = slot_getattr(slot, legacy_key_attno, &isnull);
-				if (isnull)
-					break;
-				key_name = DatumGetName(datum);
-				meta->key_count = 1;
-				strlcpy(meta->key_columns[0], NameStr(*key_name), NAMEDATALEN);
 			}
 
 			found = true;
@@ -435,10 +424,26 @@ pglc_sql_trigger_function(Oid function_oid, Oid namespace_oid,
 }
 
 static bool
-pglc_sql_triggers_valid(Relation relation, const PgLocalCacheSqlMeta *meta)
+pglc_sql_trigger_owned_by_extension(Oid trigger_oid, Oid extension_oid)
+{
+	List	   *extension_oids;
+	bool		owned;
+
+	if (!OidIsValid(trigger_oid) || !OidIsValid(extension_oid))
+		return false;
+	extension_oids = getAutoExtensionsOfObject(TriggerRelationId, trigger_oid);
+	owned = list_member_oid(extension_oids, extension_oid);
+	list_free(extension_oids);
+	return owned;
+}
+
+static bool
+pglc_sql_triggers_valid(Relation relation, const PgLocalCacheSqlMeta *meta,
+						bool check_extension_ownership)
 {
 	TriggerDesc *trigger_desc = relation->trigdesc;
 	Oid			namespace_oid;
+	Oid			extension_oid;
 	bool		guard_found = false;
 	bool		row_found = false;
 	bool		truncate_found = false;
@@ -449,6 +454,13 @@ pglc_sql_triggers_valid(Relation relation, const PgLocalCacheSqlMeta *meta)
 	namespace_oid = get_namespace_oid("local_cache", true);
 	if (!OidIsValid(namespace_oid))
 		return false;
+	extension_oid = InvalidOid;
+	if (check_extension_ownership)
+	{
+		extension_oid = get_extension_oid("pg_local_cache", true);
+		if (!OidIsValid(extension_oid))
+			return false;
+	}
 
 	for (index = 0; index < trigger_desc->numtriggers; index++)
 	{
@@ -467,6 +479,9 @@ pglc_sql_triggers_valid(Relation relation, const PgLocalCacheSqlMeta *meta)
 		{
 			guard_found = trigger->tgenabled == TRIGGER_FIRES_ALWAYS &&
 				plain_trigger &&
+				(!check_extension_ownership ||
+				 pglc_sql_trigger_owned_by_extension(trigger->tgoid,
+											extension_oid)) &&
 				trigger->tgtype == (TRIGGER_TYPE_BEFORE | TRIGGER_TYPE_INSERT |
 					TRIGGER_TYPE_UPDATE | TRIGGER_TYPE_DELETE |
 					TRIGGER_TYPE_TRUNCATE) &&
@@ -494,6 +509,9 @@ pglc_sql_triggers_valid(Relation relation, const PgLocalCacheSqlMeta *meta)
 
 			row_found = trigger->tgenabled == TRIGGER_FIRES_ALWAYS &&
 				plain_trigger &&
+				(!check_extension_ownership ||
+				 pglc_sql_trigger_owned_by_extension(trigger->tgoid,
+											extension_oid)) &&
 				trigger->tgtype == (TRIGGER_TYPE_ROW | TRIGGER_TYPE_INSERT |
 					TRIGGER_TYPE_UPDATE | TRIGGER_TYPE_DELETE) &&
 				key_arguments_match &&
@@ -505,6 +523,9 @@ pglc_sql_triggers_valid(Relation relation, const PgLocalCacheSqlMeta *meta)
 		{
 			truncate_found = trigger->tgenabled == TRIGGER_FIRES_ALWAYS &&
 				plain_trigger &&
+				(!check_extension_ownership ||
+				 pglc_sql_trigger_owned_by_extension(trigger->tgoid,
+											extension_oid)) &&
 				trigger->tgtype == TRIGGER_TYPE_TRUNCATE &&
 				trigger->tgnargs == 1 &&
 				pglc_sql_trigger_function(trigger->tgfoid, namespace_oid,
@@ -569,6 +590,33 @@ pglc_sql_relation_has_parent(Relation relation)
 	return has_superclass(RelationGetRelid(relation));
 }
 
+static bool
+pglc_sql_source_relation_allowed(Relation relation)
+{
+	Oid			namespace_oid = relation->rd_rel->relnamespace;
+	Oid			extension_oid;
+	char	   *namespace_name;
+	bool		disallowed_namespace;
+
+	namespace_name = get_namespace_name(namespace_oid);
+	if (namespace_name == NULL)
+		return false;
+	disallowed_namespace = strncmp(namespace_name, "pg_", 3) == 0 ||
+		strcmp(namespace_name, "information_schema") == 0 ||
+		strcmp(namespace_name, "local_cache") == 0;
+	pfree(namespace_name);
+	if (disallowed_namespace)
+		return false;
+
+	extension_oid = get_extension_oid("pg_local_cache", true);
+	if (OidIsValid(extension_oid) &&
+		get_extension_schema(extension_oid) == namespace_oid)
+		return false;
+
+	return !OidIsValid(getExtensionOfObject(RelationRelationId,
+										 RelationGetRelid(relation)));
+}
+
 /*
  * standard_planner() consults the sticky relhassubclass hint before the
  * set_rel_pathlist hook runs.  If the last child was dropped, that would turn
@@ -602,6 +650,7 @@ pglc_sql_normalize_query_inheritance(Query *parse)
 			relation->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT &&
 			relation->rd_rel->relhassubclass &&
 			!pglc_sql_relation_has_children(relation) &&
+			pglc_sql_source_relation_allowed(relation) &&
 			pglc_sql_read_mapping(rte->relid, &meta))
 			rte->inh = false;
 
@@ -622,7 +671,8 @@ pglc_sql_planner(Query *parse, const char *query_string, int cursor_options,
 }
 
 static bool
-pglc_sql_relation_base_meta(Relation relation, PgLocalCacheSqlMeta *meta)
+pglc_sql_relation_base_meta(Relation relation, PgLocalCacheSqlMeta *meta,
+							bool check_catalog_provenance)
 {
 	TupleDesc	descriptor;
 	int			key_index;
@@ -632,7 +682,9 @@ pglc_sql_relation_base_meta(Relation relation, PgLocalCacheSqlMeta *meta)
 		relation->rd_rel->relam != HEAP_TABLE_AM_OID ||
 		relation->rd_rel->relispartition ||
 		relation->rd_rel->relrowsecurity || relation->rd_rel->relforcerowsecurity ||
-		!pglc_sql_triggers_valid(relation, meta))
+		(check_catalog_provenance &&
+		 !pglc_sql_source_relation_allowed(relation)) ||
+		!pglc_sql_triggers_valid(relation, meta, check_catalog_provenance))
 		return false;
 
 	descriptor = RelationGetDescr(relation);
@@ -694,9 +746,11 @@ pglc_sql_relation_base_meta(Relation relation, PgLocalCacheSqlMeta *meta)
 }
 
 static bool
-pglc_sql_relation_meta(Relation relation, PgLocalCacheSqlMeta *meta)
+pglc_sql_relation_meta(Relation relation, PgLocalCacheSqlMeta *meta,
+					   bool check_catalog_provenance)
 {
-	return pglc_sql_relation_base_meta(relation, meta) &&
+	return pglc_sql_relation_base_meta(relation, meta,
+									   check_catalog_provenance) &&
 		!pglc_sql_relation_has_children(relation) &&
 		!pglc_sql_relation_has_parent(relation);
 }
@@ -909,8 +963,25 @@ pglc_sql_match_clauses(RelOptInfo *rel, Index rti,
 	return true;
 }
 
+static bool
+pglc_sql_index_is_primary(Oid index_oid)
+{
+	HeapTuple	index_tuple;
+	bool		is_primary = false;
+
+	index_tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(index_oid));
+	if (HeapTupleIsValid(index_tuple))
+	{
+		Form_pg_index index_form = (Form_pg_index) GETSTRUCT(index_tuple);
+
+		is_primary = index_form->indisprimary;
+		ReleaseSysCache(index_tuple);
+	}
+	return is_primary;
+}
+
 static IndexPath *
-pglc_sql_unique_index_path(PlannerInfo *root, RelOptInfo *rel,
+pglc_sql_primary_index_path(PlannerInfo *root, RelOptInfo *rel,
 							   const PgLocalCacheSqlMeta *meta,
 							   RestrictInfo **restrict_infos)
 {
@@ -935,6 +1006,7 @@ pglc_sql_unique_index_path(PlannerInfo *root, RelOptInfo *rel,
 		int			key_index;
 
 		if (index_info == NULL || index_info->relam != BTREE_AM_OID ||
+			!pglc_sql_index_is_primary(index_info->indexoid) ||
 			!index_info->unique || !index_info->immediate ||
 			index_info->hypothetical || !index_info->amhasgettuple ||
 			index_info->nkeycolumns != meta->key_count ||
@@ -1074,7 +1146,7 @@ pglc_sql_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		return;
 
 	relation = table_open(rte->relid, NoLock);
-	if (!pglc_sql_relation_meta(relation, &meta) ||
+	if (!pglc_sql_relation_meta(relation, &meta, true) ||
 		!pglc_sql_targets_supported(root->parse, rti, relation, &meta) ||
 		!pglc_sql_match_clauses(rel, rti, &meta, restrict_infos,
 							   &key_exprs))
@@ -1084,7 +1156,7 @@ pglc_sql_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	}
 	table_close(relation, NoLock);
 
-	index_path = pglc_sql_unique_index_path(root, rel, &meta, restrict_infos);
+	index_path = pglc_sql_primary_index_path(root, rel, &meta, restrict_infos);
 	if (index_path == NULL)
 		return;
 	for (key_index = 0; key_index < meta.key_count; key_index++)
@@ -1238,6 +1310,7 @@ pglc_sql_validate_runtime(PgLocalCacheSqlScanState *state,
 	PgLocalCacheSqlMeta current_meta;
 	TupleDesc	descriptor;
 	uint64		current_generation;
+	bool		check_catalog_provenance;
 	int			key_index;
 
 	if (relation == NULL ||
@@ -1248,6 +1321,9 @@ pglc_sql_validate_runtime(PgLocalCacheSqlScanState *state,
 		relation->rd_rel->relrowsecurity || relation->rd_rel->relforcerowsecurity)
 		return false;
 
+	current_generation = pglc_config_generation();
+	check_catalog_provenance =
+		state->mapping.config_generation != current_generation;
 	descriptor = RelationGetDescr(relation);
 	if (state->key_count < 1 ||
 		state->key_count > PGLC_MAX_KEY_COLUMNS)
@@ -1275,11 +1351,13 @@ pglc_sql_validate_runtime(PgLocalCacheSqlScanState *state,
 	/*
 	 * Keep the ordinary execution path free of mapping-table and inheritance
 	 * catalog scans.  Relcache-backed shape, RLS, partition and exact trigger
-	 * checks still run for every execution.  Relevant DDL advances the global
-	 * generation; only that slow path performs the exact hierarchy and mapping
-	 * revalidation below.
+	 * checks still run for every execution.  Source/trigger dependency
+	 * provenance is established while planning.  Mapped-relation DDL advances
+	 * the global generation; only that slow path repeats provenance, hierarchy
+	 * and mapping revalidation below.
 	 */
-	if (!pglc_sql_relation_base_meta(relation, &planned_meta) ||
+	if (!pglc_sql_relation_base_meta(relation, &planned_meta,
+									  check_catalog_provenance) ||
 		planned_meta.whole_row != state->whole_row ||
 		planned_meta.value_type != state->mapping.value_type ||
 		planned_meta.value_typmod != state->mapping.value_typmod ||
@@ -1294,7 +1372,6 @@ pglc_sql_validate_runtime(PgLocalCacheSqlScanState *state,
 			return false;
 	}
 
-	current_generation = pglc_config_generation();
 	if (state->mapping.config_generation == current_generation)
 	{
 		(void) scan;
@@ -1309,7 +1386,7 @@ pglc_sql_validate_runtime(PgLocalCacheSqlScanState *state,
 	 */
 	MemSet(&current_meta, 0, sizeof(current_meta));
 	if (!pglc_sql_read_mapping(RelationGetRelid(relation), &current_meta) ||
-		!pglc_sql_relation_meta(relation, &current_meta))
+		!pglc_sql_relation_meta(relation, &current_meta, true))
 		return false;
 	if (current_meta.relation_oid != state->mapping.relation_oid ||
 		strcmp(current_meta.nspace, state->mapping.nspace) != 0 ||
@@ -1428,13 +1505,6 @@ pglc_sql_begin(CustomScanState *node, EState *estate, int eflags)
 					NameStr(key_attribute->attname), NAMEDATALEN);
 		}
 	}
-	/* Retain the scalar aliases used by the 1.0 worker/cache ABI. */
-	state->mapping.key_type = state->key_types[0];
-	state->mapping.key_typmod = state->key_typmods[0];
-	state->mapping.key_output = state->key_outputs[0];
-	strlcpy(state->mapping.key_column, state->mapping.key_columns[0],
-			sizeof(state->mapping.key_column));
-
 	if (!state->whole_row)
 	{
 		getTypeInputInfo(state->mapping.value_type, &value_input_oid,

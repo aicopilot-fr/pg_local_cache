@@ -228,8 +228,8 @@ def setup_data() -> int:
         f" SELECT g, repeat('x', {VALUE_SIZE})"
         f" FROM generate_series(1, {KEY_COUNT}) AS g;"
         f"{grant}"
-        f"SELECT local_cache.register_mapping("
-        f"'{NAMESPACE}', 'public.{TABLE}', 'id', 'value', false)"
+        f"SELECT local_cache.attach_value("
+        f"'public.{TABLE}'::regclass, 'value', '{NAMESPACE}', false)"
     )
     return capacity
 

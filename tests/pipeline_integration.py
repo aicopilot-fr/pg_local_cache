@@ -625,8 +625,8 @@ def main() -> None:
         "(1, 'initial'), (2, repeat('x', 8192)), (3, 'delete-once'), "
         "(4, 'malformed-tail'), (5, 'auth-tail');"
         f"{grant}"
-        f"SELECT local_cache.register_mapping('{namespace}', "
-        f"'public.{table}', 'id', 'value', true)"
+        f"SELECT local_cache.attach_value("
+        f"'public.{table}'::regclass, 'value', '{namespace}', true)"
     )
     try:
         bootstrap = RespConnection()

@@ -250,7 +250,7 @@ def main() -> None:
             f"CREATE TABLE {relation} ("
             "id bigint PRIMARY KEY, value text NOT NULL);"
             f"INSERT INTO {relation} VALUES (1, 'one'), (-1, 'minus-one');"
-            "SELECT local_cache.attach_table("
+            "SELECT local_cache.attach_value("
             f"'{relation}'::regclass, 'value', '{namespace}', false);"
             f"GRANT SELECT, UPDATE ON TABLE {relation} TO {quoted_app_role}"
         )

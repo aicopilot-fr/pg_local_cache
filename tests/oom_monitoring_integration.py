@@ -27,15 +27,8 @@ def wait_until(description: str, predicate, timeout: float = 15.0) -> None:
 
 def metric_row() -> dict[str, int]:
     payload = sql(
-        "SELECT pg_catalog.row_to_json(combined)::text FROM ("
-        "SELECT m.*, "
-        "       (h.payload ->> 'workers_with_incomplete_mappings')::bigint "
-        "           AS workers_with_incomplete_mappings, "
-        "       (h.payload ->> 'mapping_reload_incomplete_retries_total')::bigint "
-        "           AS mapping_reload_incomplete_retries_total "
-        "FROM local_cache.metrics() AS m "
-        "CROSS JOIN LATERAL (SELECT local_cache.health() AS payload) AS h"
-        ") AS combined"
+        "SELECT pg_catalog.row_to_json(metrics)::text "
+        "FROM local_cache.metrics() AS metrics"
     )
     parsed = json.loads(payload)
     assert all(isinstance(value, int) for value in parsed.values()), parsed
@@ -60,7 +53,6 @@ def create_monitor_role() -> None:
         f"GRANT USAGE ON SCHEMA local_cache TO {quoted};"
         f"GRANT EXECUTE ON FUNCTION local_cache.stats() TO {quoted};"
         f"GRANT EXECUTE ON FUNCTION local_cache.metrics() TO {quoted};"
-        f"GRANT EXECUTE ON FUNCTION local_cache.mapping_metrics() TO {quoted};"
         f"GRANT EXECUTE ON FUNCTION local_cache.health() TO {quoted}"
     )
 
@@ -79,13 +71,12 @@ def assert_monitor_acl() -> None:
             f"SET ROLE {quoted};"
             "SELECT (local_cache.health() ->> 'ready')::boolean, "
             "       (SELECT count(*) FROM local_cache.metrics()) = 1, "
-            "       (SELECT count(*) FROM local_cache.mapping_metrics()) = 1, "
             "       pg_catalog.jsonb_typeof(local_cache.stats()) = 'object', "
             "       pg_catalog.has_table_privilege("
             "           current_user, 'local_cache.mapping', 'SELECT');"
             "RESET ROLE"
         ).splitlines()[0]
-        assert result == "t|t|t|t|f", result
+        assert result == "t|t|t|f", result
         app_acl = sql(
             "SELECT pg_catalog.has_schema_privilege("
             f"           {APP_ROLE!r}, 'local_cache', 'USAGE'), "
@@ -94,11 +85,9 @@ def assert_monitor_acl() -> None:
             "       pg_catalog.has_function_privilege("
             f"           {APP_ROLE!r}, 'local_cache.metrics()', 'EXECUTE'), "
             "       pg_catalog.has_function_privilege("
-            f"           {APP_ROLE!r}, 'local_cache.mapping_metrics()', 'EXECUTE'), "
-            "       pg_catalog.has_function_privilege("
             f"           {APP_ROLE!r}, 'local_cache.health()', 'EXECUTE')"
         )
-        assert app_acl == "f|f|f|f|f", app_acl
+        assert app_acl == "f|f|f|f", app_acl
     finally:
         drop_monitor_role()
 

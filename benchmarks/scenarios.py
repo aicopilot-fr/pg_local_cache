@@ -627,9 +627,9 @@ def setup(config: compare.Config) -> int:
         config,
         f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE "
         f"public.{compare.TABLE} TO {compare.PG_WORKER_ROLE};"
-        f"SELECT local_cache.register_mapping("
-        f"'{compare.NAMESPACE}', 'public.{compare.TABLE}', "
-        "'id', 'value', true);",
+        f"SELECT local_cache.attach_value("
+        f"'public.{compare.TABLE}'::regclass, 'value', "
+        f"'{compare.NAMESPACE}', true);",
     )
     compare.setup_plain_postgres(config)
     return capacity

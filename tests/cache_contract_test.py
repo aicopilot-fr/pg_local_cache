@@ -51,6 +51,49 @@ def c_function(source: str, name: str) -> str:
 
 
 class CacheOwnershipSourceTests(unittest.TestCase):
+    def test_admin_paths_lock_the_exact_relation_oid_until_transaction_end(self) -> None:
+        relation_lock = c_function(CORE, "pg_local_cache_lock_relation")
+        self.assertIn("PG_GETARG_OID(0)", relation_lock)
+        self.assertIn(
+            "LockRelationOid(relation_oid, ShareRowExclusiveLock)",
+            relation_lock,
+        )
+        self.assertIn("get_rel_name(relation_oid) == NULL", relation_lock)
+        self.assertIn(
+            "UnlockRelationOid(relation_oid, ShareRowExclusiveLock)",
+            relation_lock,
+        )
+        self.assertIn(
+            "PG_FUNCTION_INFO_V1(pg_local_cache_lock_relation)", CORE
+        )
+
+    def test_sql_fast_path_requires_the_current_key_columns_catalog(self) -> None:
+        mapping = c_function(SQL_FASTPATH, "pglc_sql_read_mapping_once")
+        self.assertIn('get_attnum(mapping_oid, "key_columns")', mapping)
+        self.assertNotIn('get_attnum(mapping_oid, "key_column")', mapping)
+        self.assertNotIn("legacy_key_attno", mapping)
+        self.assertIn("slot_getattr(slot, value_attno", mapping)
+
+        for alias in (
+            "key_column[NAMEDATALEN]",
+            "key_type;",
+            "key_ioparam;",
+            "key_typmod;",
+            "key_input;",
+            "key_output;",
+        ):
+            self.assertNotIn(alias, HEADER)
+        for alias in (
+            "key_column",
+            "key_type",
+            "key_ioparam",
+            "key_typmod",
+            "key_input",
+            "key_output",
+        ):
+            self.assertNotIn(f"mapping->{alias} =", WORKER)
+            self.assertNotIn(f"mapping.{alias} =", SQL_FASTPATH)
+
     def test_every_new_cache_slot_gets_a_unique_generation(self) -> None:
         entry_lookup = c_function(CORE, "get_cache_entry")
         self.assertIn("entry->version = next_entry_generation();", entry_lookup)
@@ -220,7 +263,7 @@ class CacheOwnershipSourceTests(unittest.TestCase):
         self.assertNotIn("operator->opno != type_cache->eq_opr", matcher)
 
     def test_sql_cache_rejects_aliasing_custom_btree_families(self) -> None:
-        index_path = c_function(SQL_FASTPATH, "pglc_sql_unique_index_path")
+        index_path = c_function(SQL_FASTPATH, "pglc_sql_primary_index_path")
         self.assertIn("TYPECACHE_BTREE_OPFAMILY", index_path)
         self.assertIn(
             "index_info->opfamily[key_index] != type_cache->btree_opf",
@@ -233,6 +276,67 @@ class CacheOwnershipSourceTests(unittest.TestCase):
             "get_op_opfamily_strategy(index_operator,\n"
             "\t\t\t\t\t\t\t\t type_cache->btree_opf)",
             index_path,
+        )
+
+    def test_sql_fast_path_requires_source_and_trigger_provenance(self) -> None:
+        source = c_function(
+            SQL_FASTPATH, "pglc_sql_source_relation_allowed"
+        )
+        self.assertIn('strncmp(namespace_name, "pg_", 3)', source)
+        self.assertIn('strcmp(namespace_name, "information_schema")', source)
+        self.assertIn('strcmp(namespace_name, "local_cache")', source)
+        self.assertIn("get_extension_schema(extension_oid)", source)
+        self.assertIn(
+            "getExtensionOfObject(RelationRelationId,", source
+        )
+
+        base_meta = c_function(SQL_FASTPATH, "pglc_sql_relation_base_meta")
+        normalizer = c_function(
+            SQL_FASTPATH, "pglc_sql_normalize_query_inheritance"
+        )
+        self.assertIn("check_catalog_provenance", base_meta)
+        self.assertIn("pglc_sql_source_relation_allowed(relation)", base_meta)
+        self.assertIn(
+            "pglc_sql_source_relation_allowed(relation)", normalizer
+        )
+
+        ownership = c_function(
+            SQL_FASTPATH, "pglc_sql_trigger_owned_by_extension"
+        )
+        self.assertIn(
+            "getAutoExtensionsOfObject(TriggerRelationId, trigger_oid)",
+            ownership,
+        )
+        self.assertIn("list_member_oid(extension_oids, extension_oid)", ownership)
+        triggers = c_function(SQL_FASTPATH, "pglc_sql_triggers_valid")
+        self.assertIn('get_extension_oid("pg_local_cache", true)', triggers)
+        self.assertEqual(
+            triggers.count("pglc_sql_trigger_owned_by_extension"), 3
+        )
+
+        runtime = c_function(SQL_FASTPATH, "pglc_sql_validate_runtime")
+        generation_at = runtime.index(
+            "current_generation = pglc_config_generation()"
+        )
+        validation_at = runtime.index("pglc_sql_relation_base_meta")
+        self.assertLess(generation_at, validation_at)
+        self.assertIn(
+            "state->mapping.config_generation != current_generation",
+            runtime,
+        )
+        self.assertIn(
+            "pglc_sql_relation_meta(relation, &current_meta, true)", runtime
+        )
+
+    def test_sql_fast_path_uses_only_the_primary_index(self) -> None:
+        primary = c_function(SQL_FASTPATH, "pglc_sql_index_is_primary")
+        self.assertIn("SearchSysCache1(INDEXRELID", primary)
+        self.assertIn("index_form->indisprimary", primary)
+        self.assertIn("ReleaseSysCache(index_tuple)", primary)
+
+        index_path = c_function(SQL_FASTPATH, "pglc_sql_primary_index_path")
+        self.assertIn(
+            "pglc_sql_index_is_primary(index_info->indexoid)", index_path
         )
 
     def test_worker_trigger_query_uses_real_pg16_catalog_columns(self) -> None:

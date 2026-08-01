@@ -1,5 +1,6 @@
 # Extended benchmark scenarios
 
+The benchmark suite targets the complete pg_local_cache 1.0.0 API.
 `compare.py` is the strict scalar warm-GET comparison. `scenarios.py` adds
 workloads whose semantics differ too much to combine into one throughput
 ranking. `whole_row.py` measures the KVik-compatible full-row API separately.
@@ -9,10 +10,10 @@ The default `benchmarks/run.sh` runs all three and writes:
 - `scenarios.json` and `scenarios.md` for the scenarios below;
 - `whole-row.json` and `whole-row.md` for full-row RESP, SQL and width lanes.
 
-Set `PGLC_BENCH_RUN_SCENARIOS=0` only when reproducing an older warm-only
-report. All common `PGLC_BENCH_*` sizing variables still apply. Extended
-duration defaults to the smaller of the main duration and 30 seconds, so the
-one-second Docker smoke remains short:
+Set `PGLC_BENCH_RUN_SCENARIOS=0` to run only the warm comparison. All common
+`PGLC_BENCH_*` sizing variables still apply. Extended duration defaults to the
+smaller of the main duration and 30 seconds, so the one-second Docker smoke
+remains short:
 
 ```bash
 PGLC_BENCH_SCENARIO_DURATION=30 \
@@ -21,8 +22,8 @@ PGLC_BENCH_STAMPEDE_ROUNDS=10 \
 bash benchmarks/run.sh
 ```
 
-Set `PGLC_BENCH_RUN_WHOLE_ROW=0` only to reproduce reports made before the
-1.1 whole-row API. Its duration and repetitions can be bounded independently:
+Set `PGLC_BENCH_RUN_WHOLE_ROW=0` to omit the whole-row suite. Its duration and
+repetitions can be bounded independently:
 
 ```bash
 PGLC_BENCH_ROW_DURATION=30 \

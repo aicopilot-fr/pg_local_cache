@@ -170,7 +170,6 @@ jobs:
             tests/cache_contract_test.py \
             tests/scenario_benchmark_test.py \
             tests/integration.py \
-            tests/upgrade_integration.py \
             tests/whole_row_integration.py \
             tests/whole_row_benchmark_test.py \
             tests/oom_monitoring_integration.py \

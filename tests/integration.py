@@ -237,12 +237,12 @@ def main() -> None:
             f"CREATE TABLE public.{table}"
             " (id bigint PRIMARY KEY, value text NOT NULL);"
             f"INSERT INTO public.{table} VALUES (1, 'one');"
-            f"SELECT local_cache.attach_table('public.{table}', 'value',"
-            f" '{namespace}', true)"
+            f"SELECT local_cache.attach_value("
+            f"'public.{table}'::regclass, 'value', '{namespace}', true)"
         )
     )
     assert attached["namespace"] == namespace, attached
-    assert attached["primary_key_column"] == "id", attached
+    assert attached["primary_key_columns"] == ["id"], attached
     assert attached["value_column"] == "value", attached
     assert attached["writable"] is True, attached
     assert attached["templates"]["get"] == f"GET {namespace}:<id>", attached
@@ -305,8 +305,9 @@ def main() -> None:
         assert client.command("PING") == "PONG"
         hello = client.command("HELLO", "2")
         assert hello[hello.index("server") + 1] == "pg_local_cache"
+        assert hello[hello.index("version") + 1] == "1.0.0"
         assert hello[hello.index("proto") + 1] == 2
-        assert "pg_local_cache_version:1.1.0" in client.command("INFO")
+        assert "pg_local_cache_version:1.0.0" in client.command("INFO")
         assert client.command("CLIENT", "GETNAME") is None
         assert isinstance(client.command("CLIENT", "ID"), int)
 
@@ -353,7 +354,7 @@ def main() -> None:
             client.command(
                 "GET", f"CRUD:{PGDATABASE}.public.{table}:{{\"id\":1}}"
             )
-            raise AssertionError("legacy scalar mapping leaked into CRUD API")
+            raise AssertionError("scalar mapping leaked into CRUD API")
         except RespError as error:
             assert "unknown KVik table mapping" in str(error)
 
@@ -589,9 +590,21 @@ def main() -> None:
             "pg_local_cache_row_invalidate"
         )
         wait_for_unavailable_mapping(client, f"{namespace}:1")
+        sql_fails(
+            f"SELECT local_cache.attach_value("
+            f"'public.{table}'::regclass, 'value', '{namespace}', true)",
+            "reserved pg_local_cache trigger name",
+        )
+        assert sql(
+            "SELECT count(*) FROM pg_catalog.pg_trigger "
+            f"WHERE tgrelid = 'public.{table}'::regclass "
+            "AND tgname = 'pg_local_cache_row_invalidate' "
+            "AND tgqual IS NOT NULL"
+        ) == "1"
         sql(
-            f"SELECT local_cache.register_mapping('{namespace}',"
-            f" 'public.{table}', 'id', 'value', true)"
+            "DROP TRIGGER pg_local_cache_row_invalidate "
+            f"ON public.{table};"
+            f"SELECT local_cache.reconcile_table('public.{table}'::regclass)"
         )
         assert wait_for_mapping(client, f"{namespace}:1") == "from-resp"
 
@@ -637,7 +650,7 @@ def main() -> None:
             f"public.{table} FOR VALUES FROM (MINVALUE) TO (MAXVALUE)"
         )
         sql_fails(
-            f"SELECT local_cache.attach_table('public.{table}'::regclass, "
+            f"SELECT local_cache.attach_value('public.{table}'::regclass, "
             f"'value', '{namespace}', true)",
             "table inheritance is not supported by pg_local_cache",
         )
@@ -671,8 +684,9 @@ def main() -> None:
             f"INSERT INTO public.{second_table}"
             " VALUES ('00000000-0000-0000-0000-000000000001', 'uuid-value');\n"
             f"{grant_worker(second_table)}\n"
-            f"SELECT local_cache.register_mapping('{second_namespace}',"
-            f" 'public.{second_table}', 'id', 'value', false);\n"
+            f"SELECT local_cache.attach_value("
+            f"'public.{second_table}'::regclass, 'value', "
+            f"'{second_namespace}', false);\n"
             "COMMIT;\n"
             f"EXPLAIN (ANALYZE, COSTS OFF) EXECUTE "
             f"pglc_generation_{suffix}(1);\n"
@@ -703,8 +717,9 @@ def main() -> None:
             " (id character(4) PRIMARY KEY, value character varying(5) NOT NULL);"
             f"INSERT INTO public.{typmod_table} VALUES ('a', 'one');"
             f"{grant_worker(typmod_table)}"
-            f"SELECT local_cache.register_mapping('{typmod_namespace}',"
-            f" 'public.{typmod_table}', 'id', 'value', true)"
+            f"SELECT local_cache.attach_value("
+            f"'public.{typmod_table}'::regclass, 'value', "
+            f"'{typmod_namespace}', true)"
         )
 
         # This RESP connection has just loaded an incomplete generation for
@@ -746,8 +761,9 @@ def main() -> None:
             f"{grant_worker(enum_table)}"
         )
         sql_fails(
-            f"SELECT local_cache.register_mapping('itenum{suffix}',"
-            f" 'public.{enum_table}', 'id', 'value', false)",
+            f"SELECT local_cache.attach_value("
+            f"'public.{enum_table}'::regclass, 'value', "
+            f"'itenum{suffix}', false)",
             "unsupported scalar value type",
         )
 
@@ -818,8 +834,9 @@ def main() -> None:
                 "(id text COLLATE \"C\" PRIMARY KEY, value text NOT NULL);"
                 f"INSERT INTO public.{collation_table} VALUES ('FOO', 'one');"
                 f"{grant_worker(collation_table)}"
-                f"SELECT local_cache.register_mapping('itcoll{suffix}',"
-                f" 'public.{collation_table}', 'id', 'value', false)"
+                f"SELECT local_cache.attach_value("
+                f"'public.{collation_table}'::regclass, 'value', "
+                f"'itcoll{suffix}', false)"
             )
             assert client.command("GET", f"itcoll{suffix}:FOO") == "one"
             sql(
@@ -836,8 +853,9 @@ def main() -> None:
             )
             sql(f"SELECT local_cache.unregister_mapping('itcoll{suffix}')")
             sql_fails(
-                f"SELECT local_cache.register_mapping('itcoll{suffix}',"
-                f" 'public.{collation_table}', 'id', 'value', false)",
+                f"SELECT local_cache.attach_value("
+                f"'public.{collation_table}'::regclass, 'value', "
+                f"'itcoll{suffix}', false)",
                 "nondeterministic key collation is not supported",
             )
 
@@ -853,13 +871,15 @@ def main() -> None:
             f"INSERT INTO public.{remap_b_table} VALUES (1, 'from-b');"
             f"{grant_worker(remap_a_table)}"
             f"{grant_worker(remap_b_table)}"
-            f"SELECT local_cache.register_mapping('{remap_namespace}',"
-            f" 'public.{remap_a_table}', 'id', 'value', false)"
+            f"SELECT local_cache.attach_value("
+            f"'public.{remap_a_table}'::regclass, 'value', "
+            f"'{remap_namespace}', false)"
         )
         assert wait_for_mapping(client, f"{remap_namespace}:1") == "from-a"
         sql_fails(
-            f"SELECT local_cache.register_mapping('{remap_namespace}',"
-            f" 'public.{remap_b_table}', 'id', 'value', false)",
+            f"SELECT local_cache.attach_value("
+            f"'public.{remap_b_table}'::regclass, 'value', "
+            f"'{remap_namespace}', false)",
             "is already attached to table",
         )
         assert wait_for_mapping(client, f"{remap_namespace}:1") == "from-a"
@@ -872,8 +892,9 @@ def main() -> None:
             )
             sql(
                 f"SELECT local_cache.unregister_mapping('{remap_namespace}');"
-                f"SELECT local_cache.register_mapping('{remap_namespace}',"
-                f" '{relation}', 'id', 'value', false)"
+                f"SELECT local_cache.attach_value("
+                f"'{relation}'::regclass, 'value', "
+                f"'{remap_namespace}', false)"
             )
             assert (
                 wait_for_mapping(client, f"{remap_namespace}:1") == expected
@@ -941,8 +962,9 @@ def main() -> None:
             f"ALTER TABLE public.{rls_table} ENABLE ROW LEVEL SECURITY"
         )
         sql_fails(
-            f"SELECT local_cache.register_mapping('rls{suffix}',"
-            f" 'public.{rls_table}', 'id', 'value', false)",
+            f"SELECT local_cache.attach_value("
+            f"'public.{rls_table}'::regclass, 'value', "
+            f"'rls{suffix}', false)",
             "row-level security is not supported",
         )
 
@@ -952,9 +974,10 @@ def main() -> None:
             f"CREATE UNIQUE INDEX ON public.{partial_table}(id) WHERE id > 0"
         )
         sql_fails(
-            f"SELECT local_cache.register_mapping('partial{suffix}',"
-            f" 'public.{partial_table}', 'id', 'value', false)",
-            "needs a valid single-column UNIQUE index",
+            f"SELECT local_cache.attach_value("
+            f"'public.{partial_table}'::regclass, 'value', "
+            f"'partial{suffix}', false)",
+            "has no primary key",
         )
 
         sql(f"INSERT INTO public.{table} VALUES (500, '0')")

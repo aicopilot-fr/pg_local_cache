@@ -4,6 +4,13 @@ ARG POSTGRES_IMAGE=postgres:16.14-bookworm
 
 FROM ${POSTGRES_IMAGE} AS builder
 
+RUN postgres_version="$(postgres --version)" \
+    && case "$postgres_version" in \
+        *" 16."*) ;; \
+        *) printf 'pg_local_cache image requires PostgreSQL 16, got: %s\n' \
+            "$postgres_version" >&2; exit 1 ;; \
+    esac
+
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         build-essential \
@@ -30,8 +37,6 @@ COPY --from=builder \
     /usr/share/postgresql/16/extension/pg_local_cache.control
 COPY --from=builder \
     /stage/usr/share/postgresql/16/extension/pg_local_cache--1.0.0.sql \
-    /stage/usr/share/postgresql/16/extension/pg_local_cache--1.0.0--1.1.0.sql \
-    /stage/usr/share/postgresql/16/extension/pg_local_cache--1.1.0.sql \
     /usr/share/postgresql/16/extension/
 
 COPY --chmod=0755 docker/entrypoint.sh \

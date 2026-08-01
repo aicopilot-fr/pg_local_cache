@@ -5,16 +5,15 @@ This optional Compose overlay adds a least-privilege PostgreSQL monitoring role,
 dashboard. The only new host port is Grafana on loopback. Prometheus and the
 exporter remain reachable only on the Compose network.
 
-The exporter reads the typed, one-row `local_cache.metrics()` and
-`local_cache.mapping_metrics()` functions. It also collects standard PostgreSQL
-metrics so the same Prometheus can be used for database health. The
+The exporter reads the typed, one-row `local_cache.metrics()` function. It also
+collects standard PostgreSQL metrics so the same Prometheus can be used for
+database health. The
 `local_cache_monitor` role has `CONNECTION LIMIT 2`, read-only
 transactions, short timeouts, `pg_monitor`, and execute permission only for the
-cache `metrics()`, `mapping_metrics()`, `health()`, and `stats()` functions. To
-remain compatible with grants created by 1.0, the exporter reads its two new
-mapping-health fields from `health()`; `mapping_metrics()` is the typed SQL API
-for the same fields. The split preserves the 1.0 `metrics()` row type for
-dependency-safe upgrades.
+cache `metrics()`, `health()`, and `stats()` functions. Mapping readiness and
+incomplete-reload counters are part of the typed `metrics()` row; `health()`
+provides the readiness decision and `stats()` provides the JSON diagnostic
+snapshot.
 
 ## Start
 
@@ -131,9 +130,9 @@ docker compose \
   config --quiet
 ```
 
-For an existing PostgreSQL data volume created by an older image, first update
-the extension to 1.1 and verify that both `local_cache.metrics()` and
-`local_cache.mapping_metrics()` exist before starting the overlay. Then
-recreate `monitoring-init` and `postgres-exporter` so the least-privilege role
-receives the additive function grant. The one-shot initializer deliberately
-fails instead of granting broad schema access when the contract is absent.
+Before starting the overlay, verify that the extension is installed and that
+`local_cache.metrics()`, `local_cache.health()`, and `local_cache.stats()` are
+available. Recreate `monitoring-init` and `postgres-exporter` after replacing
+the extension image so the least-privilege role and exporter are reprovisioned.
+The one-shot initializer deliberately fails instead of granting broad schema
+access when the monitoring contract is absent.

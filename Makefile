@@ -5,9 +5,7 @@ OBJS = src/pg_local_cache.o src/pg_local_cache_sql.o \
 	src/pg_local_cache_worker.o src/resp.o src/key_codec.o \
 	src/row_payload.o
 
-DATA = sql/pg_local_cache--1.0.0.sql \
-	sql/pg_local_cache--1.0.0--1.1.0.sql \
-	sql/pg_local_cache--1.1.0.sql
+DATA = sql/pg_local_cache--1.0.0.sql
 PGFILEDESC = "pg_local_cache - RESP row cache embedded in PostgreSQL"
 EXTRA_CLEAN = tests/unit/resp_test tests/unit/resp_test_sanitized
 
@@ -39,7 +37,7 @@ verify-static: all
 		tests/scenario_benchmark_test.py tests/whole_row_benchmark_test.py \
 		tests/sql_api_test.py \
 		tests/worker_kvik_contract_test.py \
-		tests/integration.py tests/upgrade_integration.py \
+		tests/integration.py \
 		tests/whole_row_integration.py tests/pipeline_integration.py \
 		tests/oom_monitoring_integration.py \
 		tests/sql_fastpath_integration.py tests/load.py

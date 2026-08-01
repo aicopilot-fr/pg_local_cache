@@ -96,8 +96,10 @@ class WholeRowWorkerContractTests(unittest.TestCase):
     def test_loader_builds_parameterized_whole_row_plans(self):
         reload = c_function(WORKER, "reload_mappings")
         self.assertIn("m.key_columns", reload)
-        self.assertIn("ARRAY[source_mapping.key_column]::name[]", reload)
-        self.assertIn('get_attnum(mapping_relation_oid, "key_columns")', reload)
+        self.assertIn("source_mapping.key_columns", reload)
+        self.assertNotIn("ARRAY[source_mapping.key_column]", reload)
+        self.assertNotIn("get_attnum(mapping_relation_oid", reload)
+        self.assertNotIn("mapping_relation_oid", reload)
         self.assertIn("jsonb_populate_record", reload)
         self.assertIn("ON CONFLICT (%s) %s", reload)
         self.assertIn("mapping->key_count + 1", reload)
@@ -122,6 +124,7 @@ class WholeRowWorkerContractTests(unittest.TestCase):
 
     def test_loader_revalidates_primary_key_semantics_after_ddl(self):
         reload = c_function(WORKER, "reload_mappings")
+        self.assertIn("i.indisprimary", reload)
         self.assertIn("i.indexprs IS NULL", reload)
         self.assertIn("am.amname = 'btree'", reload)
         self.assertIn("NOT opc.opcdefault", reload)
@@ -132,6 +135,42 @@ class WholeRowWorkerContractTests(unittest.TestCase):
         self.assertIn("current_database() !~ '[.:]'", reload)
         self.assertIn("n.nspname !~ '[.:]'", reload)
         self.assertIn("c.relname !~ '[.:]'", reload)
+
+    def test_loader_rejects_untrusted_trigger_and_source_provenance(self):
+        reload = c_function(WORKER, "reload_mappings")
+        self.assertGreaterEqual(reload.count("deptype = 'x'"), 3)
+        self.assertIn("source_ext.extnamespace = n.oid", reload)
+        self.assertIn("source_dep.deptype = 'e'", reload)
+        self.assertIn("n.nspname !~ '^pg_'", reload)
+        self.assertIn("n.nspname <> 'information_schema'", reload)
+        self.assertIn(
+            "c.relowner <> CURRENT_USER::pg_catalog.regrole", reload
+        )
+        for role_guard in (
+            "worker_role.rolcanlogin",
+            "NOT worker_role.rolsuper",
+            "NOT worker_role.rolinherit",
+            "NOT worker_role.rolcreatedb",
+            "NOT worker_role.rolcreaterole",
+            "NOT worker_role.rolreplication",
+            "NOT worker_role.rolbypassrls",
+        ):
+            self.assertIn(role_guard, reload)
+
+    def test_loader_revalidates_writable_and_read_only_mapping_shape(self):
+        reload = c_function(WORKER, "reload_mappings")
+        self.assertIn("m.writable OR (", reload)
+        for privilege in ("INSERT", "UPDATE", "DELETE"):
+            self.assertIn(
+                f"NOT pg_catalog.has_table_privilege(c.oid, '{privilege}')",
+                reload,
+            )
+        self.assertIn("m.value_column <> ALL (m.key_columns)", reload)
+        self.assertIn(
+            "wa.attgenerated <> '' OR wa.attidentity <> ''", reload
+        )
+        self.assertIn("wa.attname <> ALL (m.key_columns)", reload)
+        self.assertIn("wa.attnotnull AND NOT wa.atthasdef", reload)
 
 
 if __name__ == "__main__":

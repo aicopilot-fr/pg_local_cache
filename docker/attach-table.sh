@@ -13,15 +13,15 @@ Usage:
 
 Options:
   --namespace NAME       RESP namespace; defaults to schema.table
-  --value-column NAME    Use legacy scalar-value mode instead of whole-row JSON
+  --value-column NAME    Cache one scalar column instead of the whole-row JSON
   --writable             Enable RESP SET and DEL (default: read-only)
   --database NAME        Target database (default: PG_LOCAL_CACHE_DATABASE)
   --replace              Allow replacing a namespace mapped to another table
   --help                 Show this help
 
 Whole-row mode discovers the table PRIMARY KEY in index order and supports
-1-16 columns. Scalar-value mode preserves the 1.0 API and requires one PK
-column. The SQL API validates the table and worker role, grants least privilege,
+1-16 columns. Scalar-value mode requires one PK column. The SQL API validates
+the table and worker role, grants least privilege,
 and installs the transaction guard plus row and truncate invalidators.
 USAGE
 }
@@ -130,45 +130,145 @@ result="$("${psql_base[@]}" \
     --set writable="$writable" \
     --set scalar_mode="$scalar_mode" \
     --set replace="$replace" <<'SQL'
-BEGIN;
+/* The post-lock mapping recheck needs a fresh statement snapshot even when a
+ * deployment changes default_transaction_isolation at role/database scope. */
+BEGIN ISOLATION LEVEL READ COMMITTED;
+
+/* Resolve the requested name exactly once.  All later operations use its OID
+ * so a concurrent rename cannot redirect this command to another table. */
+CREATE TEMP TABLE pg_local_cache_attach_target (
+    relation_oid oid PRIMARY KEY,
+    effective_namespace text NOT NULL,
+    namespace_is_default boolean NOT NULL
+) ON COMMIT DROP;
+
+INSERT INTO pg_temp.pg_local_cache_attach_target
+SELECT target.relation_oid,
+       COALESCE(
+           NULLIF(:'namespace', ''),
+           local_cache._default_namespace(target.relation_oid::pg_catalog.regclass)
+       ),
+       NULLIF(:'namespace', '') IS NULL
+  FROM (
+      SELECT :'relation'::pg_catalog.regclass::oid AS relation_oid
+  ) AS target;
+
+/* Snapshot every mapping that a replacement would remove before taking any
+ * heavyweight relation locks.  Two opposing A<->B replacements therefore
+ * discover the same OID set and lock it in the same global order. */
+CREATE TEMP TABLE pg_local_cache_attach_conflicts (
+    namespace text NOT NULL,
+    relation_oid oid NOT NULL,
+    PRIMARY KEY (namespace, relation_oid)
+) ON COMMIT DROP;
+
+INSERT INTO pg_temp.pg_local_cache_attach_conflicts
+SELECT m.namespace, m.relation::oid
+  FROM local_cache.mapping AS m
+  CROSS JOIN pg_temp.pg_local_cache_attach_target AS target
+ WHERE (
+           m.namespace = target.effective_namespace
+       AND m.relation::oid <> target.relation_oid
+       )
+    OR (
+           m.relation::oid = target.relation_oid
+       AND m.namespace <> target.effective_namespace
+       );
+
+DO $pg_local_cache_attach$
+DECLARE
+    v_relation_oid oid;
+BEGIN
+    FOR v_relation_oid IN
+        SELECT candidate.relation_oid
+          FROM (
+              SELECT target.relation_oid
+                FROM pg_temp.pg_local_cache_attach_target AS target
+              UNION
+              SELECT conflict.relation_oid
+                FROM pg_temp.pg_local_cache_attach_conflicts AS conflict
+          ) AS candidate
+         ORDER BY candidate.relation_oid
+    LOOP
+        IF NOT local_cache._lock_relation(v_relation_oid) THEN
+            RAISE EXCEPTION
+                'pg_local_cache attach: relation OID % no longer exists; retry the command',
+                v_relation_oid
+                USING ERRCODE = '40001';
+        END IF;
+    END LOOP;
+END;
+$pg_local_cache_attach$;
 
 LOCK TABLE local_cache.mapping IN EXCLUSIVE MODE;
 
-SELECT COALESCE(
-           NULLIF(:'namespace', ''),
-           local_cache._default_namespace(:'relation'::pg_catalog.regclass)
-       ) AS effective_namespace
-\gset
-
-SELECT EXISTS (
-    SELECT 1
+/* A mapping may have changed while the sorted relation locks were acquired.
+ * Never chase a newly discovered relation while holding the mapping lock:
+ * fail and retry from a fresh, globally ordered snapshot instead. */
+WITH current_conflicts AS (
+    SELECT m.namespace, m.relation::oid AS relation_oid
       FROM local_cache.mapping AS m
+      CROSS JOIN pg_temp.pg_local_cache_attach_target AS target
      WHERE (
-               m.namespace = :'effective_namespace'
-           AND m.relation <> :'relation'::pg_catalog.regclass
+               m.namespace = target.effective_namespace
+           AND m.relation::oid <> target.relation_oid
            )
         OR (
-               m.relation = :'relation'::pg_catalog.regclass
-           AND m.namespace <> :'effective_namespace'
+               m.relation::oid = target.relation_oid
+           AND m.namespace <> target.effective_namespace
            )
-) AS mapping_conflict
+), changed_conflicts AS (
+    (
+        SELECT current_conflicts.namespace, current_conflicts.relation_oid
+          FROM current_conflicts
+        EXCEPT
+        SELECT snapshot.namespace, snapshot.relation_oid
+          FROM pg_temp.pg_local_cache_attach_conflicts AS snapshot
+    )
+    UNION ALL
+    (
+        SELECT snapshot.namespace, snapshot.relation_oid
+          FROM pg_temp.pg_local_cache_attach_conflicts AS snapshot
+        EXCEPT
+        SELECT current_conflicts.namespace, current_conflicts.relation_oid
+          FROM current_conflicts
+    )
+)
+SELECT COALESCE(
+           (
+               NOT target.namespace_is_default
+               OR target.effective_namespace = local_cache._default_namespace(
+                   target.relation_oid::pg_catalog.regclass
+               )
+           )
+           AND NOT EXISTS (SELECT 1 FROM changed_conflicts),
+           false
+       ) AS mapping_snapshot_stable,
+       EXISTS (
+           SELECT 1 FROM pg_temp.pg_local_cache_attach_conflicts
+       ) AS mapping_conflict
+  FROM pg_temp.pg_local_cache_attach_target AS target
 \gset
+
+\if :mapping_snapshot_stable
+\else
+ROLLBACK;
+DO $pg_local_cache_attach$
+BEGIN
+    RAISE EXCEPTION
+        'pg_local_cache attach: table name or mapping changed concurrently; retry the command'
+        USING ERRCODE = '40001';
+END;
+$pg_local_cache_attach$;
+\endif
 
 \if :mapping_conflict
 \if :replace
 SELECT pg_catalog.format(
            'SELECT local_cache.unregister_mapping(%L);', m.namespace
        )
-  FROM local_cache.mapping AS m
- WHERE (
-           m.namespace = :'effective_namespace'
-       AND m.relation <> :'relation'::pg_catalog.regclass
-       )
-    OR (
-           m.relation = :'relation'::pg_catalog.regclass
-       AND m.namespace <> :'effective_namespace'
-       )
- ORDER BY m.namespace
+  FROM pg_temp.pg_local_cache_attach_conflicts AS m
+ ORDER BY m.relation_oid, m.namespace
 \gexec
 \else
 ROLLBACK;
@@ -181,16 +281,21 @@ $pg_local_cache_attach$;
 \endif
 \endif
 
+SELECT target.relation_oid::text AS target_relation_oid,
+       target.effective_namespace
+  FROM pg_temp.pg_local_cache_attach_target AS target
+\gset
+
 \if :scalar_mode
 SELECT local_cache.attach_value(
-    :'relation'::pg_catalog.regclass,
+    :'target_relation_oid'::oid::pg_catalog.regclass,
     :'value_column'::name,
     :'effective_namespace',
     :'writable'::boolean
 )::text;
 \else
 SELECT local_cache.attach_table(
-    :'relation'::pg_catalog.regclass,
+    :'target_relation_oid'::oid::pg_catalog.regclass,
     :'writable'::boolean,
     :'effective_namespace'
 )::text;

@@ -1,14 +1,7 @@
 pg_local_cache:
   query: |
-    SELECT metrics.*,
-           (mapping_health.payload ->> 'workers_with_incomplete_mappings')::bigint
-               AS workers_with_incomplete_mappings,
-           (mapping_health.payload ->> 'mapping_reload_incomplete_retries_total')::bigint
-               AS mapping_reload_incomplete_retries_total
+    SELECT metrics.*
       FROM local_cache.metrics() AS metrics
-      CROSS JOIN LATERAL (
-          SELECT local_cache.health() AS payload
-      ) AS mapping_health
   master: true
   metrics:
     - up:

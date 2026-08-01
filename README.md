@@ -79,8 +79,8 @@ builder stage, а runtime содержит только PostgreSQL 16, extension
 healthcheck и команду подключения таблицы. Собрать образ и проверить CLI:
 
 ```bash
-docker build --tag pg_local_cache:1.1.0 .
-docker run --rm pg_local_cache:1.1.0 pg_local_cache_attach --help
+docker build --tag pg_local_cache:1.0.0 .
+docker run --rm pg_local_cache:1.0.0 pg_local_cache_attach --help
 ```
 
 Если нужен только прозрачный SQL cache без RESP listener, второй secret и
@@ -134,8 +134,9 @@ RESP port — не альтернативный способ войти паро
 и RLS на RESP endpoint не применяются. Для разных trust zones используйте
 разные инстансы/token либо отдельный auth proxy.
 
-`POSTGRES_IMAGE` вынесен в build argument. Для воспроизводимого production
-build передайте разрешённый вашей организацией digest вместо плавающего тега:
+`POSTGRES_IMAGE` принимает только PostgreSQL 16 image; build явно отвергает
+другую major version. Для воспроизводимого production build передайте
+разрешённый вашей организацией digest вместо плавающего тега:
 
 ```bash
 docker compose build \
@@ -179,16 +180,15 @@ Namespace по умолчанию равен `schema.table`, то есть зд�
 
 В `CRUD:` wire key используется реальная `database.schema.table`, а не
 namespace. Namespace остаётся стабильным административным идентификатором
-mapping, именем в метриках и prefix старого scalar protocol.
+mapping, именем в метриках и prefix explicit scalar protocol.
 
-Опция `--value-column` нужна только для совместимого с 1.0 scalar mode. В нём
-кешируется одна `NOT NULL` value-колонка, а convenience-команда требует
-одноколоночный PK:
+Опция `--value-column` явно включает scalar mode. В нём кешируется одна
+`NOT NULL` value-колонка, а convenience-команда требует одноколоночный PK:
 
 ```bash
 docker compose exec postgres pg_local_cache_attach \
   --database app \
-  --namespace legacy-items \
+  --namespace item-values \
   --table public.items \
   --value-column value \
   --writable
@@ -196,13 +196,13 @@ docker compose exec postgres pg_local_cache_attach \
 
 Для defaults на sequence/function worker role дополнительно нужны права на
 эти объекты. В read-only mode команда выдаёт `SELECT` и отзывает у worker
-`INSERT`, `UPDATE`, `DELETE` на source table; `unregister` отзывает table
-privileges целиком, но не удаляет ранее выданный schema `USAGE`. Команда не
+`INSERT`, `UPDATE`, `DELETE` на source table; detach отзывает table privileges
+целиком, но не удаляет ранее выданный schema `USAGE`. Команда не
 переназначит без явного `--replace` ни занятый другой таблицей namespace, ни
 уже подключённую под другим namespace таблицу. SQL API следует тому же
-fail-safe правилу: сначала вызовите `unregister_mapping` для фактически
-конфликтующего namespace, иначе регистрация вернёт ошибку и не изменит старый
-mapping, triggers или ACL.
+fail-safe правилу: сначала вызовите `detach_table` для фактически подключённой
+таблицы, иначе attach вернёт ошибку и не изменит существующий mapping,
+triggers или ACL.
 
 Эквивалентная ручная регистрация для native installation:
 
@@ -213,48 +213,67 @@ SELECT local_cache.attach_table('public.items'::regclass);
 -- Whole-row mapping с явными namespace и writable RESP API:
 SELECT local_cache.attach_table(
     'public.items'::regclass,
-    p_row_namespace => 'items',
-    p_row_writable => true
+    p_namespace => 'items',
+    p_writable => true
 );
 
--- Legacy scalar mapping:
+-- Явный scalar mapping одной value-колонки:
 SELECT local_cache.attach_value(
     'public.items'::regclass,
-    'value',
-    'legacy-items',
-    true
+    p_value_column => 'value',
+    p_namespace => 'item-values',
+    p_writable => true
 );
+
+-- Снять mapping по таблице; false означает, что таблица не была подключена:
+SELECT local_cache.detach_table('public.items'::regclass);
+
+-- Восстановить triggers и ACL одного существующего mapping:
+SELECT local_cache.reconcile_table('public.items'::regclass);
+
+-- Атомарно сверить административную обвязку всех mappings:
+SELECT local_cache.reconcile_all();
 ```
 
-Основной вызов — `attach_table(regclass)`. Опции доступны через однозначный
-overload `attach_table(regclass, row_writable boolean,
-row_namespace text DEFAULT NULL)`;
-для читаемости используйте named arguments, как в примере выше. Такой порядок
-не конфликтует со старыми scalar-вызовами
-`attach_table(relation, value_column [, namespace [, writable]])`. Функция
-находит весь primary key, выдаёт dedicated worker role минимальные
-table/schema grants, регистрирует whole-row mapping и возвращает JSON с
-готовыми key/GET/SET/DEL/INVALIDATE templates. Это административная функция с
-`SECURITY DEFINER`, отозванная у `PUBLIC`; application role она не нужна.
+Основной API — одна функция `attach_table(p_relation regclass,
+p_writable boolean DEFAULT false, p_namespace text DEFAULT NULL)`. Она находит
+весь primary key, выдаёт dedicated worker role минимальные table/schema grants,
+создаёт whole-row mapping и возвращает JSON с готовыми
+key/GET/SET/DEL/INVALIDATE templates. Для приложения, которому действительно
+нужно кешировать только одну колонку, есть отдельная и намеренно явная функция
+`attach_value(p_relation, p_value_column, p_namespace, p_writable)` без
+автоопределения value column. `detach_table(regclass)` симметрично удаляет
+mapping, triggers и table grants и возвращает `true`, если mapping существовал.
+`reconcile_table(regclass)` повторно применяет сохранённую конфигурацию одного
+mapping, а `reconcile_all()` делает то же для всех mappings и возвращает их
+число. Они восстанавливают отсутствующие или выключенные managed triggers и
+права worker role, но не меняют namespace, PK/value columns или writable mode.
 
-Низкоуровневый whole-row API принимает точный PK-массив:
-`register_mapping(namespace, relation, key_columns name[], writable)`.
-`attach_value`, `register_value_mapping` и старые 2/3/4-аргументные
-`attach_table` оставлены как scalar compatibility shims для миграции с 1.0.
-Старое автоопределение единственной non-PK value-колонки тоже сохранено:
-используйте `attach_value(relation, NULL)` или legacy-вызов
-`attach_table(relation, NULL)`. Явный `NULL::name` или именованный
-`p_value_column => NULL::name` рекомендуются для читаемости.
+Attach, detach и reconcile сначала берут `ShareRowExclusiveLock` на уже
+разрешённый OID таблицы и держат его до конца транзакции. Поэтому concurrent
+rename/drop/recreate не может переключить административную операцию на другой
+объект с тем же именем; `reconcile_all()` блокирует relations в порядке OID.
 
-Два старых named-вызова, которые полностью пропускали `p_value_column`, нужно
-переписать явно: `attach_table(relation, p_writable => true)` становится
-`attach_value(relation, NULL, p_writable => true)`, а
-`attach_table(relation, p_namespace => 'x')` —
-`attach_value(relation, NULL, p_namespace => 'x')`. Имена whole-row опций
-намеренно начинаются с `p_row_`, поэтому старый scalar-вызов не может молча
-сменить смысл.
-Низкоуровневая scalar-регистрация также принимает одну `NOT NULL` key-колонку
-с обычным valid immediate UNIQUE B-tree index, что сохраняет mappings 1.0.
+Три зарезервированных trigger получают dependency
+`DEPENDS ON EXTENSION pg_local_cache`. Перед изменением API проверяет точные
+имя, функцию, тип, arguments и эту provenance-связь. Foreign или unmarked
+trigger с зарезервированным именем приводит к fail-closed ошибке и остаётся
+нетронутым. Повреждённый, переименованный или выключенный trigger с доказанной
+extension-owned dependency автоматически восстанавливается при
+`attach_*`/`reconcile_*`; неизвестный объект API не удаляет и не заменяет.
+
+Все функции attach/detach/reconcile/unregister административные: они имеют
+`SECURITY DEFINER` и отозваны у `PUBLIC`. Вызывайте их от extension owner либо
+выдавайте `EXECUTE` только доверенной deploy-role; обычному application role
+они не нужны.
+
+Source table должна быть application-owned permanent table. Attach отклоняет
+схемы `pg_*`, `information_schema`, собственную схему расширения и relation,
+входящую в любое PostgreSQL extension. Dedicated worker role также не может
+владеть source table: она должна оставаться `NOSUPERUSER NOINHERIT` role с
+только автоматически выданными ACL. Worker повторяет provenance-проверку при
+каждой загрузке mappings, поэтому прямой restore/COPY в `local_cache.mapping`
+не обходит эту границу.
 
 ### Drop-in SQL fast path без нового драйвера
 
@@ -280,8 +299,8 @@ Whole-row mapping поддерживает `SELECT *`, любой непусто
 columns, их перестановку, повторы и aliases. Predicate должен содержать ровно
 по одному equality для каждой PK-колонки; порядок условий произвольный, справа
 или слева допустим `Const` либо внешний parameter. Alias таблицы и
-необязательный `LIMIT 1` поддерживаются. Для `attach_value` действует прежнее
-ограничение: projection должна содержать ровно mapped scalar value column.
+необязательный `LIMIT 1` поддерживаются. Для explicit scalar mapping через
+`attach_value` projection должна содержать ровно mapped value column.
 
 Join, дополнительные filters, sort, CTE, aggregate, row lock и expressions
 над колонками не кешируются. `REPEATABLE READ`, `SERIALIZABLE`, RLS, recovery
@@ -372,9 +391,10 @@ redis-cli -h 127.0.0.1 -p 6380 -a "$PG_LOCAL_CACHE_TOKEN" --raw \
 команды, а не PostgreSQL password authentication. Обе формы открывают ту же
 фиксированную worker role и тот же набор mappings.
 
-`register_mapping` и `unregister_mapping` закрыты от `PUBLIC`. Выполняйте их
-от имени extension owner либо выдавайте `EXECUTE` только полностью доверенной
-административной роли: это `SECURITY DEFINER` API управляет triggers.
+`attach_table`, `attach_value`, `detach_table`, `reconcile_table` и
+`reconcile_all` закрыты от `PUBLIC`. Выполняйте их от имени extension owner
+либо выдавайте `EXECUTE` только полностью доверенной административной роли:
+это `SECURITY DEFINER` API управляет triggers и правами worker role.
 `local_cache.invalidate(text)` дополнительно требует реального superuser в C,
 поэтому одного `GRANT EXECUTE` для обычной роли недостаточно. Обычным
 application roles ручная инвалидация не нужна.
@@ -397,6 +417,11 @@ CREATE ROLE local_cache_worker
     NOBYPASSRLS;
 GRANT CONNECT ON DATABASE app TO local_cache_worker;
 ```
+
+Эта role не должна владеть source tables и не должна получать права через
+membership/PUBLIC. `attach_*` требует `NOSUPERUSER NOINHERIT NOCREATEDB
+NOCREATEROLE NOREPLICATION NOBYPASSRLS`, проверяет ownership и выдаёт только
+необходимые ACL на конкретную application table.
 
 Файл токена должен быть абсолютным, обычным файлом, принадлежать OS-пользователю
 PostgreSQL и не иметь group/other permissions:
@@ -422,45 +447,35 @@ GRANT USAGE ON SCHEMA local_cache TO local_cache_worker;
 GRANT SELECT ON TABLE local_cache.mapping TO local_cache_worker;
 ```
 
-Безопасный порядок обновления с 1.0:
+### Логическое восстановление
 
-1. Проверьте, что старый scalar namespace `CRUD` не используется. В 1.1 это
-   зарезервированный wire prefix. Сначала сохраните параметры mapping, вызовите
-   `unregister_mapping('CRUD')` и зарегистрируйте ту же таблицу под другим
-   namespace через API 1.0. Не переименовывайте строку прямым `UPDATE`: это не
-   обновит аргументы invalidation triggers. Upgrade при конфликте завершится
-   явной ошибкой без частичной миграции.
-2. Сделайте обычный backup и установите binary/control/SQL files версии 1.1.
-3. Полностью перезапустите PostgreSQL, чтобы postmaster загрузил новый `.so`.
-   Новый worker умеет читать ещё не обновлённую таблицу mapping формата 1.0.
-4. Только после restart обновите SQL-каталог:
+`local_cache.mapping` зарегистрирована как extension config, поэтому
+`pg_dump` сохраняет строки с описаниями mappings. PostgreSQL roles принадлежат
+всему cluster и не входят в dump отдельной database: сначала создайте
+настроенную `pg_local_cache.role`, выдайте ей `CONNECT` и запустите workers
+именно с этим именем. Role должна существовать до включения
+`shared_preload_libraries` и рестарта PostgreSQL.
+
+Восстановите весь dump, включая секцию post-data. Только после завершения
+restore запустите от extension owner отдельную транзакцию reconciliation:
 
 ```sql
-ALTER EXTENSION pg_local_cache UPDATE TO '1.1.0';
+BEGIN;
+GRANT USAGE ON SCHEMA local_cache TO local_cache_worker;
+GRANT SELECT ON TABLE local_cache.mapping TO local_cache_worker;
+SELECT local_cache.reconcile_all();
+COMMIT;
+
+SELECT (local_cache.health() ->> 'ready')::boolean AS ready;
 ```
 
-Не выполняйте `ALTER EXTENSION` под ещё работающим binary 1.0. После update
-проверьте `extversion`, `local_cache.health()` и один cold/warm lookup каждого
-mapping. Таблица `local_cache.mapping` зарегистрирована как extension config:
-обычный `pg_dump` сохраняет её строки, а statement trigger после restore
-перезагружает workers. После восстановления всё равно проверьте dedicated role,
-ACL и три `ENABLE ALWAYS` trigger; повторный `attach_*` безопасно восстанавливает
-административную обвязку.
-
-Если используется bundled monitoring overlay, после update переиздайте grant
-на добавленную typed-функцию и перезапустите exporter:
-
-```bash
-docker compose -f compose.yaml -f compose.monitoring.yaml \
-  up -d --force-recreate monitoring-init postgres-exporter
-```
-
-Существующие mappings остаются в legacy scalar mode и продолжают работать
-через совместимые сигнатуры. `attach_table(regclass)` для новых mappings уже
-означает whole-row; используйте `attach_value` там, где по-прежнему нужна одна
-value column. При update старая четырёхпараметровая функция переименовывается
-с сохранением OID, зависимостей и ACL, а её прямые `EXECUTE` grants копируются
-на новый публичный compatibility wrapper.
+Для custom `pg_local_cache.role` замените имя в двух `GRANT`.
+`reconcile_all()` использует сохранённые описания, заново проверяет relations
+и PK, восстанавливает managed triggers и права на source tables, затем
+атомарно публикует mapping generation. Проверяйте `health()` после `COMMIT` и
+допускайте трафик только когда `ready=true`; workers могут догружать новую
+generation асинхронно. Ошибка provenance, отсутствующая relation или
+изменившийся PK прерывает операцию без частично применённого commit.
 
 ## Конфигурация
 
@@ -510,7 +525,7 @@ backend-процессов, поэтому cgroup/container limit и запас 
 
 ## Wire API
 
-Основной wire key v1.1 совместим с моделью KVik:
+Основной wire key `1.0.0` совместим с моделью KVik:
 
 ```text
 CRUD:database.schema.table:{"pk_column":<json-scalar>,...}
@@ -542,10 +557,10 @@ row JSON; совпадающие значения принимаются, нес
 ограничения исходной таблицы остаются обязательными. Mapping должен быть
 создан с `writable=true`.
 
-Scalar compatibility mode через `attach_value` сохраняет ключи
-`namespace:scalar-key` и одно textual value. Это migration API, а не основной
-whole-row контракт v1.1; `INVALIDATE namespace` также сохранён для старых
-клиентов.
+Explicit scalar mode через `attach_value` использует ключи
+`namespace:scalar-key` и возвращает одно textual value. Он предназначен для
+узких value lookups; основной KVik-style API остаётся whole-row.
+`INVALIDATE namespace` инвалидирует такой scalar mapping.
 
 Каждый `SET` и `DEL` — отдельная PostgreSQL-транзакция. Ответ отправляется
 после commit. Если TCP-соединение оборвалось до ответа, outcome записи
@@ -562,10 +577,11 @@ SQL API:
 ```sql
 SELECT local_cache.stats();
 SELECT * FROM local_cache.metrics();
-SELECT * FROM local_cache.mapping_metrics();
 SELECT local_cache.health();
 SELECT local_cache.invalidate('items');
-SELECT local_cache.unregister_mapping('items');
+SELECT local_cache.detach_table('public.items'::regclass);
+SELECT local_cache.reconcile_table('public.items'::regclass);
+SELECT local_cache.reconcile_all();
 ```
 
 `STAT` сохраняет подробные native counters и добавляет vocabulary KVik:
@@ -623,14 +639,19 @@ Event triggers перезагружают mappings для DDL, затрагив�
 `DROP INDEX` постоянного объекта тоже обрабатывается как global mapping change,
 потому что PostgreSQL уже удалил связь index→table к моменту `sql_drop`.
 
+Committed `DROP TABLE` удаляет mapping по точному OID в той же DDL-транзакции,
+выполняет relation forget и освобождает namespace для нового attach. Rollback
+`DROP TABLE` откатывает и удаление mapping. Таблица, позднее созданная под тем
+же schema/name, получает другой OID и не подключается автоматически.
+
 ## Производительность и gate 10k ops/s
 
-Существующий обязательный `make load` gate сохраняет v1.0 scalar workload: он
-измеряет только успешные warm positive `GET namespace:key` одного textual
-value через persistent connections и pipeline, требует ноль cache misses,
-SQL reads и RESP errors. Он завершает процесс с ошибкой при результате ниже
-`PG_LOCAL_CACHE_MIN_OPS` (default `10000`). Это полезный regression gate hot
-path, но не замер whole-row JSON v1.1.
+Обязательный `make load` gate измеряет explicit scalar hot path: только
+успешные warm positive `GET namespace:key` одного textual value через
+persistent connections и pipeline. Он требует ноль cache misses, SQL reads и
+RESP errors и завершается с ошибкой при результате ниже
+`PG_LOCAL_CACHE_MIN_OPS` (default `10000`). Whole-row RESP и ordinary-SQL
+имеют отдельные gates, поэтому разные payload и protocol costs не смешиваются.
 
 ```bash
 PG_LOCAL_CACHE_PSQL=/path/to/psql \
@@ -646,29 +667,14 @@ PG_LOCAL_CACHE_MIN_OPS=10000 \
 make load
 ```
 
-Следующие числа — исторический прогон v1.0 scalar payload, а не результат
-whole-row API v1.1. PostgreSQL 16.14 с non-superuser role, 4 workers,
-`cache_entries=65536`, 16 clients, pipeline 32, 16384 warm keys, value
-128 bytes, 15 секунд warmup и 3 measured run по 120 секунд:
+CI повторяет короткие независимые gates `>=10000 ops/s` для scalar GET,
+whole-row GET, prepared ordinary SQL и unnamed extended ordinary SQL. Перед
+production rollout повторите 30–60 second gate несколько раз на закреплённых
+CPU целевой машины и контролируйте p99. `SET`, `DEL`, cold miss и
+invalidation-heavy workloads измеряются отдельно: они включают стоимость
+PostgreSQL transaction, storage, WAL и locks и не обязаны проходить read gate.
 
-- median `239292 ops/s`, range `236072–243811`, CV `1.32%`;
-- median p50 `1.693 ms`, p95 `4.265 ms`, p99 `6.951 ms`;
-- `0` errors, `0` misses и `0` SQL reads во всех measured run.
-
-До batching/input-cursor/context-reuse оптимизаций тот же полный workload дал
-median `64918 ops/s`, p50 `6.082 ms`, p95 `16.388 ms`, p99 `26.943 ms`.
-Наблюдаемый raw throughput вырос в `3.69x` (`+268.6%`), а p50/p95/p99
-уменьшились на `72.2%`/`74.0%`/`74.2%`. Это два отдельных запуска на shared
-двухъядерном GitHub runner. Поэтому результат является regression evidence
-для этой оптимизации, а не универсальной гарантией для любого CPU/container.
-
-CI повторяет короткий smoke gate `>=10000 warm GET/s`; перед production
-rollout повторите 30–60 second gate несколько раз на закреплённых CPU целевой
-машины и контролируйте p99. `SET`, `DEL`, cold miss и invalidation-heavy
-workloads измеряйте отдельно: они включают стоимость PostgreSQL transaction,
-storage, WAL и locks.
-
-В scalar suite ordinary-SQL lane имеет независимый fail-closed gate
+В explicit scalar suite ordinary-SQL lane имеет независимый fail-closed gate
 `PGLC_BENCH_SQL_MIN_OPS` (default `10000`): проверяются не только ops/s, но и
 ровно один `sql_cache_hit` на каждый успешный timed `SELECT`, ноль miss/fill/
 bypass и отдельный cold miss→fill→hit proof.
@@ -684,19 +690,17 @@ Prepared и extended SQL результаты не объединяются. У 
 fail-closed порог `PGLC_BENCH_SQL_EXTENDED_MIN_OPS`; если он не задан, он
 наследует `PGLC_BENCH_SQL_MIN_OPS` (по умолчанию те же `10000 ops/s`).
 
-Для v1.1 добавлен отдельный `benchmarks/whole_row.py`. Он не смешивает новые
-результаты с историческим `comparison.json` и сохраняет `whole-row.json` и
+`benchmarks/whole_row.py` сохраняет отдельные `whole-row.json` и
 `whole-row.md`. В нём есть wire-identical `resp_full_row` для
 `pg_local_cache`/Valkey/Redis, sweep размера whole-row payload и ordinary-SQL
 lanes `select_star`, `reordered_projection` и
-`composite_predicate_reordered` против stock PostgreSQL. До публикации
-полного повторяемого прогона на закреплённых CPU README намеренно не приводит
-для этих lanes неподтверждённые числа.
+`composite_predicate_reordered` против stock PostgreSQL.
 
 ## Сравнение с Valkey, Redis и прямым PostgreSQL
 
-Исторический `benchmarks/compare.py` — воспроизводимый scalar comparative
-suite v1.0 со следующими зафиксированными целями:
+`benchmarks/compare.py` — воспроизводимый explicit-scalar comparative suite,
+а `benchmarks/whole_row.py` — основной KVik-style whole-row suite. Они
+используют следующие зафиксированные цели:
 
 - `pg_local_cache` на `postgres:16.14-bookworm`;
 - `valkey/valkey:9.1.1-trixie`;
@@ -721,32 +725,26 @@ reads. Порядок сервисов вращается между повто�
 bash benchmarks/run.sh
 ```
 
-Проверенный полный прогон 2026-07-31 на 2 CPU quota для client и каждого
-server container:
+Последний полный GitHub Actions прогон текущего harness дал следующие median
+throughput values на shared runner:
 
-| Target | Median ops/s | Min–max ops/s | CV | p50 | p95 | p99 |
-|---|---:|---:|---:|---:|---:|---:|
-| pg_local_cache v1.0 scalar | 239292 | 236072–243811 | 1.32% | 1.693 ms | 4.265 ms | 6.951 ms |
-| Valkey 9.1.1 | 235349 | 233980–235787 | 0.33% | 1.886 ms | 4.363 ms | 6.850 ms |
-| Redis 8.8.1 | 238019 | 235799–240762 | 0.85% | 1.849 ms | 4.358 ms | 6.694 ms |
+| Lane | Target | Median ops/s |
+|---|---|---:|
+| Whole-row RESP GET | pg_local_cache | 106948 |
+| Whole-row RESP GET | Valkey | 118387 |
+| Whole-row RESP GET | Redis | 123790 |
+| Ordinary SQL prepared | pg_local_cache cached fast path | 70275 |
+| Ordinary SQL unnamed extended | pg_local_cache cached fast path | 18985 |
+| Transactional RESP SET | pg_local_cache | 5456 |
+| Transactional RESP DEL | pg_local_cache | 5520 |
 
-В этом scalar run `pg_local_cache` оказался на `1.7%` выше median Valkey и на
-`0.5%` выше Redis, но такая малая разница находится внутри вариативности
-shared runner и не является доказательством engine ranking или whole-row
-throughput v1.1. Полные отчёты сохранены в
-репозитории: [до оптимизации](benchmarks/reference/2026-07-31-before-batching.md)
-([JSON](benchmarks/reference/2026-07-31-before-batching.json)) и
-[после оптимизации](benchmarks/reference/2026-07-31-transaction-safe-batching.md)
-([JSON](benchmarks/reference/2026-07-31-transaction-safe-batching.json)).
-Исходный полный прогон также доступен в
-[GitHub Actions run 30660130760](https://github.com/aicopilot-fr/pg_local_cache/actions/runs/30660130760).
-
-Число stock PostgreSQL `47974 ops/s` из этих исторических артефактов
-считать валидным нельзя: runner ошибочно передавал `pgbench -d`, то есть
-включал per-command debug logging. RESP-замеры `pg_local_cache`/Valkey/Redis
-этим дефектом не затронуты. Флаг удалён, source-тест запрещает его возврат;
-новое stock PostgreSQL и ordinary-SQL значение будет опубликовано только
-после полного повторного прогона исправленного harness.
+Все read lanes прошли независимый gate `10000 ops/s`. `SET` и `DEL` приведены
+отдельно и не сравниваются с in-memory writes Valkey/Redis: каждая операция
+`pg_local_cache` включает настоящую PostgreSQL-транзакцию, WAL и commit-time
+invalidation. Значения доступны в
+[GitHub Actions run 30706923498](https://github.com/aicopilot-fr/pg_local_cache/actions/runs/30706923498),
+но shared runner пригоден для regression evidence, а не для универсального
+engine ranking или capacity promise.
 
 Результат сохраняется в `benchmarks/results/comparison.json` и
 `comparison.md`: все отдельные run, median/min/max/CV, p50/p95/p99,
@@ -856,7 +854,7 @@ deterministic collation, value-type allowlist, remap fence, relation-state GC,
 timeouts, каждый настроенный worker PID, full cache, race fence и 2PC
 rejection.
 
-Отдельный v1.1 black-box suite проверяет JSON всей строки, composite PK,
+Отдельный whole-row black-box suite проверяет JSON всей строки, composite PK,
 canonicalization независимо от порядка JSON fields, omitted/matching/mismatched
 PK в `SET`, unknown columns, четыре `INVALIDATE` scope, negative cache,
 `SELECT *`, reordered projections, prepared parameters, transactional PK move,
@@ -891,15 +889,13 @@ comparative stack и `pgbench`, correctness с cache `128`, включённым
   events и slow-client drops;
 - worker starts и pending forget markers.
 
-Для частого scrape используйте `local_cache.metrics()` вместе с
-`local_cache.mapping_metrics()`: это типизированные однострочные O(1) функции,
-которые не сканируют cache entries. Раздельный второй row сохраняет стабильный
-return type `metrics()` при upgrade с 1.0. Тяжёлый `stats()` оставлен для
-диагностики. `health()` также O(1) и сообщает worker quorum, число воркеров,
-которые ещё не подтвердили текущую mapping generation (включая неполные
-mapping sets), client capacity и memory-budget invariant. Поэтому `ready=true`
-означает, что каждый настроенный RESP-воркер уже загрузил текущую конфигурацию.
-Эти функции отозваны у
+Для частого scrape используйте типизированную однострочную
+`local_cache.metrics()`: она O(1), не сканирует cache entries и включает как
+основные counters, так и число workers, не загрузивших текущую mapping
+generation. Тяжёлый JSON `stats()` оставлен для диагностики. `health()` также
+O(1) и сообщает worker quorum, incomplete mappings, client capacity и
+memory-budget invariant. Поэтому `ready=true` означает, что каждый настроенный
+RESP-воркер уже загрузил текущую полную конфигурацию. Эти функции отозваны у
 `PUBLIC`; из прав на объекты схемы `local_cache` отдельной monitor role
 выдаются только `USAGE` и `EXECUTE` (плюс `CONNECT` к БД и стандартное
 членство `pg_monitor` для PostgreSQL-метрик).
@@ -932,10 +928,26 @@ timeout errors и рестартами workers. Cache недолговечен �
 
 - один primary, одна настроенная database и один фиксированный worker role;
 - только permanent ordinary tables;
+- committed `DROP TABLE` намеренно забывает mapping; recreated table нужно
+  подключить заново, даже если schema/name совпали;
+- attach/detach/reconcile берут `ShareRowExclusiveLock` до конца транзакции и
+  могут ждать concurrent DDL/DML либо завершиться по настроенному
+  `lock_timeout`;
+- три trigger names `pg_local_cache_statement_guard`,
+  `pg_local_cache_row_invalidate` и `pg_local_cache_truncate_invalidate`
+  зарезервированы на каждой mapped table; foreign/unmarked trigger с таким
+  именем вызывает fail-closed ошибку и не изменяется, а повреждённый
+  extension-owned trigger автоматически пересоздаётся;
+- source table не может находиться в `pg_*`, `information_schema` или схеме
+  `pg_local_cache` и не может быть member-объектом любого extension; worker
+  повторно проверяет это вместе с ownership managed triggers при загрузке;
+- dedicated worker role не может владеть mapped table или быть superuser и
+  должна оставаться `NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION
+  NOBYPASSRLS`;
 - primary key из `1..16` `NOT NULL` колонок;
 - в whole-row mode имена database, schema и table не могут содержать `.` или
-  `:`, поскольку эти символы являются разделителями KVik wire key; legacy
-  scalar mode адресуется только через `namespace:key`;
+  `:`, поскольку эти символы являются разделителями KVik wire key; explicit
+  scalar mode адресуется через `namespace:key`;
 - key types: `int2`, `int4`, `int8`, `text`, `varchar`, `bpchar`, `uuid`;
 - PK должен быть valid/ready immediate non-partial B-tree primary index с
   default equality opclass для каждой колонки;
@@ -960,9 +972,8 @@ timeout errors и рестартами workers. Cache недолговечен �
 - whole-row `SET` является полной заменой неключевых fields, а не partial
   patch; table casts, `NOT NULL`, checks, foreign keys и другие constraints
   применяются PostgreSQL;
-- `attach_value` требует одноколоночный PK; низкоуровневый legacy scalar API
-  также сохраняет 1.0 mapping с одной `NOT NULL` key-колонкой под valid
-  immediate UNIQUE B-tree index. Нужна отдельная `NOT NULL` value column типа
+- `attach_value` требует одноколоночный primary key и отдельную `NOT NULL`
+  value column типа
   `int2`, `int4`, `int8`, `numeric`, `bool`, `text`, `varchar`, `bpchar`,
   `uuid`, `json` или `jsonb`; domain/enum/composite value запрещены;
 - нет TTL, `MGET`, `MULTI/WATCH`, Lua, Pub/Sub, NX/XX/EX/PX и RESP3;
@@ -980,7 +991,7 @@ timeout errors и рестартами workers. Cache недолговечен �
 - C-extension выполняется внутри PostgreSQL; crash в native code способен
   вызвать recovery всего instance.
 
-Контракт v1.1 закрывает центральную
+Контракт `1.0.0` закрывает центральную
 [KVik-модель](https://postgrespro.com/docs/enterprise/current/proxima.html):
 `CRUD:` key, JSON всей строки,
 composite PK, `GET` fallback/negative cache, writable `SET`/`DEL`, четыре
@@ -990,8 +1001,8 @@ database и одна фиксированная role, нет cache mappings дл
 serving или multi-primary. TTL отсутствует и здесь, и в KVik-модели; это не
 Redis replacement. `AUTH username token` не проверяет пароль обычного
 PostgreSQL-пользователя, а KVik `STAT` names являются aliases над локальными
-counters. Legacy `namespace:scalar-key` оставлен только для совместимости с
-pg_local_cache 1.0.
+counters. Explicit scalar keys используют отдельный `namespace:scalar-key`
+contract и не меняют основной whole-row wire format.
 
 Архитектура использует штатные PostgreSQL
 [background workers](https://www.postgresql.org/docs/16/bgworker.html),

@@ -348,8 +348,8 @@ def setup_postgres(config: Config) -> int:
         f" FROM generate_series(1, {config.keys}) AS g;"
         f"GRANT SELECT ON TABLE public.{TABLE} TO {PG_WORKER_ROLE};"
         f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.{TABLE} TO {PG_APP_USER};"
-        f"SELECT local_cache.register_mapping("
-        f"'{NAMESPACE}', 'public.{TABLE}', 'id', 'value', false);"
+        f"SELECT local_cache.attach_value("
+        f"'public.{TABLE}'::regclass, 'value', '{NAMESPACE}', false);"
         f"ANALYZE public.{TABLE}",
     )
     capacity = int(psql(config, "SHOW pg_local_cache.cache_entries"))

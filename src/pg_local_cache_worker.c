@@ -374,8 +374,8 @@ create_listener(void)
 		(strcmp(pglc_bind_address, "127.0.0.1") != 0 &&
 		 strcmp(pglc_bind_address, "0.0.0.0") != 0))
 		ereport(FATAL,
-				(errmsg("pg_local_cache.bind_address must be an IPv4 literal"),
-				 errhint("The alpha release supports 127.0.0.1 or 0.0.0.0.")));
+					(errmsg("pg_local_cache.bind_address must be an IPv4 literal"),
+					 errhint("Supported values are 127.0.0.1 and 0.0.0.0.")));
 
 	if (strcmp(pglc_bind_address, "0.0.0.0") == 0 &&
 		(worker_auth_token == NULL || worker_auth_token[0] == '\0'))
@@ -1120,7 +1120,7 @@ execute_command_inner(PgLocalCacheClient *client, PgLocalCacheRespArg *args, int
 		return raw_response(
 			"*14\r\n"
 			"$6\r\nserver\r\n$14\r\npg_local_cache\r\n"
-			"$7\r\nversion\r\n$5\r\n1.1.0\r\n"
+			"$7\r\nversion\r\n$5\r\n1.0.0\r\n"
 			"$5\r\nproto\r\n:2\r\n"
 			"$2\r\nid\r\n:0\r\n"
 			"$4\r\nmode\r\n$10\r\nstandalone\r\n"
@@ -1133,7 +1133,7 @@ execute_command_inner(PgLocalCacheClient *client, PgLocalCacheRespArg *args, int
 		const char *info =
 			"# Server\r\n"
 			"server:pg_local_cache\r\n"
-			"pg_local_cache_version:1.1.0\r\n"
+			"pg_local_cache_version:1.0.0\r\n"
 			"redis_mode:standalone\r\n";
 
 		if (argc != 1 && argc != 2)
@@ -2136,10 +2136,7 @@ reload_mappings(uint64 target_generation)
 		HeapTuple	count_tuple;
 		TupleDesc	count_desc;
 		bool		count_is_null;
-		Oid			mapping_namespace_oid;
-		Oid			mapping_relation_oid;
-		const char *key_columns_expression;
-		char	   *mapping_query;
+		const char *mapping_query;
 
 		begin_spi_transaction();
 		free_mapping_plans();
@@ -2160,23 +2157,10 @@ reload_mappings(uint64 target_generation)
 		if (count_is_null || configured_mapping_count > PGLC_MAX_MAPPINGS)
 			elog(ERROR, "too many pg_local_cache mappings");
 
-		mapping_namespace_oid = get_namespace_oid("local_cache", false);
-		mapping_relation_oid = get_relname_relid("mapping",
-											 mapping_namespace_oid);
-		if (!OidIsValid(mapping_relation_oid))
-			elog(ERROR, "could not find local_cache.mapping");
-		if (get_attnum(mapping_relation_oid, "key_columns") != InvalidAttrNumber)
-			key_columns_expression = "source_mapping.key_columns";
-		else if (get_attnum(mapping_relation_oid, "key_column") != InvalidAttrNumber)
-			key_columns_expression =
-				"ARRAY[source_mapping.key_column]::name[]";
-		else
-			elog(ERROR, "pg_local_cache mapping has no key column metadata");
-
-		mapping_query = psprintf(
+		mapping_query =
 			"WITH pglc_mapping AS ("
 			"SELECT source_mapping.namespace, source_mapping.relation, "
-			"       %s AS key_columns, source_mapping.value_column, "
+			"       source_mapping.key_columns, source_mapping.value_column, "
 			"       source_mapping.writable "
 			"  FROM local_cache.mapping AS source_mapping) "
 			"SELECT m.namespace, c.oid, n.nspname, c.relname, "
@@ -2197,6 +2181,14 @@ reload_mappings(uint64 target_generation)
 			"   AND gt.tgtype = 62 AND gt.tgnargs = 0 "
 			"   AND pg_catalog.octet_length(gt.tgargs) = 0 "
 			"   AND gt.tgfoid = 'local_cache._statement_guard()'::regprocedure "
+			"   AND EXISTS ("
+			"       SELECT 1 FROM pg_catalog.pg_depend AS gd "
+			"       JOIN pg_catalog.pg_extension AS ge ON ge.oid = gd.refobjid "
+			"        AND ge.extname = 'pg_local_cache' "
+			"        WHERE gd.classid = 'pg_catalog.pg_trigger'::regclass "
+			"          AND gd.objid = gt.oid AND gd.objsubid = 0 "
+			"          AND gd.refclassid = 'pg_catalog.pg_extension'::regclass "
+			"          AND gd.refobjsubid = 0 AND gd.deptype = 'x') "
 			"  JOIN pg_catalog.pg_trigger AS rt "
 			"    ON rt.tgrelid = c.oid "
 			"   AND rt.tgname = 'pg_local_cache_row_invalidate' "
@@ -2219,6 +2211,14 @@ reload_mappings(uint64 target_generation)
 			"              ORDER BY k.ordinality) "
 			"            FROM pg_catalog.unnest(m.key_columns) WITH ORDINALITY "
 			"              AS k(column_name, ordinality)), ''::bytea) "
+			"   AND EXISTS ("
+			"       SELECT 1 FROM pg_catalog.pg_depend AS rd "
+			"       JOIN pg_catalog.pg_extension AS re ON re.oid = rd.refobjid "
+			"        AND re.extname = 'pg_local_cache' "
+			"        WHERE rd.classid = 'pg_catalog.pg_trigger'::regclass "
+			"          AND rd.objid = rt.oid AND rd.objsubid = 0 "
+			"          AND rd.refclassid = 'pg_catalog.pg_extension'::regclass "
+			"          AND rd.refobjsubid = 0 AND rd.deptype = 'x') "
 			"  JOIN pg_catalog.pg_trigger AS tt "
 			"    ON tt.tgrelid = c.oid "
 			"   AND tt.tgname = 'pg_local_cache_truncate_invalidate' "
@@ -2234,7 +2234,39 @@ reload_mappings(uint64 target_generation)
 			"   AND tt.tgargs = "
 			"       convert_to(m.namespace, current_setting('server_encoding')) "
 			"       || decode('00', 'hex') "
+			"   AND EXISTS ("
+			"       SELECT 1 FROM pg_catalog.pg_depend AS td "
+			"       JOIN pg_catalog.pg_extension AS te ON te.oid = td.refobjid "
+			"        AND te.extname = 'pg_local_cache' "
+			"        WHERE td.classid = 'pg_catalog.pg_trigger'::regclass "
+			"          AND td.objid = tt.oid AND td.objsubid = 0 "
+			"          AND td.refclassid = 'pg_catalog.pg_extension'::regclass "
+			"          AND td.refobjsubid = 0 AND td.deptype = 'x') "
 			" WHERE c.relkind = 'r' AND c.relpersistence = 'p' "
+			"   AND n.nspname !~ '^pg_' "
+			"   AND n.nspname <> 'information_schema' "
+			"   AND c.relowner <> CURRENT_USER::pg_catalog.regrole "
+			"   AND EXISTS ("
+			"       SELECT 1 FROM pg_catalog.pg_roles AS worker_role "
+			"        WHERE worker_role.rolname = CURRENT_USER "
+			"          AND worker_role.rolcanlogin "
+			"          AND NOT worker_role.rolsuper "
+			"          AND NOT worker_role.rolinherit "
+			"          AND NOT worker_role.rolcreatedb "
+			"          AND NOT worker_role.rolcreaterole "
+			"          AND NOT worker_role.rolreplication "
+			"          AND NOT worker_role.rolbypassrls) "
+			"   AND NOT EXISTS ("
+			"       SELECT 1 FROM pg_catalog.pg_extension AS source_ext "
+			"        WHERE source_ext.extname = 'pg_local_cache' "
+			"          AND source_ext.extnamespace = n.oid) "
+			"   AND NOT EXISTS ("
+			"       SELECT 1 FROM pg_catalog.pg_depend AS source_dep "
+			"        WHERE source_dep.classid = 'pg_catalog.pg_class'::regclass "
+			"          AND source_dep.objid = c.oid AND source_dep.objsubid = 0 "
+			"          AND source_dep.refclassid = 'pg_catalog.pg_extension'::regclass "
+			"          AND source_dep.refobjsubid = 0 "
+			"          AND source_dep.deptype = 'e') "
 			"   AND m.namespace <> 'CRUD' "
 			"   AND (m.value_column IS NOT NULL OR ("
 			"        current_database() !~ '[.:]' "
@@ -2256,6 +2288,10 @@ reload_mappings(uint64 target_generation)
 			"       pg_catalog.has_table_privilege(c.oid, 'INSERT') "
 			"       AND pg_catalog.has_table_privilege(c.oid, 'UPDATE') "
 			"       AND pg_catalog.has_table_privilege(c.oid, 'DELETE'))) "
+			"   AND (m.writable OR ("
+			"       NOT pg_catalog.has_table_privilege(c.oid, 'INSERT') "
+			"       AND NOT pg_catalog.has_table_privilege(c.oid, 'UPDATE') "
+			"       AND NOT pg_catalog.has_table_privilege(c.oid, 'DELETE'))) "
 			"   AND NOT EXISTS ("
 			"       SELECT 1 "
 			"         FROM pg_catalog.unnest(m.key_columns) WITH ORDINALITY "
@@ -2275,7 +2311,7 @@ reload_mappings(uint64 target_generation)
 			"   AND EXISTS ("
 			"       SELECT 1 FROM pg_catalog.pg_index AS i "
 			"        WHERE i.indrelid = c.oid "
-			"          AND (m.value_column IS NOT NULL OR i.indisprimary) "
+			"          AND i.indisprimary "
 			"          AND i.indisunique AND i.indimmediate "
 			"          AND i.indisvalid AND i.indisready "
 			"          AND i.indpred IS NULL AND i.indexprs IS NULL "
@@ -2305,7 +2341,8 @@ reload_mappings(uint64 target_generation)
 			"                       WHERE pc.castsource = ka.atttypid "
 			"                         AND pc.casttarget = opc.opcintype "
 			"                         AND pc.castmethod = 'b')))) "
-			"   AND (m.value_column IS NULL OR EXISTS ("
+			"   AND (m.value_column IS NULL OR ("
+			"       m.value_column <> ALL (m.key_columns) AND EXISTS ("
 			"       SELECT 1 FROM pg_catalog.pg_attribute AS va "
 			"        WHERE va.attrelid = c.oid AND va.attname = m.value_column "
 			"          AND va.attnum > 0 AND NOT va.attisdropped AND va.attnotnull "
@@ -2313,15 +2350,29 @@ reload_mappings(uint64 target_generation)
 			"              ('int2'::regtype, 'int4'::regtype, 'int8'::regtype, "
 			"               'numeric'::regtype, 'bool'::regtype, "
 			"               'text'::regtype, 'varchar'::regtype, 'bpchar'::regtype, "
-			"               'uuid'::regtype, 'json'::regtype, 'jsonb'::regtype))) "
+			"               'uuid'::regtype, 'json'::regtype, 'jsonb'::regtype)))) "
 			"   AND NOT (m.writable AND m.value_column IS NULL AND EXISTS ("
 			"       SELECT 1 FROM pg_catalog.pg_attribute AS wa "
 			"        WHERE wa.attrelid = c.oid AND wa.attnum > 0 "
 			"          AND NOT wa.attisdropped "
 			"          AND wa.attname = ANY (m.key_columns) "
 			"          AND wa.attgenerated <> '')) "
-			" ORDER BY m.namespace LIMIT 129",
-			key_columns_expression);
+			"   AND NOT (m.writable AND m.value_column IS NOT NULL AND EXISTS ("
+			"       SELECT 1 FROM pg_catalog.pg_attribute AS wa "
+			"        WHERE wa.attrelid = c.oid AND wa.attnum > 0 "
+			"          AND NOT wa.attisdropped "
+			"          AND (wa.attname = ANY (m.key_columns) "
+			"               OR wa.attname = m.value_column) "
+			"          AND (wa.attgenerated <> '' OR wa.attidentity <> ''))) "
+			"   AND NOT (m.writable AND m.value_column IS NOT NULL AND EXISTS ("
+			"       SELECT 1 FROM pg_catalog.pg_attribute AS wa "
+			"        WHERE wa.attrelid = c.oid AND wa.attnum > 0 "
+			"          AND NOT wa.attisdropped "
+			"          AND wa.attname <> ALL (m.key_columns) "
+			"          AND wa.attname <> m.value_column "
+			"          AND wa.attnotnull AND NOT wa.atthasdef "
+			"          AND wa.attgenerated = '' AND wa.attidentity = '')) "
+			" ORDER BY m.namespace LIMIT 129";
 		result = SPI_execute(mapping_query, true, PGLC_MAX_MAPPINGS + 1);
 		if (result != SPI_OK_SELECT)
 			elog(ERROR, "could not load pg_local_cache mappings");
@@ -2400,14 +2451,6 @@ reload_mappings(uint64 target_generation)
 				fmgr_info_cxt(output_function, &mapping->key_outputs[key_index],
 							  mapping_context);
 			}
-			strlcpy(mapping->key_column, mapping->key_columns[0],
-					sizeof(mapping->key_column));
-			mapping->key_type = mapping->key_types[0];
-			mapping->key_ioparam = mapping->key_ioparams[0];
-			mapping->key_typmod = mapping->key_typmods[0];
-			mapping->key_input = mapping->key_inputs[0];
-			mapping->key_output = mapping->key_outputs[0];
-
 			{
 				char	   *value_column = SPI_getvalue(tuple, desc, 6);
 
