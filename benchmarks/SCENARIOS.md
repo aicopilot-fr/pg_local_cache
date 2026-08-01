@@ -1,11 +1,13 @@
 # Extended benchmark scenarios
 
-`compare.py` is the strict warm-GET comparison. `scenarios.py` adds workloads
-whose semantics differ too much to combine into one throughput ranking. The
-default `benchmarks/run.sh` runs both and writes:
+`compare.py` is the strict scalar warm-GET comparison. `scenarios.py` adds
+workloads whose semantics differ too much to combine into one throughput
+ranking. `whole_row.py` measures the KVik-compatible full-row API separately.
+The default `benchmarks/run.sh` runs all three and writes:
 
 - `comparison.json` and `comparison.md` for identical warm RESP GETs;
-- `scenarios.json` and `scenarios.md` for the scenarios below.
+- `scenarios.json` and `scenarios.md` for the scenarios below;
+- `whole-row.json` and `whole-row.md` for full-row RESP, SQL and width lanes.
 
 Set `PGLC_BENCH_RUN_SCENARIOS=0` only when reproducing an older warm-only
 report. All common `PGLC_BENCH_*` sizing variables still apply. Extended
@@ -16,6 +18,17 @@ one-second Docker smoke remains short:
 PGLC_BENCH_SCENARIO_DURATION=30 \
 PGLC_BENCH_SCENARIO_REPETITIONS=3 \
 PGLC_BENCH_STAMPEDE_ROUNDS=10 \
+bash benchmarks/run.sh
+```
+
+Set `PGLC_BENCH_RUN_WHOLE_ROW=0` only to reproduce reports made before the
+1.1 whole-row API. Its duration and repetitions can be bounded independently:
+
+```bash
+PGLC_BENCH_ROW_DURATION=30 \
+PGLC_BENCH_ROW_REPETITIONS=3 \
+PGLC_BENCH_ROW_VALUE_SIZE=512 \
+PGLC_BENCH_ROW_PAYLOAD_SIZES=64,512,2048 \
 bash benchmarks/run.sh
 ```
 
@@ -42,6 +55,43 @@ The mutation comparison deliberately includes Valkey and Redis with
 persistence disabled. It uses byte-identical commands and the same client,
 but is not durability-equivalent: every pg_local_cache SET/DEL includes a
 PostgreSQL transaction, WAL and commit-time invalidation.
+
+## Whole-row and KVik-compatible lanes
+
+`whole_row.py` does not alter or reuse the scalar throughput samples. The
+`resp_full_row` lane creates a composite-primary-key table and reads it through
+`CRUD:database.schema.table:{pk-json}` keys. JSON key members are intentionally
+sent in a different order than the primary key. PostgreSQL `row_to_json` output
+for every row is then installed byte-for-byte in Valkey and Redis. The same
+client processes, connections, key sequence, pipeline, and exact per-key reply
+validation are used for all three targets. Before measurement, the harness
+globally invalidates pg_local_cache and flushes each external target so entries
+from scalar or earlier lanes cannot consume the measured whole-row keyspace.
+It then repeats complete pg_local_cache warm/validation passes until one whole
+pass increments neither `cache_misses` nor `database_reads`. Those untimed
+stabilization reads are reported separately and never counted as throughput.
+
+The `resp_payload_width_sweep` lane measures only pg_local_cache at each
+configured text payload size. It records the resulting minimum/maximum JSON
+response bytes and requires zero cache misses or database reads in every timed
+window. Values are capped at 3000 text bytes so this is a warm-cache width
+sweep; oversized safe-bypass behavior belongs to integration tests, not a
+mislabelled warm hit result.
+
+Three ordinary SQL lanes compare the mapped server with stock PostgreSQL using
+identical prepared/pipelined SELECT text:
+
+- `select_star` reads the complete native row;
+- `reordered_projection` reads multiple columns in a non-table order;
+- `composite_predicate_reordered` reverses the composite-PK predicate order.
+
+The full-row RESP and SQL gates are independent from both the scalar gate and
+each other. `PGLC_BENCH_ROW_RESP_MIN_OPS` and
+`PGLC_BENCH_ROW_SQL_MIN_OPS` default to 10,000 ops/s.
+`PGLC_BENCH_ROW_WIDTH_MIN_OPS` defaults to zero because response size is the
+independent variable; set it explicitly for a hardware-specific regression
+gate. A failure is emitted in `whole-row-failure.json/.md`, without deleting
+the scalar or extended-scenario reports.
 
 ## Ordinary SQL fast-path feature lane
 

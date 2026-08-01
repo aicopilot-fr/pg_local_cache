@@ -192,6 +192,19 @@ def wait_for_unavailable_mapping(client: RespClient, key: str) -> None:
         time.sleep(0.05)
 
 
+def wait_for_health_ready(expected: bool) -> dict[str, object]:
+    deadline = time.monotonic() + 10
+    last: dict[str, object] = {}
+    while time.monotonic() < deadline:
+        last = json.loads(sql("SELECT local_cache.health()::text"))
+        if last.get("ready") is expected:
+            return last
+        time.sleep(0.05)
+    raise AssertionError(
+        f"health.ready did not become {expected!r}: {last!r}"
+    )
+
+
 def main() -> None:
     suffix = str(os.getpid())
     table = f"pglc_it_{suffix}"
@@ -293,7 +306,7 @@ def main() -> None:
         hello = client.command("HELLO", "2")
         assert hello[hello.index("server") + 1] == "pg_local_cache"
         assert hello[hello.index("proto") + 1] == 2
-        assert "pg_local_cache_version:1.0.0" in client.command("INFO")
+        assert "pg_local_cache_version:1.1.0" in client.command("INFO")
         assert client.command("CLIENT", "GETNAME") is None
         assert isinstance(client.command("CLIENT", "ID"), int)
 
@@ -336,6 +349,13 @@ def main() -> None:
 
         assert wait_for_mapping(client, f"{namespace}:1") == "one"
         assert client.command("GET", f"{namespace}:1") == "one"
+        try:
+            client.command(
+                "GET", f"CRUD:{PGDATABASE}.public.{table}:{{\"id\":1}}"
+            )
+            raise AssertionError("legacy scalar mapping leaked into CRUD API")
+        except RespError as error:
+            assert "unknown KVik table mapping" in str(error)
 
         # A cold-key wave must collapse to one SQL lookup across RESP workers.
         configured_workers = int(sql("SHOW pg_local_cache.workers"))
@@ -526,6 +546,10 @@ def main() -> None:
             " DISABLE TRIGGER pg_local_cache_statement_guard"
         )
         wait_for_unavailable_mapping(client, f"{namespace}:1")
+        incomplete_health = wait_for_health_ready(False)
+        assert incomplete_health["workers_with_incomplete_mappings"] >= 1, (
+            incomplete_health
+        )
         guard_plan = sql(
             f"EXPLAIN (COSTS OFF) SELECT value FROM public.{table} WHERE id = 1"
         )
@@ -535,6 +559,10 @@ def main() -> None:
             " ENABLE ALWAYS TRIGGER pg_local_cache_statement_guard"
         )
         assert wait_for_mapping(client, f"{namespace}:1") == "from-resp"
+        recovered_health = wait_for_health_ready(True)
+        assert recovered_health["workers_with_incomplete_mappings"] == 0, (
+            recovered_health
+        )
 
         sql(
             f"ALTER TABLE public.{table}"
@@ -580,7 +608,7 @@ def main() -> None:
             "VALUES (1, 'from-child')"
         )
         sql_fails(
-            f"SELECT local_cache.attach_table("
+            f"SELECT local_cache.attach_value("
             f"'public.{inherited_table}'::regclass, 'value')",
             "table inheritance is not supported by pg_local_cache",
         )
@@ -678,9 +706,24 @@ def main() -> None:
             f"SELECT local_cache.register_mapping('{typmod_namespace}',"
             f" 'public.{typmod_table}', 'id', 'value', true)"
         )
-        assert wait_for_mapping(client, f"{typmod_namespace}:a") == "one"
+
+        # This RESP connection has just loaded an incomplete generation for
+        # the dropped second_table and is still inside its one-second retry
+        # window.  A valid newer generation must bypass that older backoff.
+        # A character(n) query expression can carry typmod -1 while the tuple
+        # and trigger Datum are padded to the column typmod.  Populate through
+        # ordinary SQL, mutate, and prove both paths address the same entry.
+        client.command("INVALIDATE", typmod_namespace)
+        assert sql(
+            f"SELECT value FROM public.{typmod_table} WHERE id = 'a'"
+        ) == "one"
         sql(f"UPDATE public.{typmod_table} SET value = 'two' WHERE id = 'a'")
-        assert client.command("GET", f"{typmod_namespace}:a") == "two"
+        assert sql(
+            f"SELECT value FROM public.{typmod_table} WHERE id = 'a'"
+        ) == "two"
+        assert wait_for_mapping(client, f"{typmod_namespace}:a") == "two"
+        sql(f"UPDATE public.{typmod_table} SET value = 'three' WHERE id = 'a'")
+        assert client.command("GET", f"{typmod_namespace}:a") == "three"
         try:
             client.command("SET", f"{typmod_namespace}:a", "123456")
             raise AssertionError("varchar typmod was not enforced")
@@ -691,7 +734,7 @@ def main() -> None:
         )
         time.sleep(statement_timeout_ms / 1000 + 0.1)
         assert client.command("PING") == "PONG"
-        assert client.command("GET", f"{typmod_namespace}:a") == "two"
+        assert client.command("GET", f"{typmod_namespace}:a") == "three"
         sql(f"SELECT local_cache.unregister_mapping('{typmod_namespace}')")
         wait_for_unavailable_mapping(client, f"{typmod_namespace}:a")
 
@@ -705,7 +748,7 @@ def main() -> None:
         sql_fails(
             f"SELECT local_cache.register_mapping('itenum{suffix}',"
             f" 'public.{enum_table}', 'id', 'value', false)",
-            "unsupported value type",
+            "unsupported scalar value type",
         )
 
         sql(f"INSERT INTO public.{table} VALUES (700, 'locked')")
@@ -795,7 +838,7 @@ def main() -> None:
             sql_fails(
                 f"SELECT local_cache.register_mapping('itcoll{suffix}',"
                 f" 'public.{collation_table}', 'id', 'value', false)",
-                "nondeterministic key collations are not supported",
+                "nondeterministic key collation is not supported",
             )
 
         relation_states_before = json.loads(client.command("STAT"))[
@@ -814,6 +857,12 @@ def main() -> None:
             f" 'public.{remap_a_table}', 'id', 'value', false)"
         )
         assert wait_for_mapping(client, f"{remap_namespace}:1") == "from-a"
+        sql_fails(
+            f"SELECT local_cache.register_mapping('{remap_namespace}',"
+            f" 'public.{remap_b_table}', 'id', 'value', false)",
+            "is already attached to table",
+        )
+        assert wait_for_mapping(client, f"{remap_namespace}:1") == "from-a"
         for iteration in range(12):
             expected = "from-b" if iteration % 2 == 0 else "from-a"
             relation = (
@@ -822,6 +871,7 @@ def main() -> None:
                 else f"public.{remap_a_table}"
             )
             sql(
+                f"SELECT local_cache.unregister_mapping('{remap_namespace}');"
                 f"SELECT local_cache.register_mapping('{remap_namespace}',"
                 f" '{relation}', 'id', 'value', false)"
             )

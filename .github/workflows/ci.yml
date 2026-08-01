@@ -102,6 +102,9 @@ jobs:
           PGLC_BENCH_SERVER_MEMORY: "1g"
           PGLC_BENCH_MIN_OPS: "0"
           PGLC_BENCH_SQL_MIN_OPS: "10000"
+          PGLC_BENCH_ROW_RESP_MIN_OPS: "0"
+          PGLC_BENCH_ROW_SQL_MIN_OPS: "0"
+          PGLC_BENCH_ROW_WIDTH_MIN_OPS: "0"
           PGLC_BENCH_OUTPUT_DIR: ${{ runner.temp }}/comparison-smoke
         run: bash benchmarks/run.sh
 
@@ -162,10 +165,14 @@ jobs:
           python3 -m py_compile \
             benchmarks/compare.py \
             benchmarks/scenarios.py \
+            benchmarks/whole_row.py \
             tests/benchmark_test.py \
             tests/cache_contract_test.py \
             tests/scenario_benchmark_test.py \
             tests/integration.py \
+            tests/upgrade_integration.py \
+            tests/whole_row_integration.py \
+            tests/whole_row_benchmark_test.py \
             tests/oom_monitoring_integration.py \
             tests/pipeline_integration.py \
             tests/sql_fastpath_integration.py \

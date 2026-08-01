@@ -207,16 +207,28 @@ class CacheOwnershipSourceTests(unittest.TestCase):
         coercion = c_function(SQL_FASTPATH, "pglc_sql_coerce_key_expr")
         self.assertIn("coerce_to_target_type", coercion)
         self.assertIn("COERCION_IMPLICIT", coercion)
-        matcher = c_function(SQL_FASTPATH, "pglc_sql_match_clause")
-        self.assertIn("pglc_sql_coerce_key_expr(other, meta)", matcher)
+        matcher = c_function(SQL_FASTPATH, "pglc_sql_match_clauses")
+        self.assertIn(
+            "pglc_sql_coerce_key_expr(\n"
+            "\t\t\tother, meta->key_types[key_index], "
+            "meta->key_typmods[key_index])",
+            matcher,
+        )
+        self.assertIn("restrict_infos[key_index] = rinfo", matcher)
+        self.assertIn("ordered_exprs[key_index] = coerced_other", matcher)
+        self.assertIn("restrict_infos[key_index] != NULL", matcher)
         self.assertNotIn("operator->opno != type_cache->eq_opr", matcher)
 
     def test_sql_cache_rejects_aliasing_custom_btree_families(self) -> None:
         index_path = c_function(SQL_FASTPATH, "pglc_sql_unique_index_path")
         self.assertIn("TYPECACHE_BTREE_OPFAMILY", index_path)
         self.assertIn(
-            "index_info->opfamily[0] != type_cache->btree_opf", index_path
+            "index_info->opfamily[key_index] != type_cache->btree_opf",
+            index_path,
         )
+        self.assertIn("index_info->indexkeys[key_index]", index_path)
+        self.assertIn("match_index_to_operand(left, key_index", index_path)
+        self.assertIn("match_index_to_operand(right, key_index", index_path)
         self.assertIn(
             "get_op_opfamily_strategy(index_operator,\n"
             "\t\t\t\t\t\t\t\t type_cache->btree_opf)",
@@ -306,6 +318,61 @@ class CacheOwnershipSourceTests(unittest.TestCase):
             can_use,
         )
 
+    def test_mapping_reload_backoff_is_scoped_to_one_generation(self) -> None:
+        retry = c_function(WORKER, "maybe_reload_mappings")
+        self.assertIn("generation == worker_retry_generation", retry)
+        self.assertIn("reload_mappings(generation)", retry)
+
+        reload_mappings = c_function(WORKER, "reload_mappings")
+        self.assertIn("uint64 target_generation", reload_mappings)
+        self.assertGreaterEqual(
+            reload_mappings.count(
+                "worker_retry_generation = target_generation;"
+            ),
+            2,
+        )
+        self.assertIn("worker_retry_generation = 0;", reload_mappings)
+
+    def test_mapping_health_tracks_every_worker_generation(self) -> None:
+        self.assertIn("#define PGLC_MAX_WORKERS 32", HEADER)
+        self.assertIn(
+            "worker_mapping_generations[PGLC_MAX_WORKERS]", HEADER
+        )
+        self.assertIn(
+            "pg_atomic_init_u64(\n"
+            "\t\t\t\t&pglc_shared->worker_mapping_generations[worker_index], 0)",
+            CORE,
+        )
+
+        publish = c_function(WORKER, "set_worker_mapping_generation")
+        self.assertIn("worker_mapping_generations[worker_slot]", publish)
+        reload_mappings = c_function(WORKER, "reload_mappings")
+        self.assertIn(
+            "set_worker_mapping_generation(target_generation)",
+            reload_mappings,
+        )
+        self.assertGreaterEqual(
+            reload_mappings.count("set_worker_mapping_generation(0)"), 2
+        )
+        exit_cleanup = c_function(WORKER, "worker_before_exit")
+        self.assertIn("set_worker_mapping_generation(0)", exit_cleanup)
+
+        readiness = c_function(
+            CORE, "pglc_workers_without_current_mappings"
+        )
+        self.assertIn("worker_mapping_generations[worker_index]", readiness)
+        self.assertGreaterEqual(
+            readiness.count("pglc_config_generation()"), 2
+        )
+        self.assertIn("return (uint64) pglc_worker_count", readiness)
+        for reporter in (
+            c_function(CORE, "pglc_stats_json"),
+            c_function(CORE, "pglc_metrics_json"),
+        ):
+            self.assertIn(
+                "pglc_workers_without_current_mappings()", reporter
+            )
+
     def test_inheritance_checks_do_not_trust_sticky_relhassubclass(self) -> None:
         # PostgreSQL may retain relhassubclass after the last child is dropped.
         # Registration, worker reload, and both fast-path validation stages
@@ -366,6 +433,23 @@ class CacheOwnershipSourceTests(unittest.TestCase):
         retry = c_function(WORKER, "maybe_reload_mappings")
         self.assertIn("!worker_mappings_incomplete", retry)
         self.assertIn("worker_next_mapping_retry", retry)
+        self.assertNotIn("worker_next_mapping_retry = 0", retry)
+
+        transition = c_function(WORKER, "set_worker_mappings_incomplete")
+        self.assertIn("worker_mappings_incomplete = incomplete", transition)
+        self.assertNotIn("pg_atomic_", transition)
+        exit_reconciler = c_function(WORKER, "worker_before_exit")
+        self.assertIn("set_worker_mappings_incomplete(false)", exit_reconciler)
+        worker_main = c_function(WORKER, "pg_local_cache_worker_main")
+        self.assertLess(
+            worker_main.index("set_worker_mappings_incomplete(true)"),
+            worker_main.index("pglc_note_worker_start()"),
+        )
+        reload_mappings = c_function(WORKER, "reload_mappings")
+        self.assertLess(
+            reload_mappings.index("set_worker_mappings_incomplete(true)"),
+            reload_mappings.index("PG_TRY()"),
+        )
 
 
 class SqlOnlyContainerSourceTests(unittest.TestCase):
@@ -381,6 +465,7 @@ class SqlOnlyContainerSourceTests(unittest.TestCase):
         )
 
     def test_sql_only_healthcheck_skips_worker_and_resp_probes(self) -> None:
+        self.assertIn("local_cache.health() ->> 'ready'", HEALTHCHECK)
         self.assertIn(
             "current_setting('pg_local_cache.port')::integer = 0",
             HEALTHCHECK,

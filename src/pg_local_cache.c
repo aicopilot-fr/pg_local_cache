@@ -24,6 +24,7 @@
 #include "utils/rel.h"
 #include "utils/timestamp.h"
 
+#include "key_codec.h"
 #include "pg_local_cache.h"
 
 PG_MODULE_MAGIC;
@@ -34,7 +35,7 @@ int			pglc_cache_entries = 16384;
 int			pglc_relation_states = 1024;
 int			pglc_max_clients = 256;
 int			pglc_max_clients_per_worker = 64;
-int			pglc_memory_budget_mb = 256;
+int			pglc_memory_budget_mb = 384;
 int			pglc_idle_timeout_ms = 300000;
 int			pglc_statement_timeout_ms = 2000;
 int			pglc_lock_timeout_ms = 250;
@@ -110,6 +111,7 @@ static void pglc_collect_forget_relation(Oid database_oid, Oid relation_oid,
 										const char *nspace);
 static void pglc_collect_global(bool bump_config);
 static bool pglc_mapping_exists(const char *nspace);
+static uint64 pglc_workers_without_current_mappings(void);
 
 static void
 pglc_define_gucs(void)
@@ -133,7 +135,7 @@ pglc_define_gucs(void)
 							&pglc_worker_count,
 							4,
 							1,
-							32,
+							PGLC_MAX_WORKERS,
 							PGC_POSTMASTER,
 							0,
 							NULL,
@@ -196,7 +198,7 @@ pglc_define_gucs(void)
 							"Hard startup budget for deterministic pg_local_cache shared memory and RESP buffers.",
 							NULL,
 							&pglc_memory_budget_mb,
-							256,
+							384,
 							64,
 							8192,
 							PGC_POSTMASTER,
@@ -460,6 +462,7 @@ pglc_shmem_startup(void)
 {
 	bool		found;
 	HASHCTL		control;
+	int		worker_index;
 
 	if (previous_shmem_startup_hook)
 		previous_shmem_startup_hook();
@@ -479,6 +482,7 @@ pglc_shmem_startup(void)
 		pg_atomic_init_u64(&pglc_shared->cache_hits, 0);
 		pg_atomic_init_u64(&pglc_shared->cache_misses, 0);
 		pg_atomic_init_u64(&pglc_shared->negative_hits, 0);
+		pg_atomic_init_u64(&pglc_shared->negative_writes, 0);
 		pg_atomic_init_u64(&pglc_shared->sql_cache_hits, 0);
 		pg_atomic_init_u64(&pglc_shared->sql_cache_misses, 0);
 		pg_atomic_init_u64(&pglc_shared->sql_cache_fills, 0);
@@ -486,6 +490,8 @@ pglc_shmem_startup(void)
 		pg_atomic_init_u64(&pglc_shared->database_reads, 0);
 		pg_atomic_init_u64(&pglc_shared->database_writes, 0);
 		pg_atomic_init_u64(&pglc_shared->invalidations, 0);
+		pg_atomic_init_u64(&pglc_shared->key_invalidations, 0);
+		pg_atomic_init_u64(&pglc_shared->table_invalidations, 0);
 		pg_atomic_init_u64(&pglc_shared->evictions, 0);
 		pg_atomic_init_u64(&pglc_shared->singleflight_leaders, 0);
 		pg_atomic_init_u64(&pglc_shared->singleflight_waiters, 0);
@@ -501,12 +507,26 @@ pglc_shmem_startup(void)
 		pg_atomic_init_u64(&pglc_shared->slow_client_drops, 0);
 		pg_atomic_init_u64(&pglc_shared->worker_starts, 0);
 		pg_atomic_init_u64(&pglc_shared->active_workers, 0);
+		for (worker_index = 0; worker_index < PGLC_MAX_WORKERS;
+			 worker_index++)
+			pg_atomic_init_u64(
+				&pglc_shared->worker_mapping_generations[worker_index], 0);
 		pg_atomic_init_u64(&pglc_shared->cache_admission_rejections, 0);
 		pg_atomic_init_u64(&pglc_shared->relation_state_admission_rejections, 0);
 		pg_atomic_init_u64(&pglc_shared->dirty_key_limit_fallbacks, 0);
 		pg_atomic_init_u64(&pglc_shared->mapping_reload_attempts, 0);
 		pg_atomic_init_u64(&pglc_shared->mapping_reload_failures, 0);
 		pg_atomic_init_u64(&pglc_shared->mapping_reload_incomplete_retries, 0);
+		pg_atomic_init_u64(&pglc_shared->client_connects, 0);
+		pg_atomic_init_u64(&pglc_shared->client_disconnects, 0);
+		pg_atomic_init_u64(&pglc_shared->client_requests, 0);
+		pg_atomic_init_u64(&pglc_shared->client_request_errors, 0);
+		pg_atomic_init_u64(&pglc_shared->client_gets, 0);
+		pg_atomic_init_u64(&pglc_shared->client_sets, 0);
+		pg_atomic_init_u64(&pglc_shared->client_dels, 0);
+		pg_atomic_init_u64(&pglc_shared->pass_to_main, 0);
+		pg_atomic_init_u64(&pglc_shared->sql_sets, 0);
+		pg_atomic_init_u64(&pglc_shared->sql_dels, 0);
 	}
 
 	memset(&control, 0, sizeof(control));
@@ -1101,6 +1121,8 @@ pglc_cache_store(const PgLocalCacheMapping *mapping, const char *canonical_key,
 			pg_atomic_fetch_add_u64(&pglc_shared->clock, 1) + 1);
 	}
 	LWLockRelease(pglc_shared->lock);
+	if (stored && negative)
+		pg_atomic_fetch_add_u64(&pglc_shared->negative_writes, 1);
 	return stored;
 }
 
@@ -1254,6 +1276,101 @@ pglc_cache_invalidate_namespace(Oid database_oid, const char *nspace)
 	count = invalidate_namespace_locked(database_oid, nspace);
 	LWLockRelease(pglc_shared->lock);
 	pg_atomic_fetch_add_u64(&pglc_shared->invalidations, 1);
+	pg_atomic_fetch_add_u64(&pglc_shared->table_invalidations, 1);
+	return count;
+}
+
+uint64
+pglc_cache_invalidate_key(const PgLocalCacheMapping *mapping,
+						  const char *canonical_key)
+{
+	PgLocalCacheRelationState *relation_state;
+	PgLocalCacheCacheEntry *entry;
+	uint64		count = 0;
+
+	pglc_require_preload();
+	LWLockAcquire(pglc_shared->lock, LW_EXCLUSIVE);
+	pglc_shared->global_version++;
+	relation_state = get_relation_state(MyDatabaseId, mapping->relation_oid,
+									   mapping->nspace, false);
+	entry = get_cache_entry(MyDatabaseId, mapping->relation_oid,
+						mapping->nspace, canonical_key, false);
+	if (entry != NULL &&
+		cache_entry_is_current_locked(entry, relation_state))
+		count = 1;
+	if (entry != NULL)
+	{
+		entry->valid = false;
+		entry->loading = false;
+		entry->load_id++;
+		entry->version = next_entry_generation();
+		entry->source_xmin = InvalidTransactionId;
+		entry->source_observed_full_xid = 0;
+	}
+	LWLockRelease(pglc_shared->lock);
+	pg_atomic_fetch_add_u64(&pglc_shared->invalidations, count);
+	pg_atomic_fetch_add_u64(&pglc_shared->key_invalidations, count);
+	return count;
+}
+
+uint64
+pglc_cache_invalidate_database(Oid database_oid)
+{
+	HASH_SEQ_STATUS cache_sequence;
+	HASH_SEQ_STATUS relation_sequence;
+	PgLocalCacheCacheEntry *entry;
+	PgLocalCacheRelationState *relation_state;
+	uint64		count = 0;
+
+	pglc_require_preload();
+	LWLockAcquire(pglc_shared->lock, LW_EXCLUSIVE);
+	pglc_shared->global_version++;
+	hash_seq_init(&cache_sequence, pglc_cache_hash);
+	while ((entry = hash_seq_search(&cache_sequence)) != NULL)
+	{
+		if (entry->key.database_oid != database_oid)
+			continue;
+		relation_state = get_relation_state(database_oid, entry->relation_oid,
+										entry->key.nspace, false);
+		if (cache_entry_is_current_locked(entry, relation_state))
+			count++;
+	}
+	hash_seq_init(&relation_sequence, pglc_relation_hash);
+	while ((relation_state = hash_seq_search(&relation_sequence)) != NULL)
+	{
+		if (relation_state->key.database_oid == database_oid)
+			relation_state->version++;
+	}
+	LWLockRelease(pglc_shared->lock);
+	pg_atomic_fetch_add_u64(&pglc_shared->invalidations, count);
+	pg_atomic_fetch_add_u64(&pglc_shared->table_invalidations, 1);
+	return count;
+}
+
+uint64
+pglc_cache_invalidate_all(void)
+{
+	HASH_SEQ_STATUS sequence;
+	PgLocalCacheCacheEntry *entry;
+	PgLocalCacheRelationState *relation_state;
+	uint64		count = 0;
+
+	pglc_require_preload();
+	LWLockAcquire(pglc_shared->lock, LW_EXCLUSIVE);
+	hash_seq_init(&sequence, pglc_cache_hash);
+	while ((entry = hash_seq_search(&sequence)) != NULL)
+	{
+		relation_state = get_relation_state(entry->key.database_oid,
+										entry->relation_oid,
+										entry->key.nspace, false);
+		if (cache_entry_is_current_locked(entry, relation_state))
+			count++;
+	}
+	pglc_shared->global_version++;
+	(void) invalidate_all_locked();
+	LWLockRelease(pglc_shared->lock);
+	pg_atomic_fetch_add_u64(&pglc_shared->invalidations, count);
+	pg_atomic_fetch_add_u64(&pglc_shared->table_invalidations, 1);
 	return count;
 }
 
@@ -1340,6 +1457,30 @@ pglc_note_worker_stop(void)
 	Assert(previous > 0);
 	if (previous == 0)
 		pg_atomic_write_u64(&pglc_shared->active_workers, 0);
+}
+
+static uint64
+pglc_workers_without_current_mappings(void)
+{
+	uint64		generation;
+	uint64		observed_generation;
+	uint64		workers = 0;
+	int		worker_index;
+
+	if (pglc_port == 0)
+		return 0;
+	generation = pglc_config_generation();
+	for (worker_index = 0; worker_index < pglc_worker_count; worker_index++)
+	{
+		if (pg_atomic_read_u64(
+				&pglc_shared->worker_mapping_generations[worker_index]) !=
+			generation)
+			workers++;
+	}
+	observed_generation = pglc_config_generation();
+	if (observed_generation != generation)
+		return (uint64) pglc_worker_count;
+	return workers;
 }
 
 static HTAB *
@@ -1551,6 +1692,8 @@ pglc_publish_dirty(void)
 	HASH_SEQ_STATUS sequence;
 	PgLocalCacheLocalDirtyEntry *local;
 	uint64		invalidated = 0;
+	uint64		key_invalidated = 0;
+	uint64		table_invalidated = 0;
 
 	if (local_dirty_hash == NULL || local_dirty_published)
 		return;
@@ -1583,7 +1726,10 @@ pglc_publish_dirty(void)
 										false);
 				Assert(entry != NULL);
 				if (entry->valid)
+				{
 					invalidated++;
+					key_invalidated++;
+				}
 				entry->valid = false;
 				entry->loading = false;
 				entry->load_id++;
@@ -1601,6 +1747,7 @@ pglc_publish_dirty(void)
 				Assert(state != NULL);
 				state->version++;
 				invalidated++;
+				table_invalidated++;
 			}
 		}
 	}
@@ -1608,6 +1755,10 @@ pglc_publish_dirty(void)
 	local_dirty_published = true;
 	LWLockRelease(pglc_shared->lock);
 	pg_atomic_fetch_add_u64(&pglc_shared->invalidations, invalidated);
+	pg_atomic_fetch_add_u64(&pglc_shared->key_invalidations,
+						key_invalidated);
+	pg_atomic_fetch_add_u64(&pglc_shared->table_invalidations,
+						table_invalidated);
 }
 
 static void
@@ -1764,58 +1915,60 @@ pglc_backend_exit(int code, Datum arg)
 		pglc_finish_dirty(false);
 }
 
-static char *
-tuple_key_as_cstring(TriggerData *trigger_data, HeapTuple tuple,
-					 const char *column_name, bool *is_null)
-{
-	TupleDesc	descriptor = RelationGetDescr(trigger_data->tg_relation);
-	AttrNumber	attribute_number;
-	Form_pg_attribute attribute;
-	Datum		value;
-	Oid			output_function;
-	bool		type_is_varlena;
-
-	attribute_number = get_attnum(RelationGetRelid(trigger_data->tg_relation),
-								  column_name);
-	if (attribute_number == InvalidAttrNumber)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_COLUMN),
-				 errmsg("pg_local_cache key column \"%s\" no longer exists",
-						column_name)));
-
-	attribute = TupleDescAttr(descriptor, attribute_number - 1);
-	value = heap_getattr(tuple, attribute_number, descriptor, is_null);
-	if (*is_null)
-		return NULL;
-
-	getTypeOutputInfo(attribute->atttypid, &output_function, &type_is_varlena);
-	return OidOutputFunctionCall(output_function, value);
-}
-
 static void
 collect_tuple_key(TriggerData *trigger_data, HeapTuple tuple,
-				  const char *nspace, const char *column_name)
+				  const char *nspace, int key_count, char **column_names)
 {
-	char	   *key;
-	bool		is_null;
+	TupleDesc	descriptor = RelationGetDescr(trigger_data->tg_relation);
+	char		canonical[PGLC_KEY_MAX];
+	Datum		key_values[PGLC_MAX_KEY_COLUMNS];
+	bool		key_nulls[PGLC_MAX_KEY_COLUMNS];
+	FmgrInfo	key_outputs[PGLC_MAX_KEY_COLUMNS];
+	Size		canonical_len;
+	int			key_index;
 
-	key = tuple_key_as_cstring(trigger_data, tuple, column_name, &is_null);
-	if (is_null || key == NULL)
+	MemSet(key_values, 0, sizeof(key_values));
+	MemSet(key_nulls, 0, sizeof(key_nulls));
+	MemSet(key_outputs, 0, sizeof(key_outputs));
+	for (key_index = 0; key_index < key_count; key_index++)
 	{
-		pglc_collect_relation(MyDatabaseId,
-							 RelationGetRelid(trigger_data->tg_relation),
-							 nspace);
-		return;
-	}
+		AttrNumber	attribute_number;
+		Form_pg_attribute attribute;
+		Oid			output_function;
+		bool		type_is_varlena;
 
-	if (strlen(key) >= PGLC_KEY_MAX)
-		pglc_collect_relation(MyDatabaseId,
-							 RelationGetRelid(trigger_data->tg_relation),
-							 nspace);
-	else
-		pglc_collect_key(MyDatabaseId,
-						RelationGetRelid(trigger_data->tg_relation),
-						nspace, key);
+		attribute_number = get_attnum(
+			RelationGetRelid(trigger_data->tg_relation),
+			column_names[key_index]);
+		if (attribute_number == InvalidAttrNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("pg_local_cache key column \"%s\" no longer exists",
+							column_names[key_index])));
+
+		attribute = TupleDescAttr(descriptor, attribute_number - 1);
+		key_values[key_index] = heap_getattr(
+			tuple, attribute_number, descriptor, &key_nulls[key_index]);
+		if (key_nulls[key_index])
+			goto relation_fallback;
+
+		getTypeOutputInfo(attribute->atttypid, &output_function,
+						  &type_is_varlena);
+		fmgr_info(output_function, &key_outputs[key_index]);
+	}
+	if (!pglc_canonical_key(key_values, key_nulls, key_count, key_outputs,
+							canonical, sizeof(canonical), &canonical_len))
+		goto relation_fallback;
+
+	pglc_collect_key(MyDatabaseId,
+					RelationGetRelid(trigger_data->tg_relation),
+					nspace, canonical);
+	return;
+
+relation_fallback:
+	pglc_collect_relation(MyDatabaseId,
+						 RelationGetRelid(trigger_data->tg_relation),
+						 nspace);
 }
 
 Datum
@@ -1854,7 +2007,8 @@ pg_local_cache_row_invalidate(PG_FUNCTION_ARGS)
 {
 	TriggerData *trigger_data;
 	const char *nspace;
-	const char *column_name;
+	int			key_count;
+	char	  **column_names;
 
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		ereport(ERROR,
@@ -1864,26 +2018,28 @@ pg_local_cache_row_invalidate(PG_FUNCTION_ARGS)
 	trigger_data = (TriggerData *) fcinfo->context;
 	if (!TRIGGER_FIRED_AFTER(trigger_data->tg_event) ||
 		!TRIGGER_FIRED_FOR_ROW(trigger_data->tg_event) ||
-		trigger_data->tg_trigger->tgnargs != 2)
+		trigger_data->tg_trigger->tgnargs < 2 ||
+		trigger_data->tg_trigger->tgnargs > PGLC_MAX_KEY_COLUMNS + 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 				 errmsg("invalid pg_local_cache row trigger definition")));
 
 	nspace = trigger_data->tg_trigger->tgargs[0];
-	column_name = trigger_data->tg_trigger->tgargs[1];
+	key_count = trigger_data->tg_trigger->tgnargs - 1;
+	column_names = &trigger_data->tg_trigger->tgargs[1];
 
 	if (TRIGGER_FIRED_BY_INSERT(trigger_data->tg_event))
 		collect_tuple_key(trigger_data, trigger_data->tg_trigtuple,
-						  nspace, column_name);
+						  nspace, key_count, column_names);
 	else if (TRIGGER_FIRED_BY_DELETE(trigger_data->tg_event))
 		collect_tuple_key(trigger_data, trigger_data->tg_trigtuple,
-						  nspace, column_name);
+						  nspace, key_count, column_names);
 	else if (TRIGGER_FIRED_BY_UPDATE(trigger_data->tg_event))
 	{
 		collect_tuple_key(trigger_data, trigger_data->tg_trigtuple,
-						  nspace, column_name);
+						  nspace, key_count, column_names);
 		collect_tuple_key(trigger_data, trigger_data->tg_newtuple,
-						  nspace, column_name);
+						  nspace, key_count, column_names);
 	}
 
 	if (TRIGGER_FIRED_BY_INSERT(trigger_data->tg_event) ||
@@ -2059,6 +2215,7 @@ pglc_stats_json(void)
 	uint64		output_backpressure_events;
 	uint64		slow_client_drops;
 	uint64		worker_starts;
+	uint64		workers_with_incomplete_mappings = 0;
 	HASH_SEQ_STATUS relation_sequence;
 	PgLocalCacheRelationState *relation_state;
 	uint32		global_dirty_writers;
@@ -2131,6 +2288,8 @@ pglc_stats_json(void)
 	slow_client_drops =
 		pg_atomic_read_u64(&pglc_shared->slow_client_drops);
 	worker_starts = pg_atomic_read_u64(&pglc_shared->worker_starts);
+	workers_with_incomplete_mappings =
+		pglc_workers_without_current_mappings();
 
 	expanded.data = psprintf(
 		"{\"entries\":" UINT64_FORMAT
@@ -2201,6 +2360,7 @@ pglc_stats_json(void)
 		",\"client_limit_rejections\":" UINT64_FORMAT
 		",\"workers_configured\":%d"
 		",\"workers_running\":" UINT64_FORMAT
+		",\"workers_with_incomplete_mappings\":" UINT64_FORMAT
 		",\"shared_memory_bytes\":%zu"
 		",\"worker_memory_bytes\":%zu"
 		",\"estimated_memory_bytes\":%zu"
@@ -2211,7 +2371,25 @@ pglc_stats_json(void)
 		",\"dirty_key_limit_fallbacks\":" UINT64_FORMAT
 		",\"mapping_reload_attempts\":" UINT64_FORMAT
 		",\"mapping_reload_failures\":" UINT64_FORMAT
-		",\"mapping_reload_incomplete_retries\":" UINT64_FORMAT "}",
+		",\"mapping_reload_incomplete_retries\":" UINT64_FORMAT
+		/* KVik-compatible STAT names, kept alongside native counters. */
+		",\"store_memory\":%zu"
+		",\"client_connect\":" UINT64_FORMAT
+		",\"client_disconnect\":" UINT64_FORMAT
+		",\"client_requests\":" UINT64_FORMAT
+		",\"client_request_errors\":" UINT64_FORMAT
+		",\"client_gets\":" UINT64_FORMAT
+		",\"client_sets\":" UINT64_FORMAT
+		",\"client_dels\":" UINT64_FORMAT
+		",\"cache_hit_in_main\":" UINT64_FORMAT
+		",\"cache_neg_write_count\":" UINT64_FORMAT
+		",\"cache_invalidate_entry\":" UINT64_FORMAT
+		",\"cache_invalidate_table\":" UINT64_FORMAT
+		",\"pass_to_main\":" UINT64_FORMAT
+		",\"sql_meta\":" UINT64_FORMAT
+		",\"sql_sets\":" UINT64_FORMAT
+		",\"sql_dels\":" UINT64_FORMAT
+		",\"sql_result_reuses\":" UINT64_FORMAT "}",
 		pglc_cache_entries, pglc_relation_states,
 		pglc_port == 0 ? 0 : pglc_max_clients,
 		pglc_port == 0 ? 0 : pglc_max_clients_per_worker,
@@ -2222,6 +2400,7 @@ pglc_stats_json(void)
 		pg_atomic_read_u64(&pglc_shared->client_limit_rejections),
 		pglc_port == 0 ? 0 : pglc_worker_count,
 		pg_atomic_read_u64(&pglc_shared->active_workers),
+		workers_with_incomplete_mappings,
 		pglc_shared_memory_bytes(), pglc_worker_memory_bytes(),
 		pglc_estimated_memory_bytes(),
 		mul_size((Size) pglc_memory_budget_mb, (Size) 1024 * 1024),
@@ -2234,7 +2413,26 @@ pglc_stats_json(void)
 		pg_atomic_read_u64(&pglc_shared->mapping_reload_attempts),
 		pg_atomic_read_u64(&pglc_shared->mapping_reload_failures),
 		pg_atomic_read_u64(
-			&pglc_shared->mapping_reload_incomplete_retries));
+			&pglc_shared->mapping_reload_incomplete_retries),
+		mul_size((Size) (positive + negative),
+				 sizeof(PgLocalCacheCacheEntry)),
+		pg_atomic_read_u64(&pglc_shared->client_connects),
+		pg_atomic_read_u64(&pglc_shared->client_disconnects),
+		pg_atomic_read_u64(&pglc_shared->client_requests),
+		pg_atomic_read_u64(&pglc_shared->client_request_errors),
+		pg_atomic_read_u64(&pglc_shared->client_gets),
+		pg_atomic_read_u64(&pglc_shared->client_sets),
+		pg_atomic_read_u64(&pglc_shared->client_dels),
+		/* Every RESP hit comes from the shared/global hash in this design. */
+		cache_hits,
+		pg_atomic_read_u64(&pglc_shared->negative_writes),
+		pg_atomic_read_u64(&pglc_shared->key_invalidations),
+		pg_atomic_read_u64(&pglc_shared->table_invalidations),
+		pg_atomic_read_u64(&pglc_shared->pass_to_main),
+		pg_atomic_read_u64(&pglc_shared->mapping_reload_attempts),
+		pg_atomic_read_u64(&pglc_shared->sql_sets),
+		pg_atomic_read_u64(&pglc_shared->sql_dels),
+		pg_atomic_read_u64(&pglc_shared->singleflight_reuses));
 	return expanded.data;
 }
 
@@ -2245,6 +2443,7 @@ pglc_metrics_json(void)
 	uint64		entries;
 	uint64		relation_states;
 	uint64		global_dirty_writers;
+	uint64		workers_with_incomplete_mappings;
 
 	pglc_require_preload();
 	LWLockAcquire(pglc_shared->lock, LW_SHARED);
@@ -2252,6 +2451,8 @@ pglc_metrics_json(void)
 	relation_states = hash_get_num_entries(pglc_relation_hash);
 	global_dirty_writers = pglc_shared->global_dirty_writers;
 	LWLockRelease(pglc_shared->lock);
+	workers_with_incomplete_mappings =
+		pglc_workers_without_current_mappings();
 
 	initStringInfo(&result);
 	appendStringInfo(
@@ -2268,6 +2469,7 @@ pglc_metrics_json(void)
 		",\"client_slots\":%d"
 		",\"workers_configured\":%d"
 		",\"workers_running\":" UINT64_FORMAT
+		",\"workers_with_incomplete_mappings\":" UINT64_FORMAT
 		",\"shared_memory_bytes\":%zu"
 		",\"worker_memory_bytes\":%zu"
 		",\"estimated_memory_bytes\":%zu"
@@ -2281,6 +2483,7 @@ pglc_metrics_json(void)
 			pglc_worker_count * pglc_max_clients_per_worker,
 		pglc_port == 0 ? 0 : pglc_worker_count,
 		pg_atomic_read_u64(&pglc_shared->active_workers),
+		workers_with_incomplete_mappings,
 		pglc_shared_memory_bytes(), pglc_worker_memory_bytes(),
 		pglc_estimated_memory_bytes(),
 		mul_size((Size) pglc_memory_budget_mb, (Size) 1024 * 1024));
@@ -2312,6 +2515,7 @@ pglc_metrics_json(void)
 	PGLC_APPEND_METRIC_COUNTER("worker_starts_total", worker_starts);
 	PGLC_APPEND_METRIC_COUNTER("dirty_key_limit_fallbacks_total", dirty_key_limit_fallbacks);
 	PGLC_APPEND_METRIC_COUNTER("mapping_reload_failures_total", mapping_reload_failures);
+	PGLC_APPEND_METRIC_COUNTER("mapping_reload_incomplete_retries_total", mapping_reload_incomplete_retries);
 #undef PGLC_APPEND_METRIC_COUNTER
 	appendStringInfoChar(&result, '}');
 	return result.data;

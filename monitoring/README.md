@@ -5,12 +5,16 @@ This optional Compose overlay adds a least-privilege PostgreSQL monitoring role,
 dashboard. The only new host port is Grafana on loopback. Prometheus and the
 exporter remain reachable only on the Compose network.
 
-The exporter reads the typed, one-row `local_cache.metrics()` function. It also
-collects the standard PostgreSQL metrics so the same Prometheus can be used for
-database health. The `local_cache_monitor` role has `CONNECTION LIMIT 2`, read-only
+The exporter reads the typed, one-row `local_cache.metrics()` and
+`local_cache.mapping_metrics()` functions. It also collects standard PostgreSQL
+metrics so the same Prometheus can be used for database health. The
+`local_cache_monitor` role has `CONNECTION LIMIT 2`, read-only
 transactions, short timeouts, `pg_monitor`, and execute permission only for the
-cache `metrics()`, `health()`, and `stats()` functions. The exporter itself uses
-only `metrics()` for its stable, one-row contract.
+cache `metrics()`, `mapping_metrics()`, `health()`, and `stats()` functions. To
+remain compatible with grants created by 1.0, the exporter reads its two new
+mapping-health fields from `health()`; `mapping_metrics()` is the typed SQL API
+for the same fields. The split preserves the 1.0 `metrics()` row type for
+dependency-safe upgrades.
 
 ## Start
 
@@ -80,7 +84,9 @@ The bundled rules cover:
 - exporter, extension, and worker availability;
 - cache, client, and deterministic memory budget saturation;
 - global client-limit rejections and slow clients;
-- transaction dirty-key fallback and mapping reload failures;
+- transaction dirty-key fallback, mapping reload failures, and workers that
+  have not yet acknowledged the current mapping generation (including workers
+  that reject one or more unsafe mappings);
 - PostgreSQL container memory pressure and OOM events when cAdvisor is enabled.
 
 Tune warning windows to the workload before routing them to a pager. Counters
@@ -125,7 +131,9 @@ docker compose \
   config --quiet
 ```
 
-For an existing PostgreSQL data volume created by an older image, ensure that
-the installed extension exposes `local_cache.metrics()` before starting the
-overlay. The one-shot initializer deliberately fails instead of granting broad
-schema access when the metrics contract is absent.
+For an existing PostgreSQL data volume created by an older image, first update
+the extension to 1.1 and verify that both `local_cache.metrics()` and
+`local_cache.mapping_metrics()` exist before starting the overlay. Then
+recreate `monitoring-init` and `postgres-exporter` so the least-privilege role
+receives the additive function grant. The one-shot initializer deliberately
+fails instead of granting broad schema access when the contract is absent.

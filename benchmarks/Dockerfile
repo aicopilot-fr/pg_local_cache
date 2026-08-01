@@ -9,6 +9,7 @@ RUN apt-get update \
 
 COPY benchmarks/compare.py /usr/local/lib/pg_local_cache/compare.py
 COPY benchmarks/scenarios.py /usr/local/lib/pg_local_cache/scenarios.py
+COPY benchmarks/whole_row.py /usr/local/lib/pg_local_cache/whole_row.py
 
 ENTRYPOINT ["python3", "/usr/local/lib/pg_local_cache/compare.py"]
 CMD []

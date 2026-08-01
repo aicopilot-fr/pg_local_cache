@@ -1,7 +1,14 @@
 pg_local_cache:
   query: |
-    SELECT *
-      FROM local_cache.metrics()
+    SELECT metrics.*,
+           (mapping_health.payload ->> 'workers_with_incomplete_mappings')::bigint
+               AS workers_with_incomplete_mappings,
+           (mapping_health.payload ->> 'mapping_reload_incomplete_retries_total')::bigint
+               AS mapping_reload_incomplete_retries_total
+      FROM local_cache.metrics() AS metrics
+      CROSS JOIN LATERAL (
+          SELECT local_cache.health() AS payload
+      ) AS mapping_health
   master: true
   metrics:
     - up:
@@ -40,6 +47,9 @@ pg_local_cache:
     - workers_running:
         usage: GAUGE
         description: RESP workers currently running.
+    - workers_with_incomplete_mappings:
+        usage: GAUGE
+        description: RESP workers that have not loaded the current complete mapping generation.
     - shared_memory_bytes:
         usage: GAUGE
         description: Bytes reserved in PostgreSQL shared memory for pg_local_cache.
@@ -124,3 +134,6 @@ pg_local_cache:
     - mapping_reload_failures_total:
         usage: COUNTER
         description: Cache mapping reload failures since PostgreSQL startup.
+    - mapping_reload_incomplete_retries_total:
+        usage: COUNTER
+        description: Mapping reloads that omitted one or more unsafe mappings since PostgreSQL startup.

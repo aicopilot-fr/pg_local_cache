@@ -30,7 +30,9 @@ COPY --from=builder \
     /usr/share/postgresql/16/extension/pg_local_cache.control
 COPY --from=builder \
     /stage/usr/share/postgresql/16/extension/pg_local_cache--1.0.0.sql \
-    /usr/share/postgresql/16/extension/pg_local_cache--1.0.0.sql
+    /stage/usr/share/postgresql/16/extension/pg_local_cache--1.0.0--1.1.0.sql \
+    /stage/usr/share/postgresql/16/extension/pg_local_cache--1.1.0.sql \
+    /usr/share/postgresql/16/extension/
 
 COPY --chmod=0755 docker/entrypoint.sh \
     /usr/local/bin/pg_local_cache_entrypoint
@@ -51,7 +53,7 @@ ENV PG_LOCAL_CACHE_ROLE=local_cache_worker \
     PG_LOCAL_CACHE_RELATION_STATES=1024 \
     PG_LOCAL_CACHE_MAX_CLIENTS=512 \
     PG_LOCAL_CACHE_MAX_CLIENTS_PER_WORKER=64 \
-    PG_LOCAL_CACHE_MEMORY_BUDGET_MB=768 \
+    PG_LOCAL_CACHE_MEMORY_BUDGET_MB=1024 \
     PG_LOCAL_CACHE_MAX_WORKER_PROCESSES=16 \
     PG_LOCAL_CACHE_IDLE_TIMEOUT_MS=300000 \
     PG_LOCAL_CACHE_STATEMENT_TIMEOUT_MS=2000 \

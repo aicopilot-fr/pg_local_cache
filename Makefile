@@ -2,9 +2,12 @@ EXTENSION = pg_local_cache
 MODULE_big = pg_local_cache
 
 OBJS = src/pg_local_cache.o src/pg_local_cache_sql.o \
-	src/pg_local_cache_worker.o src/resp.o
+	src/pg_local_cache_worker.o src/resp.o src/key_codec.o \
+	src/row_payload.o
 
-DATA = sql/pg_local_cache--1.0.0.sql
+DATA = sql/pg_local_cache--1.0.0.sql \
+	sql/pg_local_cache--1.0.0--1.1.0.sql \
+	sql/pg_local_cache--1.1.0.sql
 PGFILEDESC = "pg_local_cache - RESP row cache embedded in PostgreSQL"
 EXTRA_CLEAN = tests/unit/resp_test tests/unit/resp_test_sanitized
 
@@ -29,10 +32,15 @@ endif
 
 verify-static: all
 	python3 -m py_compile benchmarks/compare.py benchmarks/scenarios.py \
+		benchmarks/whole_row.py \
 		tests/benchmark_test.py tests/cache_contract_test.py \
 		tests/monitoring_contract_test.py \
-		tests/scenario_benchmark_test.py tests/sql_api_test.py \
-		tests/integration.py tests/pipeline_integration.py \
+		tests/row_payload_contract_test.py \
+		tests/scenario_benchmark_test.py tests/whole_row_benchmark_test.py \
+		tests/sql_api_test.py \
+		tests/worker_kvik_contract_test.py \
+		tests/integration.py tests/upgrade_integration.py \
+		tests/whole_row_integration.py tests/pipeline_integration.py \
 		tests/oom_monitoring_integration.py \
 		tests/sql_fastpath_integration.py tests/load.py
 	bash -n docker/entrypoint.sh docker/healthcheck.sh docker/attach-table.sh \
@@ -46,14 +54,15 @@ verify-static: all
 source-test:
 	$(MAKE) -C tests/unit check
 	python3 -m unittest -v tests/cache_contract_test.py \
-		tests/monitoring_contract_test.py tests/sql_api_test.py
+		tests/monitoring_contract_test.py tests/row_payload_contract_test.py \
+		tests/sql_api_test.py tests/worker_kvik_contract_test.py
 
 source-sanitize:
 	$(MAKE) -C tests/unit sanitize
 
 benchmark-test:
 	python3 -m unittest -v tests/benchmark_test.py \
-		tests/scenario_benchmark_test.py
+		tests/scenario_benchmark_test.py tests/whole_row_benchmark_test.py
 
 integration:
 	python3 tests/integration.py

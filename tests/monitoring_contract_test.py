@@ -22,7 +22,7 @@ WORKER = (ROOT / "src" / "pg_local_cache_worker.c").read_text(
     encoding="utf-8"
 )
 HEADER = (ROOT / "src" / "pg_local_cache.h").read_text(encoding="utf-8")
-INSTALL_SQL = (ROOT / "sql" / "pg_local_cache--1.0.0.sql").read_text(
+INSTALL_SQL = (ROOT / "sql" / "pg_local_cache--1.1.0.sql").read_text(
     encoding="utf-8"
 )
 ENTRYPOINT = (ROOT / "docker" / "entrypoint.sh").read_text(
@@ -32,6 +32,9 @@ COMPOSE = (ROOT / "compose.yaml").read_text(encoding="utf-8")
 SQL_ONLY_COMPOSE = (ROOT / "compose.sql-only.yaml").read_text(
     encoding="utf-8"
 )
+EXPORTER_QUERIES = (
+    ROOT / "monitoring" / "postgres-exporter" / "queries.yaml"
+).read_text(encoding="utf-8")
 
 
 def c_function(source: str, name: str) -> str:
@@ -403,6 +406,39 @@ class MonitoringInterfaceSourceTests(unittest.TestCase):
             INSTALL_SQL,
             r"(?i)REVOKE\s+ALL\s+ON\s+FUNCTION\s+metrics\s*\(\s*\)"
             r"\s+FROM\s+PUBLIC\s*;",
+        )
+        mapping_metrics = re.search(
+            r"CREATE\s+FUNCTION\s+mapping_metrics\s*\(\s*\)"
+            r"(?P<body>.*?)(?=\n(?:CREATE|REVOKE|GRANT)\b|\Z)",
+            INSTALL_SQL,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        self.assertIsNotNone(mapping_metrics)
+        self.assertIn(
+            "workers_with_incomplete_mappings", mapping_metrics.group(0)
+        )
+        self.assertIn(
+            "mapping_reload_incomplete_retries_total",
+            mapping_metrics.group(0),
+        )
+        health = re.search(
+            r"CREATE\s+FUNCTION\s+health\s*\(\s*\).*?\n\$function\$;",
+            INSTALL_SQL,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        self.assertIsNotNone(health)
+        self.assertIn("workers_with_incomplete_mappings", health.group(0))
+        self.assertIn("= 0", health.group(0))
+
+    def test_exporter_keeps_the_existing_1_0_monitor_grants_working(self) -> None:
+        self.assertIn("local_cache.metrics()", EXPORTER_QUERIES)
+        self.assertIn("local_cache.health()", EXPORTER_QUERIES)
+        self.assertNotIn(
+            "CROSS JOIN local_cache.mapping_metrics()", EXPORTER_QUERIES
+        )
+        self.assertIn("workers_with_incomplete_mappings", EXPORTER_QUERIES)
+        self.assertIn(
+            "mapping_reload_incomplete_retries_total", EXPORTER_QUERIES
         )
 
     def test_entrypoint_validates_and_writes_every_memory_guard(self) -> None:

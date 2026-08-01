@@ -62,6 +62,24 @@ tests:
               summary: pg_local_cache rejected clients at the global limit
               description: At least one RESP connection was rejected by the OOM safety limit in five minutes.
 
+  - name: incomplete mappings fail readiness monitoring
+    interval: 1m
+    input_series:
+      - series: 'pg_local_cache_workers_with_incomplete_mappings{instance="postgres-exporter:9187",job="pg-local-cache"}'
+        values: '1+0x10'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: PgLocalCacheMappingsIncomplete
+        exp_alerts:
+          - exp_labels:
+              component: pg_local_cache
+              instance: postgres-exporter:9187
+              job: pg-local-cache
+              severity: critical
+            exp_annotations:
+              summary: pg_local_cache mappings are not current on every worker
+              description: At least one RESP worker has not loaded the current complete table-mapping generation.
+
   - name: cAdvisor OOM counter pages immediately
     interval: 1m
     input_series:

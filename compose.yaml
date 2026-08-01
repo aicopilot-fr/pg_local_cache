@@ -7,7 +7,7 @@ services:
       dockerfile: Dockerfile
       args:
         POSTGRES_IMAGE: postgres:16.14-bookworm
-    image: pg_local_cache:1.0.0
+    image: pg_local_cache:1.1.0
     restart: unless-stopped
     stop_grace_period: 60s
     shm_size: 1gb
@@ -26,7 +26,7 @@ services:
       PG_LOCAL_CACHE_RELATION_STATES: "1024"
       PG_LOCAL_CACHE_MAX_CLIENTS: "512"
       PG_LOCAL_CACHE_MAX_CLIENTS_PER_WORKER: "64"
-      PG_LOCAL_CACHE_MEMORY_BUDGET_MB: "768"
+      PG_LOCAL_CACHE_MEMORY_BUDGET_MB: "1024"
       PG_LOCAL_CACHE_MAX_WORKER_PROCESSES: "16"
       PG_LOCAL_CACHE_IDLE_TIMEOUT_MS: "300000"
       PG_LOCAL_CACHE_STATEMENT_TIMEOUT_MS: "2000"

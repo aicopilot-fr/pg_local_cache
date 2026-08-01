@@ -88,9 +88,10 @@
       "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value_and_name", "wideLayout": true},
       "targets": [
         {"editorMode": "code", "expr": "pg_local_cache_workers_running{instance=~\"$instance\"}", "instant": true, "legendFormat": "running", "range": false, "refId": "A"},
-        {"editorMode": "code", "expr": "pg_local_cache_workers_configured{instance=~\"$instance\"}", "instant": true, "legendFormat": "configured", "range": false, "refId": "B"}
+        {"editorMode": "code", "expr": "pg_local_cache_workers_configured{instance=~\"$instance\"}", "instant": true, "legendFormat": "configured", "range": false, "refId": "B"},
+        {"editorMode": "code", "expr": "1 - clamp_max(pg_local_cache_workers_with_incomplete_mappings{instance=~\"$instance\"}, 1)", "instant": true, "legendFormat": "mappings healthy", "range": false, "refId": "C"}
       ],
-      "title": "Workers",
+      "title": "Workers and mappings",
       "type": "stat"
     },
     {
@@ -160,7 +161,8 @@
         {"editorMode": "code", "expr": "sum by (instance) (rate(pg_local_cache_rejected_connections_total{instance=~\"$instance\"}[5m]))", "legendFormat": "rejected {{instance}}", "range": true, "refId": "A"},
         {"editorMode": "code", "expr": "sum by (instance) (rate(pg_local_cache_client_limit_rejections_total{instance=~\"$instance\"}[5m]))", "legendFormat": "client limit {{instance}}", "range": true, "refId": "B"},
         {"editorMode": "code", "expr": "sum by (instance) (rate(pg_local_cache_authentication_failures_total{instance=~\"$instance\"}[5m]))", "legendFormat": "auth failures {{instance}}", "range": true, "refId": "C"},
-        {"editorMode": "code", "expr": "sum by (instance) (rate(pg_local_cache_slow_client_drops_total{instance=~\"$instance\"}[5m]))", "legendFormat": "slow drops {{instance}}", "range": true, "refId": "D"}
+        {"editorMode": "code", "expr": "sum by (instance) (rate(pg_local_cache_slow_client_drops_total{instance=~\"$instance\"}[5m]))", "legendFormat": "slow drops {{instance}}", "range": true, "refId": "D"},
+        {"editorMode": "code", "expr": "sum by (instance) (rate(pg_local_cache_mapping_reload_incomplete_retries_total{instance=~\"$instance\"}[5m]))", "legendFormat": "incomplete mapping reloads {{instance}}", "range": true, "refId": "E"}
       ],
       "title": "Rejected and failed operations / second",
       "type": "timeseries"

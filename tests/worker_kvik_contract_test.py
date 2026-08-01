@@ -1,0 +1,138 @@
+import pathlib
+import re
+import unittest
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+WORKER = (ROOT / "src" / "pg_local_cache_worker.c").read_text()
+WHOLE_ROW_INTEGRATION = (
+    ROOT / "tests" / "whole_row_integration.py"
+).read_text()
+
+
+def c_function(source: str, name: str) -> str:
+    match = re.search(rf"(?m)^{re.escape(name)}\s*\(", source)
+    if not match:
+        raise AssertionError(f"missing C function {name}")
+    start = match.start()
+    depth = 0
+    opened = False
+    for position in range(match.end(), len(source)):
+        if source[position] == "{":
+            depth += 1
+            opened = True
+        elif source[position] == "}":
+            depth -= 1
+            if opened and depth == 0:
+                return source[start : position + 1]
+    raise AssertionError(f"unterminated C function {name}")
+
+
+class KvikWireContractTests(unittest.TestCase):
+    def test_attach_json_is_not_polluted_by_postgresql_notices(self):
+        self.assertIn("stderr=subprocess.PIPE", WHOLE_ROW_INTEGRATION)
+        self.assertNotIn("stderr=subprocess.STDOUT", WHOLE_ROW_INTEGRATION)
+        self.assertIn("(result.stdout, result.stderr)", WHOLE_ROW_INTEGRATION)
+
+    def test_crud_keys_are_scoped_to_the_current_database_and_exact_table(self):
+        resolver = c_function(WORKER, "resolve_wire_key")
+        self.assertIn('"CRUD:%s.%s.%s:"', resolver)
+        self.assertIn("!candidate->whole_row", resolver)
+        self.assertIn("pglc_database", resolver)
+        self.assertNotIn("get_database_name", resolver)
+        self.assertNotIn("SearchSysCache", resolver)
+        self.assertIn("ERR KVik key targets a different database", resolver)
+        self.assertIn("ERR unknown KVik table mapping", resolver)
+
+    def test_composite_json_keys_are_complete_and_canonical(self):
+        canonical = c_function(WORKER, "canonicalize_key")
+        self.assertIn("JB_ROOT_IS_OBJECT", canonical)
+        self.assertIn("JB_ROOT_COUNT(key_object) != mapping->key_count", canonical)
+        self.assertIn("getKeyJsonValueFromContainer", canonical)
+        self.assertIn("pglc_canonical_key", canonical)
+        self.assertIn("mapping->key_outputs", canonical)
+
+    def test_invalidate_supports_all_four_kvik_scopes(self):
+        dispatch = c_function(WORKER, "execute_command_inner")
+        self.assertIn('strcmp(scope, "CRUD") == 0', dispatch)
+        self.assertIn("pglc_cache_invalidate_all()", dispatch)
+        self.assertIn("pglc_cache_invalidate_database(MyDatabaseId)", dispatch)
+        self.assertIn("pglc_cache_invalidate_namespace", dispatch)
+        self.assertIn("pglc_cache_invalidate_key", dispatch)
+        self.assertIn("!worker_mappings[i].whole_row", dispatch)
+        self.assertIn("pglc_database", dispatch)
+        self.assertNotIn("get_database_name", dispatch)
+
+
+class WholeRowWorkerContractTests(unittest.TestCase):
+    def test_get_stores_validated_tuple_payload_and_returns_row_json(self):
+        get = c_function(WORKER, "command_get")
+        self.assertIn("pglc_row_payload_encode", get)
+        self.assertIn("PGLC_ROW_PAYLOAD_FLAG_HAS_JSON", get)
+        self.assertIn("cached_row_json", get)
+        self.assertIn("source_row_json", get)
+        self.assertIn("row JSON exceeds the RESP limit", get)
+        self.assertIn("database_payload_cacheable", get)
+        self.assertIn("pglc_cache_lookup_quiet", get)
+        self.assertIn("note_resp_cache_lookup(true, false)", get)
+        self.assertIn("note_resp_cache_lookup(false, false)", get)
+        self.assertNotIn("pglc_cache_lookup(mapping, canonical", get)
+
+        source = c_function(WORKER, "source_row_json")
+        self.assertIn("slot_getallattrs(slot)", source)
+        self.assertIn("toast_raw_datum_size", source)
+        self.assertIn("raw_attribute_bytes", source)
+        self.assertLess(source.index("toast_raw_datum_size"), source.index("F_ROW_TO_JSON_RECORD"))
+
+    def test_set_keeps_wire_pk_authoritative_and_rejects_unknown_columns(self):
+        validate = c_function(WORKER, "row_json_validate")
+        setter = c_function(WORKER, "command_set")
+        self.assertIn("get_attnum(mapping->relation_oid, column_name) <= 0", validate)
+        self.assertIn("does not match the wire key", validate)
+        self.assertIn("if (json_value == NULL)", validate)
+        self.assertIn("JsonbPGetDatum(row)", setter)
+        self.assertIn("row_json_validate", setter)
+
+    def test_loader_builds_parameterized_whole_row_plans(self):
+        reload = c_function(WORKER, "reload_mappings")
+        self.assertIn("m.key_columns", reload)
+        self.assertIn("ARRAY[source_mapping.key_column]::name[]", reload)
+        self.assertIn('get_attnum(mapping_relation_oid, "key_columns")', reload)
+        self.assertIn("jsonb_populate_record", reload)
+        self.assertIn("ON CONFLICT (%s) %s", reload)
+        self.assertIn("mapping->key_count + 1", reload)
+        self.assertIn("mapping->row_desc", reload)
+        self.assertIn("OVERRIDING SYSTEM VALUE", reload)
+        self.assertIn("attribute->attgenerated != '\\0'", reload)
+
+    def test_loader_preserves_generated_and_identity_flags_without_constraints(self):
+        reload = c_function(WORKER, "reload_mappings")
+        copy_at = reload.index("CreateTupleDescCopy(source_desc)")
+        generated_at = reload.index(
+            "copied_attribute->attgenerated = source_attribute->attgenerated"
+        )
+        identity_at = reload.index(
+            "copied_attribute->attidentity = source_attribute->attidentity"
+        )
+        close_at = reload.index("table_close(relation, NoLock)")
+        self.assertLess(copy_at, generated_at)
+        self.assertLess(generated_at, identity_at)
+        self.assertLess(identity_at, close_at)
+        self.assertNotIn("CreateTupleDescCopyConstr", reload)
+
+    def test_loader_revalidates_primary_key_semantics_after_ddl(self):
+        reload = c_function(WORKER, "reload_mappings")
+        self.assertIn("i.indexprs IS NULL", reload)
+        self.assertIn("am.amname = 'btree'", reload)
+        self.assertIn("NOT opc.opcdefault", reload)
+        self.assertIn("pc.castmethod = 'b'", reload)
+
+    def test_loader_rejects_ambiguous_kvik_wire_identifiers(self):
+        reload = c_function(WORKER, "reload_mappings")
+        self.assertIn("current_database() !~ '[.:]'", reload)
+        self.assertIn("n.nspname !~ '[.:]'", reload)
+        self.assertIn("c.relname !~ '[.:]'", reload)
+
+
+if __name__ == "__main__":
+    unittest.main()

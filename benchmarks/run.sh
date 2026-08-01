@@ -50,6 +50,10 @@ rm -f -- \
     "${output_directory}/scenarios.md" \
     "${output_directory}/scenarios-failure.json" \
     "${output_directory}/scenarios-failure.md" \
+    "${output_directory}/whole-row.json" \
+    "${output_directory}/whole-row.md" \
+    "${output_directory}/whole-row-failure.json" \
+    "${output_directory}/whole-row-failure.md" \
     "${output_directory}/.comparison.json.tmp" \
     "${output_directory}/.comparison.md.tmp" \
     "${output_directory}/.failure.json.tmp" \
@@ -57,7 +61,11 @@ rm -f -- \
     "${output_directory}/.scenarios.json.tmp" \
     "${output_directory}/.scenarios.md.tmp" \
     "${output_directory}/.scenarios-failure.json.tmp" \
-    "${output_directory}/.scenarios-failure.md.tmp"
+    "${output_directory}/.scenarios-failure.md.tmp" \
+    "${output_directory}/.whole-row.json.tmp" \
+    "${output_directory}/.whole-row.md.tmp" \
+    "${output_directory}/.whole-row-failure.json.tmp" \
+    "${output_directory}/.whole-row-failure.md.tmp"
 
 postgres_password="$(openssl rand -hex 32)"
 auth_token="$(openssl rand -hex 32)"
@@ -117,6 +125,10 @@ read -r PGLC_BENCH_SCENARIO_HARNESS_SHA256 _ < <(
     openssl dgst -sha256 -r "${script_directory}/scenarios.py"
 )
 export PGLC_BENCH_SCENARIO_HARNESS_SHA256
+read -r PGLC_BENCH_WHOLE_ROW_HARNESS_SHA256 _ < <(
+    openssl dgst -sha256 -r "${script_directory}/whole_row.py"
+)
+export PGLC_BENCH_WHOLE_ROW_HARNESS_SHA256
 PGLC_BENCH_SOURCE_REVISION="unknown"
 if command -v git >/dev/null; then
     PGLC_BENCH_SOURCE_REVISION="$(
@@ -148,11 +160,22 @@ if [[ "${PGLC_BENCH_RUN_SCENARIOS:-1}" != "0" ]]; then
         /usr/local/lib/pg_local_cache/scenarios.py || scenario_status="$?"
 fi
 
+whole_row_status=0
+if [[ "${PGLC_BENCH_RUN_WHOLE_ROW:-1}" != "0" ]]; then
+    "${compose[@]}" run --rm \
+        --entrypoint python3 \
+        benchmark \
+        /usr/local/lib/pg_local_cache/whole_row.py || whole_row_status="$?"
+fi
+
 if ((benchmark_status != 0)); then
     exit "$benchmark_status"
 fi
 if ((scenario_status != 0)); then
     exit "$scenario_status"
+fi
+if ((whole_row_status != 0)); then
+    exit "$whole_row_status"
 fi
 
 printf 'Benchmark reports are in %s\n' "$output_directory"

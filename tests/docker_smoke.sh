@@ -59,10 +59,16 @@ compose() {
 }
 
 cleanup() {
+    local exit_status=$?
+    if (( exit_status != 0 )); then
+        printf 'docker smoke failed; PostgreSQL diagnostics follow\n' >&2
+        compose logs --no-color postgres >&2 || true
+    fi
     compose down --volumes --remove-orphans >/dev/null 2>&1 || true
     if [[ "$temporary_directory" == "${TMPDIR:-/tmp}"/pg_local_cache_smoke.* ]]; then
         rm -rf -- "$temporary_directory"
     fi
+    return "$exit_status"
 }
 trap cleanup EXIT
 
@@ -171,6 +177,10 @@ CREATE TABLE public.pglc_attach_no_pk_smoke (
     id bigint NOT NULL,
     value text NOT NULL
 );
+CREATE TABLE public.pglc_attach_bad_key_smoke (
+    id bigint PRIMARY KEY,
+    value text NOT NULL
+);
 CREATE TABLE public.pglc_attach_rls_smoke (
     id bigint PRIMARY KEY,
     value text NOT NULL
@@ -190,9 +200,8 @@ WHERE NOT EXISTS (
 )
 \gexec
 GRANT USAGE ON SCHEMA local_cache TO :"cache_admin_role";
-GRANT EXECUTE ON FUNCTION local_cache.attach_table(
-    regclass, name, text, boolean
-) TO :"cache_admin_role";
+GRANT EXECUTE ON FUNCTION local_cache.attach_table(regclass)
+    TO :"cache_admin_role";
 SET ROLE :"cache_admin_role";
 SELECT local_cache.attach_table('public.pglc_attach_native_smoke'::regclass);
 RESET ROLE;
@@ -203,9 +212,9 @@ native_attach_state="$(
         psql --username postgres --dbname "$database" --no-psqlrc \
         --tuples-only --no-align --set ON_ERROR_STOP=1 \
         --command \
-		"SELECT m.key_column, m.value_column, m.writable, (SELECT count(*) FROM pg_catalog.pg_trigger t WHERE t.tgrelid = m.relation AND t.tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate') AND t.tgenabled = 'A'), pg_catalog.has_table_privilege('$worker_role', m.relation, 'SELECT') FROM local_cache.mapping m WHERE m.namespace = 'pglc_attach_native_smoke'"
+		"SELECT m.key_column, m.value_column, m.writable, (SELECT count(*) FROM pg_catalog.pg_trigger t WHERE t.tgrelid = m.relation AND t.tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate') AND t.tgenabled = 'A'), pg_catalog.has_table_privilege('$worker_role', m.relation, 'SELECT') FROM local_cache.mapping m WHERE m.namespace = 'public.pglc_attach_native_smoke'"
 )"
-[[ "$native_attach_state" == "id|value|f|3|t" ]]
+[[ "$native_attach_state" == "id||f|3|t" ]]
 
 for rejected_relation in pglc_attach_no_pk_smoke pglc_attach_rls_smoke; do
     native_attach_error="${temporary_directory}/${rejected_relation}.error"
@@ -228,6 +237,96 @@ native_failure_state="$(
         "SELECT (SELECT count(*) FROM local_cache.mapping WHERE relation IN ('public.pglc_attach_no_pk_smoke'::regclass, 'public.pglc_attach_rls_smoke'::regclass)), pg_catalog.has_table_privilege('$worker_role', 'public.pglc_attach_no_pk_smoke', 'SELECT'), pg_catalog.has_table_privilege('$worker_role', 'public.pglc_attach_rls_smoke', 'SELECT')"
 )"
 [[ "$native_failure_state" == "0|f|f" ]]
+
+bad_key_error="${temporary_directory}/attach-bad-key.error"
+if compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "SELECT local_cache.register_value_mapping('pglc_bad_key', 'public.pglc_attach_bad_key_smoke'::regclass, 'missing_key', 'value', false)" \
+    >"$bad_key_error" 2>&1; then
+    printf 'nonexistent key column was unexpectedly accepted\n' >&2
+    exit 1
+fi
+grep -Fq 'one or more key columns' "$bad_key_error"
+
+reserved_namespace_error="${temporary_directory}/attach-reserved-namespace.error"
+if compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "SELECT local_cache.register_value_mapping('CRUD', 'public.pglc_attach_bad_key_smoke'::regclass, 'id', 'value', false)" \
+    >"$reserved_namespace_error" 2>&1; then
+    printf 'reserved CRUD namespace was unexpectedly accepted\n' >&2
+    exit 1
+fi
+grep -Fq 'invalid pg_local_cache namespace' "$reserved_namespace_error"
+
+bad_registration_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT (SELECT count(*) FROM local_cache.mapping WHERE relation = 'public.pglc_attach_bad_key_smoke'::regclass), (SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgrelid = 'public.pglc_attach_bad_key_smoke'::regclass AND tgname LIKE 'pg_local_cache_%'), pg_catalog.has_table_privilege('$worker_role', 'public.pglc_attach_bad_key_smoke', 'SELECT')"
+)"
+[[ "$bad_registration_state" == "0|0|f" ]]
+
+legacy_two_args="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
+        "SELECT (result->>'whole_row')::boolean, result->'templates'->>'get' FROM (SELECT local_cache.attach_table('public.pglc_attach_smoke'::regclass, 'value') AS result) AS attached; SELECT local_cache.unregister_mapping('public.pglc_attach_smoke')"
+)"
+[[ "$legacy_two_args" == "f|GET public.pglc_attach_smoke:<id>" ]]
+
+legacy_inferred_value="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
+        "SELECT (result->>'whole_row')::boolean, result->>'value_column' FROM (SELECT local_cache.attach_value('public.pglc_attach_smoke'::regclass, NULL::name, 'legacy-inferred') AS result) AS attached; SELECT local_cache.unregister_mapping('legacy-inferred')"
+)"
+[[ "$legacy_inferred_value" == "f|value" ]]
+
+legacy_named_writable_error="${temporary_directory}/legacy-named-writable.error"
+if compose exec -T postgres \
+    psql --username postgres --dbname "$database" --no-psqlrc \
+    --set ON_ERROR_STOP=1 --command \
+    "SELECT local_cache.attach_table('public.pglc_attach_smoke'::regclass, p_writable => true)" \
+    >"$legacy_named_writable_error" 2>&1; then
+    printf 'legacy named p_writable unexpectedly changed to whole-row mode\n' >&2
+    exit 1
+fi
+grep -Fq 'p_writable => boolean' "$legacy_named_writable_error"
+
+legacy_three_args="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
+        "SELECT (result->>'whole_row')::boolean, result->>'namespace' FROM (SELECT local_cache.attach_table('public.pglc_attach_smoke'::regclass, 'value', 'legacy-three') AS result) AS attached; SELECT local_cache.unregister_mapping('legacy-three')"
+)"
+[[ "$legacy_three_args" == "f|legacy-three" ]]
+
+legacy_four_args="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
+        "SELECT (result->>'whole_row')::boolean, (result->>'writable')::boolean FROM (SELECT local_cache.attach_table('public.pglc_attach_smoke'::regclass, 'value', 'legacy-four', true) AS result) AS attached; SELECT local_cache.unregister_mapping('legacy-four')"
+)"
+[[ "$legacy_four_args" == "f|t" ]]
+
+whole_two_args="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
+        "SELECT (result->>'whole_row')::boolean, (result->>'writable')::boolean FROM (SELECT local_cache.attach_table('public.pglc_attach_smoke'::regclass, false) AS result) AS attached; SELECT local_cache.unregister_mapping('public.pglc_attach_smoke')"
+)"
+[[ "$whole_two_args" == "t|f" ]]
+
+whole_three_args="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
+        "SELECT (result->>'whole_row')::boolean, result->>'namespace', (result->>'writable')::boolean FROM (SELECT local_cache.attach_table('public.pglc_attach_smoke'::regclass, true, 'whole-three') AS result) AS attached; SELECT local_cache.unregister_mapping('whole-three')"
+)"
+[[ "$whole_three_args" == "t|whole-three|t" ]]
 
 database_mismatch_error="${temporary_directory}/attach-database.error"
 if compose exec -T postgres pg_local_cache_attach \
@@ -262,11 +361,13 @@ unprivileged_mapping_count="$(
 attach_output="$(
     compose exec -T postgres pg_local_cache_attach \
         --database "$database" \
+        --namespace pglc_attach_smoke \
         --table public.pglc_attach_smoke \
         --writable
 )"
-[[ "$attach_output" == *"namespace=pglc_attach_smoke"* ]]
-[[ "$attach_output" == *"key=id value=value writable=true"* ]]
+[[ "$attach_output" == *'"namespace": "pglc_attach_smoke"'* ]]
+[[ "$attach_output" == *'"whole_row": true'* ]]
+[[ "$attach_output" == *'"primary_key_columns": ["id"]'* ]]
 
 attach_state="$(
     compose exec -T postgres \
@@ -275,7 +376,7 @@ attach_state="$(
         --command \
 		"SELECT m.key_column, m.value_column, m.writable, (SELECT count(*) FROM pg_catalog.pg_trigger t WHERE t.tgrelid = m.relation AND t.tgname IN ('pg_local_cache_statement_guard', 'pg_local_cache_row_invalidate', 'pg_local_cache_truncate_invalidate') AND t.tgenabled = 'A'), pg_catalog.has_schema_privilege('$worker_role', 'public', 'USAGE'), pg_catalog.has_table_privilege('$worker_role', m.relation, 'SELECT') AND pg_catalog.has_table_privilege('$worker_role', m.relation, 'INSERT') AND pg_catalog.has_table_privilege('$worker_role', m.relation, 'UPDATE') AND pg_catalog.has_table_privilege('$worker_role', m.relation, 'DELETE') FROM local_cache.mapping m WHERE m.namespace = 'pglc_attach_smoke'"
 )"
-[[ "$attach_state" == "id|value|t|3|t|t" ]]
+[[ "$attach_state" == "id||t|3|t|t" ]]
 
 namespace_conflict_error="${temporary_directory}/attach-namespace.error"
 if compose exec -T postgres pg_local_cache_attach \
@@ -303,7 +404,7 @@ replace_output="$(
         --table public.pglc_attach_other_smoke \
         --replace
 )"
-[[ "$replace_output" == *"table=public.pglc_attach_other_smoke"* ]]
+[[ "$replace_output" == *'"relation": "public.pglc_attach_other_smoke"'* ]]
 
 namespace_after_replace="$(
     compose exec -T postgres \
@@ -322,12 +423,47 @@ if compose exec -T postgres pg_local_cache_attach \
     printf 'composite primary key was unexpectedly accepted\n' >&2
     exit 1
 fi
-grep -Fq 'table must have exactly one primary-key column' "$composite_error"
+grep -Fq 'scalar mappings require a single-column primary key' "$composite_error"
+
+composite_output="$(
+    compose exec -T postgres pg_local_cache_attach \
+        --database "$database" \
+        --namespace pglc_attach_composite_smoke \
+        --table public.pglc_attach_composite_smoke
+)"
+[[ "$composite_output" == *'"whole_row": true'* ]]
+[[ "$composite_output" == *'"primary_key_columns": ["tenant_id", "id"]'* ]]
+
+composite_state="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 \
+        --command \
+        "SELECT m.key_columns::text, m.value_column IS NULL, m.writable FROM local_cache.mapping AS m WHERE m.namespace = 'pglc_attach_composite_smoke'"
+)"
+[[ "$composite_state" == "{tenant_id,id}|t|f" ]]
+
+mapping_dump="$(
+    compose exec -T postgres pg_dump --username postgres --dbname "$database" \
+        --data-only --no-owner --no-privileges
+)"
+grep -Fq 'COPY local_cache.mapping' <<<"$mapping_dump"
+grep -Fq 'pglc_attach_composite_smoke' <<<"$mapping_dump"
 
 compose exec -T postgres \
     psql --username postgres --dbname "$database" --no-psqlrc \
     --set ON_ERROR_STOP=1 --command \
-    "SELECT local_cache.unregister_mapping('pglc_attach_smoke'); SELECT local_cache.unregister_mapping('pglc_attach_native_smoke'); DROP TABLE public.pglc_attach_smoke, public.pglc_attach_composite_smoke, public.pglc_attach_other_smoke, public.pglc_attach_native_smoke, public.pglc_attach_no_pk_smoke, public.pglc_attach_rls_smoke"
+    "SELECT local_cache.unregister_mapping('pglc_attach_smoke'); SELECT local_cache.unregister_mapping('public.pglc_attach_native_smoke'); SELECT local_cache.unregister_mapping('pglc_attach_composite_smoke'); DROP TABLE public.pglc_attach_smoke, public.pglc_attach_composite_smoke, public.pglc_attach_other_smoke, public.pglc_attach_native_smoke, public.pglc_attach_no_pk_smoke, public.pglc_attach_bad_key_smoke, public.pglc_attach_rls_smoke"
+
+PG_LOCAL_CACHE_PSQL="$psql_wrapper" \
+PGHOST="/var/run/postgresql" \
+PGPORT="5432" \
+PGDATABASE="$database" \
+PG_LOCAL_CACHE_RESP_HOST="127.0.0.1" \
+PG_LOCAL_CACHE_RESP_PORT="$cache_host_port" \
+PG_LOCAL_CACHE_AUTH_TOKEN="$auth_token" \
+PG_LOCAL_CACHE_TEST_ROLE="$worker_role" \
+    python3 -B "${repository_directory}/tests/upgrade_integration.py"
 
 extension_version="$(
     compose exec -T postgres \
@@ -336,7 +472,7 @@ extension_version="$(
         --command \
         "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_local_cache'"
 )"
-[[ "$extension_version" == "1.0.0" ]]
+[[ "$extension_version" == "1.1.0" ]]
 
 worker_count="$(
     compose exec -T postgres \
@@ -384,6 +520,18 @@ PG_LOCAL_CACHE_TEST_APP_ROLE="$app_role" \
 PG_LOCAL_CACHE_TEST_APP_PASSWORD="$app_password" \
 PG_LOCAL_CACHE_TEST_APP_HOST="127.0.0.1" \
     python3 -B "${repository_directory}/tests/sql_fastpath_integration.py"
+
+PG_LOCAL_CACHE_PSQL="$psql_wrapper" \
+PGHOST="/var/run/postgresql" \
+PGPORT="5432" \
+PGDATABASE="$database" \
+PG_LOCAL_CACHE_RESP_HOST="127.0.0.1" \
+PG_LOCAL_CACHE_RESP_PORT="$cache_host_port" \
+PG_LOCAL_CACHE_AUTH_TOKEN="$auth_token" \
+PG_LOCAL_CACHE_TEST_APP_ROLE="$app_role" \
+PG_LOCAL_CACHE_TEST_APP_PASSWORD="$app_password" \
+PG_LOCAL_CACHE_TEST_APP_HOST="127.0.0.1" \
+    python3 -B "${repository_directory}/tests/whole_row_integration.py"
 
 PG_LOCAL_CACHE_PSQL="$psql_wrapper" \
 PGHOST="/var/run/postgresql" \

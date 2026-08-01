@@ -61,11 +61,14 @@ jobs:
           python3 -m py_compile \
             benchmarks/compare.py \
             benchmarks/scenarios.py \
+            benchmarks/whole_row.py \
             tests/benchmark_test.py \
-            tests/scenario_benchmark_test.py
+            tests/scenario_benchmark_test.py \
+            tests/whole_row_benchmark_test.py
           python3 -m unittest -v \
             tests/benchmark_test.py \
-            tests/scenario_benchmark_test.py
+            tests/scenario_benchmark_test.py \
+            tests/whole_row_benchmark_test.py
 
       - name: Run identical RESP comparison and PostgreSQL reference
         env:
@@ -80,6 +83,8 @@ jobs:
           PGLC_BENCH_SQL_DIRECT_SETUP: "SET pg_local_cache.sql_cache = off"
           PGLC_BENCH_SQL_FAST_PATH_SETUP: "SET pg_local_cache.sql_cache = on"
           PGLC_BENCH_SQL_MIN_OPS: "10000"
+          PGLC_BENCH_ROW_RESP_MIN_OPS: "10000"
+          PGLC_BENCH_ROW_SQL_MIN_OPS: "10000"
           PGLC_BENCH_SERVER_CPUS: "2"
           PGLC_BENCH_CLIENT_CPUS: "2"
           PGLC_BENCH_OUTPUT_DIR: ${{ github.workspace }}/benchmark-results
@@ -97,6 +102,11 @@ jobs:
             cat benchmark-results/scenarios.md >> "$GITHUB_STEP_SUMMARY"
           elif [[ -f benchmark-results/scenarios-failure.md ]]; then
             cat benchmark-results/scenarios-failure.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -f benchmark-results/whole-row.md ]]; then
+            cat benchmark-results/whole-row.md >> "$GITHUB_STEP_SUMMARY"
+          elif [[ -f benchmark-results/whole-row-failure.md ]]; then
+            cat benchmark-results/whole-row-failure.md >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload machine-readable and Markdown reports

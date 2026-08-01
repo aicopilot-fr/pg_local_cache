@@ -4,6 +4,7 @@
 #include "postgres.h"
 
 #include "access/transam.h"
+#include "access/tupdesc.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "port/atomics.h"
@@ -13,11 +14,14 @@
 #include "resp_limits.h"
 
 #define PGLC_NAMESPACE_MAX 64
-#define PGLC_KEY_MAX 256
+#define PGLC_MAX_KEY_COLUMNS 16
+#define PGLC_KEY_MAX 1024
 #define PGLC_VALUE_MAX 8192
+#define PGLC_RESPONSE_VALUE_MAX (64 * 1024)
 #define PGLC_MAX_MAPPINGS 128
+#define PGLC_MAX_WORKERS 32
 #define PGLC_MAX_CLIENTS_PER_WORKER 128
-#define PGLC_RESPONSE_MAX (PGLC_VALUE_MAX + 1024)
+#define PGLC_RESPONSE_MAX (PGLC_RESPONSE_VALUE_MAX + 1024)
 #define PGLC_AUTH_TOKEN_MAX 1024
 #define PGLC_MAX_AUTH_FAILURES 5
 #define PGLC_EVICTION_SAMPLE 64
@@ -82,6 +86,7 @@ typedef struct PgLocalCacheSharedState
 	pg_atomic_uint64 cache_hits;
 	pg_atomic_uint64 cache_misses;
 	pg_atomic_uint64 negative_hits;
+	pg_atomic_uint64 negative_writes;
 	pg_atomic_uint64 sql_cache_hits;
 	pg_atomic_uint64 sql_cache_misses;
 	pg_atomic_uint64 sql_cache_fills;
@@ -89,6 +94,8 @@ typedef struct PgLocalCacheSharedState
 	pg_atomic_uint64 database_reads;
 	pg_atomic_uint64 database_writes;
 	pg_atomic_uint64 invalidations;
+	pg_atomic_uint64 key_invalidations;
+	pg_atomic_uint64 table_invalidations;
 	pg_atomic_uint64 evictions;
 	pg_atomic_uint64 singleflight_leaders;
 	pg_atomic_uint64 singleflight_waiters;
@@ -104,12 +111,24 @@ typedef struct PgLocalCacheSharedState
 	pg_atomic_uint64 slow_client_drops;
 	pg_atomic_uint64 worker_starts;
 	pg_atomic_uint64 active_workers;
+	/* Generation fully loaded by each statically registered RESP worker. */
+	pg_atomic_uint64 worker_mapping_generations[PGLC_MAX_WORKERS];
 	pg_atomic_uint64 cache_admission_rejections;
 	pg_atomic_uint64 relation_state_admission_rejections;
 	pg_atomic_uint64 dirty_key_limit_fallbacks;
 	pg_atomic_uint64 mapping_reload_attempts;
 	pg_atomic_uint64 mapping_reload_failures;
 	pg_atomic_uint64 mapping_reload_incomplete_retries;
+	pg_atomic_uint64 client_connects;
+	pg_atomic_uint64 client_disconnects;
+	pg_atomic_uint64 client_requests;
+	pg_atomic_uint64 client_request_errors;
+	pg_atomic_uint64 client_gets;
+	pg_atomic_uint64 client_sets;
+	pg_atomic_uint64 client_dels;
+	pg_atomic_uint64 pass_to_main;
+	pg_atomic_uint64 sql_sets;
+	pg_atomic_uint64 sql_dels;
 } PgLocalCacheSharedState;
 
 typedef struct PgLocalCacheReadToken
@@ -138,6 +157,7 @@ typedef struct PgLocalCacheMapping
 	char		relation_name[NAMEDATALEN];
 	char		key_column[NAMEDATALEN];
 	char		value_column[NAMEDATALEN];
+	char		key_columns[PGLC_MAX_KEY_COLUMNS][NAMEDATALEN];
 	Oid			relation_oid;
 	Oid			key_type;
 	Oid			value_type;
@@ -145,11 +165,24 @@ typedef struct PgLocalCacheMapping
 	Oid			value_ioparam;
 	int32		key_typmod;
 	int32		value_typmod;
+	int			key_count;
+	AttrNumber	key_attnos[PGLC_MAX_KEY_COLUMNS];
+	Oid			key_types[PGLC_MAX_KEY_COLUMNS];
+	Oid			key_ioparams[PGLC_MAX_KEY_COLUMNS];
+	int32		key_typmods[PGLC_MAX_KEY_COLUMNS];
+	Oid			row_type_oid;
+	int32		row_typmod;
+	int			row_natts;
+	uint64		row_descriptor_fingerprint;
 	uint64		config_generation;
 	bool		writable;
+	bool		whole_row;
 	FmgrInfo	key_input;
 	FmgrInfo	key_output;
+	FmgrInfo	key_inputs[PGLC_MAX_KEY_COLUMNS];
+	FmgrInfo	key_outputs[PGLC_MAX_KEY_COLUMNS];
 	FmgrInfo	value_input;
+	TupleDesc	row_desc;
 	SPIPlanPtr	get_plan;
 	SPIPlanPtr	set_plan;
 	SPIPlanPtr	delete_plan;
@@ -222,6 +255,10 @@ extern void pglc_note_singleflight_timeout(void);
 extern bool pglc_current_transaction_is_dirty(void);
 extern uint64 pglc_cache_invalidate_namespace(Oid database_oid,
 											 const char *nspace);
+extern uint64 pglc_cache_invalidate_key(const PgLocalCacheMapping *mapping,
+										const char *canonical_key);
+extern uint64 pglc_cache_invalidate_database(Oid database_oid);
+extern uint64 pglc_cache_invalidate_all(void);
 extern char *pglc_stats_json(void);
 extern char *pglc_metrics_json(void);
 extern void pglc_note_database_read(void);

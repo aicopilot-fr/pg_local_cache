@@ -33,6 +33,10 @@ SELECT CASE
          WHERE extname = 'pg_local_cache'
     )
     AND pg_catalog.jsonb_typeof(local_cache.stats()) = 'object'
+    AND COALESCE(
+        (local_cache.health() ->> 'ready')::boolean,
+        false
+    )
     AND (
         SELECT count(*)
           FROM pg_catalog.pg_stat_activity

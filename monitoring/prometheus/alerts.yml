@@ -41,6 +41,16 @@ groups:
           summary: One or more pg_local_cache workers are missing
           description: The number of running RESP workers is below the configured worker count.
 
+      - alert: PgLocalCacheMappingsIncomplete
+        expr: pg_local_cache_workers_with_incomplete_mappings > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: pg_local_cache
+        annotations:
+          summary: pg_local_cache mappings are not current on every worker
+          description: At least one RESP worker has not loaded the current complete table-mapping generation.
+
   - name: pg_local_cache.capacity
     rules:
       - alert: PgLocalCacheMemoryBudgetHigh
@@ -158,6 +168,15 @@ groups:
         annotations:
           summary: pg_local_cache mapping reload failed
           description: A mapping reload failure occurred in the last five minutes.
+
+      - alert: PgLocalCacheMappingReloadIncomplete
+        expr: increase(pg_local_cache_mapping_reload_incomplete_retries_total[5m]) > 0
+        labels:
+          severity: warning
+          component: pg_local_cache
+        annotations:
+          summary: pg_local_cache retried an incomplete mapping set
+          description: At least one worker omitted an unsafe mapping during reload in the last five minutes.
 
   - name: pg_local_cache.container_oom
     rules:

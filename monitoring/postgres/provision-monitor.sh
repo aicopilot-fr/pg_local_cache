@@ -54,11 +54,13 @@ GRANT pg_monitor TO local_cache_monitor;
 GRANT CONNECT ON DATABASE :"monitor_database" TO local_cache_monitor;
 GRANT USAGE ON SCHEMA local_cache TO local_cache_monitor;
 GRANT EXECUTE ON FUNCTION local_cache.metrics() TO local_cache_monitor;
+GRANT EXECUTE ON FUNCTION local_cache.mapping_metrics() TO local_cache_monitor;
 GRANT EXECUTE ON FUNCTION local_cache.health() TO local_cache_monitor;
 GRANT EXECUTE ON FUNCTION local_cache.stats() TO local_cache_monitor;
 
 SELECT 1 AS metrics_contract_ready
   FROM local_cache.metrics()
+ CROSS JOIN local_cache.mapping_metrics()
  LIMIT 1;
 SQL
 
