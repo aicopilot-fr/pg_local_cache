@@ -10,6 +10,8 @@ project="pg_local_cache_sql_only_$$"
 override_file="${temporary_directory}/compose.override.yaml"
 psql_wrapper="${temporary_directory}/psql"
 postgres_secret="${temporary_directory}/postgres_password"
+runner_image="pg_local_cache-sql-only-runner:$$"
+benchmark_output_directory="${PGLC_SQL_ONLY_BENCH_OUTPUT_DIR:-${temporary_directory}/benchmark-results}"
 postgres_host_port="${POSTGRES_HOST_PORT:-$(
     python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
 )}"
@@ -27,6 +29,7 @@ compose() {
 
 cleanup() {
     compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+    docker image rm "$runner_image" >/dev/null 2>&1 || true
     if [[ "$temporary_directory" == "${TMPDIR:-/tmp}"/pg_local_cache_sql_only.* ]]; then
         rm -rf -- "$temporary_directory"
     fi
@@ -106,4 +109,57 @@ sql_only_metrics="$(
 )"
 [[ "$sql_only_metrics" == "1|0|0|0|0|0|t|t" ]]
 
-printf 'ok: SQL-only Docker profile, zero RESP workers, ordinary-role transparent cache\n'
+mkdir -p -- "$benchmark_output_directory"
+benchmark_output_directory="$(
+    cd -- "$benchmark_output_directory"
+    pwd -P
+)"
+docker build \
+    --file "${repository_directory}/benchmarks/Dockerfile" \
+    --tag "$runner_image" \
+    "$repository_directory"
+
+source_revision="$({
+    git -C "$repository_directory" rev-parse --verify HEAD 2>/dev/null ||
+        printf 'unknown'
+} | head -n 1)"
+if [[ -n "$(git -C "$repository_directory" status --porcelain 2>/dev/null)" ]]; then
+    source_revision="${source_revision}-dirty"
+fi
+harness_sha256="$(
+    sha256sum "${repository_directory}/benchmarks/sql_only.py" |
+        awk '{print $1}'
+)"
+
+docker run --rm \
+    --network "${project}_default" \
+    --user "$(id -u):$(id -g)" \
+    --cpus "${PGLC_SQL_ONLY_BENCH_CLIENT_CPUS:-2}" \
+    --memory "${PGLC_SQL_ONLY_BENCH_CLIENT_MEMORY:-1g}" \
+    --volume "${benchmark_output_directory}:/results" \
+    --env PGHOST=postgres \
+    --env PGPORT=5432 \
+    --env PGDATABASE="$database" \
+    --env PGUSER=postgres \
+    --env PGPASSWORD=SqlOnlyPostgresPassword_0123456789 \
+    --env PGLC_SQL_ONLY_BENCH_DURATION="${PGLC_SQL_ONLY_BENCH_DURATION:-1}" \
+    --env PGLC_SQL_ONLY_BENCH_WARMUP_SECONDS="${PGLC_SQL_ONLY_BENCH_WARMUP_SECONDS:-0}" \
+    --env PGLC_SQL_ONLY_BENCH_REPETITIONS="${PGLC_SQL_ONLY_BENCH_REPETITIONS:-1}" \
+    --env PGLC_SQL_ONLY_BENCH_CONCURRENCY="${PGLC_SQL_ONLY_BENCH_CONCURRENCY:-4}" \
+    --env PGLC_SQL_ONLY_BENCH_JOBS="${PGLC_SQL_ONLY_BENCH_JOBS:-2}" \
+    --env PGLC_SQL_ONLY_BENCH_PIPELINE="${PGLC_SQL_ONLY_BENCH_PIPELINE:-8}" \
+    --env PGLC_SQL_ONLY_BENCH_KEYS="${PGLC_SQL_ONLY_BENCH_KEYS:-128}" \
+    --env PGLC_SQL_ONLY_BENCH_PAYLOAD_BYTES="${PGLC_SQL_ONLY_BENCH_PAYLOAD_BYTES:-64}" \
+    --env PGLC_SQL_ONLY_BENCH_PREPARED_MIN_OPS="${PGLC_SQL_ONLY_BENCH_PREPARED_MIN_OPS:-10000}" \
+    --env PGLC_SQL_ONLY_BENCH_EXTENDED_MIN_OPS="${PGLC_SQL_ONLY_BENCH_EXTENDED_MIN_OPS:-10000}" \
+    --env PGLC_SQL_ONLY_BENCH_OUTPUT_DIR=/results \
+    --env PGLC_BENCH_SOURCE_REVISION="$source_revision" \
+    --env PGLC_BENCH_SQL_ONLY_HARNESS_SHA256="$harness_sha256" \
+    --entrypoint python3 \
+    "$runner_image" \
+    /usr/local/lib/pg_local_cache/sql_only.py
+
+test -s "${benchmark_output_directory}/sql-only.json"
+test -s "${benchmark_output_directory}/sql-only.md"
+
+printf 'ok: SQL-only Docker profile, zero RESP workers, ordinary-role transparent cache, prepared/extended benchmark gates\n'

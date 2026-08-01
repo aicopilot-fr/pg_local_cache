@@ -117,3 +117,52 @@ jobs:
           path: benchmark-results/
           if-no-files-found: warn
           retention-days: 30
+
+  sql-only:
+    name: SQL-only ordinary API (prepared + unnamed extended)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate SQL-only benchmark source
+        run: |
+          python3 -m py_compile benchmarks/sql_only.py tests/sql_only_benchmark_test.py
+          python3 -m unittest -v tests/sql_only_benchmark_test.py
+          bash -n tests/docker_sql_only_smoke.sh
+
+      - name: Benchmark the tokenless SQL-only deployment
+        env:
+          PGLC_SQL_ONLY_BENCH_DURATION: ${{ inputs.duration || '120' }}
+          PGLC_SQL_ONLY_BENCH_WARMUP_SECONDS: ${{ inputs.warmup || '15' }}
+          PGLC_SQL_ONLY_BENCH_REPETITIONS: ${{ inputs.repetitions || '3' }}
+          PGLC_SQL_ONLY_BENCH_CONCURRENCY: "16"
+          PGLC_SQL_ONLY_BENCH_JOBS: "2"
+          PGLC_SQL_ONLY_BENCH_PIPELINE: ${{ inputs.pipeline || '32' }}
+          PGLC_SQL_ONLY_BENCH_KEYS: ${{ inputs.keys || '16384' }}
+          PGLC_SQL_ONLY_BENCH_PAYLOAD_BYTES: "128"
+          PGLC_SQL_ONLY_BENCH_PREPARED_MIN_OPS: "10000"
+          PGLC_SQL_ONLY_BENCH_EXTENDED_MIN_OPS: "10000"
+          PGLC_SQL_ONLY_BENCH_CLIENT_CPUS: "2"
+          PGLC_SQL_ONLY_BENCH_CLIENT_MEMORY: "1g"
+          PGLC_SQL_ONLY_BENCH_OUTPUT_DIR: ${{ github.workspace }}/sql-only-results
+        run: bash tests/docker_sql_only_smoke.sh
+
+      - name: Add SQL-only report to job summary
+        if: always()
+        run: |
+          if [[ -f sql-only-results/sql-only.md ]]; then
+            cat sql-only-results/sql-only.md >> "$GITHUB_STEP_SUMMARY"
+          elif [[ -f sql-only-results/sql-only-failure.md ]]; then
+            cat sql-only-results/sql-only-failure.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload SQL-only machine-readable and Markdown reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pg_local_cache-sql-only
+          path: sql-only-results/
+          if-no-files-found: warn
+          retention-days: 90

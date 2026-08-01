@@ -27,7 +27,7 @@ RUN make -j"$(nproc)" PG_CONFIG="/usr/lib/postgresql/16/bin/pg_config" \
     && make PG_CONFIG="/usr/lib/postgresql/16/bin/pg_config" \
         DESTDIR=/stage install
 
-FROM ${POSTGRES_IMAGE} AS runtime
+FROM ${POSTGRES_IMAGE} AS extension
 
 COPY --from=builder \
     /stage/usr/lib/postgresql/16/lib/pg_local_cache.so \
@@ -38,6 +38,12 @@ COPY --from=builder \
 COPY --from=builder \
     /stage/usr/share/postgresql/16/extension/pg_local_cache--1.0.0.sql \
     /usr/share/postgresql/16/extension/
+
+# `extension` deliberately keeps the upstream PostgreSQL entrypoint.  It is
+# the minimal image for an existing PGDATA volume whose configuration and
+# restart are owned by the operator.  `runtime` below is the batteries-included
+# new-cluster image used by this repository's Compose profiles.
+FROM extension AS runtime
 
 COPY --chmod=0755 docker/entrypoint.sh \
     /usr/local/bin/pg_local_cache_entrypoint

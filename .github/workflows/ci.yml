@@ -166,6 +166,7 @@ jobs:
             benchmarks/compare.py \
             benchmarks/scenarios.py \
             benchmarks/whole_row.py \
+            benchmarks/sql_only.py \
             tests/benchmark_test.py \
             tests/cache_contract_test.py \
             tests/scenario_benchmark_test.py \
@@ -176,6 +177,7 @@ jobs:
             tests/pipeline_integration.py \
             tests/sql_fastpath_integration.py \
             tests/sql_api_test.py \
+            tests/sql_only_benchmark_test.py \
             tests/load.py
 
       - name: Build, integrate, and enforce warm-cache throughput
@@ -202,4 +204,24 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Build and test the tokenless SQL-only profile
+        env:
+          PGLC_SQL_ONLY_BENCH_DURATION: "1"
+          PGLC_SQL_ONLY_BENCH_WARMUP_SECONDS: "0"
+          PGLC_SQL_ONLY_BENCH_REPETITIONS: "1"
+          PGLC_SQL_ONLY_BENCH_CONCURRENCY: "4"
+          PGLC_SQL_ONLY_BENCH_JOBS: "2"
+          PGLC_SQL_ONLY_BENCH_PIPELINE: "8"
+          PGLC_SQL_ONLY_BENCH_KEYS: "128"
+          PGLC_SQL_ONLY_BENCH_PREPARED_MIN_OPS: "10000"
+          PGLC_SQL_ONLY_BENCH_EXTENDED_MIN_OPS: "10000"
+          PGLC_SQL_ONLY_BENCH_OUTPUT_DIR: ${{ runner.temp }}/sql-only-benchmark
         run: bash tests/docker_sql_only_smoke.sh
+
+      - name: Upload SQL-only benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sql-only-benchmark-smoke
+          path: ${{ runner.temp }}/sql-only-benchmark/
+          if-no-files-found: warn
+          retention-days: 30

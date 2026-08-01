@@ -30,12 +30,12 @@ endif
 
 verify-static: all
 	python3 -m py_compile benchmarks/compare.py benchmarks/scenarios.py \
-		benchmarks/whole_row.py \
+		benchmarks/whole_row.py benchmarks/sql_only.py \
 		tests/benchmark_test.py tests/cache_contract_test.py \
 		tests/monitoring_contract_test.py \
 		tests/row_payload_contract_test.py \
 		tests/scenario_benchmark_test.py tests/whole_row_benchmark_test.py \
-		tests/sql_api_test.py \
+		tests/sql_api_test.py tests/sql_only_benchmark_test.py \
 		tests/worker_kvik_contract_test.py \
 		tests/integration.py \
 		tests/whole_row_integration.py tests/pipeline_integration.py \
@@ -45,7 +45,7 @@ verify-static: all
 		docker/initdb/010_pg_local_cache.sh tests/docker_smoke.sh \
 		tests/docker_sql_only_smoke.sh \
 		monitoring/postgres/provision-monitor.sh \
-		benchmarks/run.sh
+		benchmarks/run.sh scripts/install-existing.sh
 	python3 -m json.tool \
 		monitoring/grafana/dashboards/pg-local-cache.json >/dev/null
 
@@ -53,14 +53,16 @@ source-test:
 	$(MAKE) -C tests/unit check
 	python3 -m unittest -v tests/cache_contract_test.py \
 		tests/monitoring_contract_test.py tests/row_payload_contract_test.py \
-		tests/sql_api_test.py tests/worker_kvik_contract_test.py
+		tests/sql_api_test.py tests/worker_kvik_contract_test.py \
+		tests/installer_release_contract_test.py
 
 source-sanitize:
 	$(MAKE) -C tests/unit sanitize
 
 benchmark-test:
 	python3 -m unittest -v tests/benchmark_test.py \
-		tests/scenario_benchmark_test.py tests/whole_row_benchmark_test.py
+		tests/scenario_benchmark_test.py tests/whole_row_benchmark_test.py \
+		tests/sql_only_benchmark_test.py
 
 integration:
 	python3 tests/integration.py

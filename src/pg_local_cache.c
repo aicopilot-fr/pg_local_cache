@@ -332,7 +332,7 @@ pglc_define_gucs(void)
 							   NULL);
 
 	DefineCustomStringVariable("pg_local_cache.auth_token_file",
-							   "Root-owned or worker-owned mode-0600 file containing the RESP AUTH token.",
+							   "PostgreSQL OS-user-owned mode-0400/0600 file containing the RESP AUTH token.",
 							   NULL,
 							   &pglc_auth_token_file,
 							   "",
