@@ -16,7 +16,6 @@
 #define PGLC_KEY_MAX 256
 #define PGLC_VALUE_MAX 8192
 #define PGLC_MAX_MAPPINGS 128
-#define PGLC_RELATION_STATES_MAX 1024
 #define PGLC_MAX_CLIENTS_PER_WORKER 128
 #define PGLC_RESPONSE_MAX (PGLC_VALUE_MAX + 1024)
 #define PGLC_AUTH_TOKEN_MAX 1024
@@ -77,6 +76,8 @@ typedef struct PgLocalCacheSharedState
 	uint64		global_version;
 	uint64		global_epoch;
 	uint32		global_dirty_writers;
+	/* Next dynahash bucket for the bounded eviction sample. */
+	uint32		eviction_bucket_cursor;
 	pg_atomic_uint64 config_generation;
 	pg_atomic_uint64 cache_hits;
 	pg_atomic_uint64 cache_misses;
@@ -94,12 +95,21 @@ typedef struct PgLocalCacheSharedState
 	pg_atomic_uint64 singleflight_reuses;
 	pg_atomic_uint64 singleflight_timeouts;
 	pg_atomic_uint64 active_clients;
+	pg_atomic_uint64 peak_active_clients;
 	pg_atomic_uint64 rejected_connections;
+	pg_atomic_uint64 client_limit_rejections;
 	pg_atomic_uint64 authentication_failures;
 	pg_atomic_uint64 protocol_errors;
 	pg_atomic_uint64 output_backpressure_events;
 	pg_atomic_uint64 slow_client_drops;
 	pg_atomic_uint64 worker_starts;
+	pg_atomic_uint64 active_workers;
+	pg_atomic_uint64 cache_admission_rejections;
+	pg_atomic_uint64 relation_state_admission_rejections;
+	pg_atomic_uint64 dirty_key_limit_fallbacks;
+	pg_atomic_uint64 mapping_reload_attempts;
+	pg_atomic_uint64 mapping_reload_failures;
+	pg_atomic_uint64 mapping_reload_incomplete_retries;
 } PgLocalCacheSharedState;
 
 typedef struct PgLocalCacheReadToken
@@ -148,6 +158,10 @@ typedef struct PgLocalCacheMapping
 extern int	pglc_port;
 extern int	pglc_worker_count;
 extern int	pglc_cache_entries;
+extern int	pglc_relation_states;
+extern int	pglc_max_clients;
+extern int	pglc_max_clients_per_worker;
+extern int	pglc_memory_budget_mb;
 extern int	pglc_idle_timeout_ms;
 extern int	pglc_statement_timeout_ms;
 extern int	pglc_lock_timeout_ms;
@@ -209,8 +223,18 @@ extern bool pglc_current_transaction_is_dirty(void);
 extern uint64 pglc_cache_invalidate_namespace(Oid database_oid,
 											 const char *nspace);
 extern char *pglc_stats_json(void);
+extern char *pglc_metrics_json(void);
 extern void pglc_note_database_read(void);
 extern void pglc_note_database_write(void);
+extern bool pglc_try_reserve_client(void);
+extern void pglc_release_clients(uint64 count);
+extern void pglc_note_client_limit_rejection(void);
+extern void pglc_note_worker_start(void);
+extern void pglc_note_worker_stop(void);
+extern Size pglc_shared_memory_bytes(void);
+extern Size pglc_worker_memory_bytes(void);
+extern Size pglc_worker_memory_bytes_per_worker(void);
+extern Size pglc_estimated_memory_bytes(void);
 extern void pglc_sql_init(void);
 extern void pg_local_cache_worker_main(Datum main_arg);
 

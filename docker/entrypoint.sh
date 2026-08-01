@@ -40,6 +40,10 @@ bind_address="${PG_LOCAL_CACHE_BIND_ADDRESS:-0.0.0.0}"
 port="${PG_LOCAL_CACHE_PORT:-6380}"
 workers="${PG_LOCAL_CACHE_WORKERS:-8}"
 cache_entries="${PG_LOCAL_CACHE_CACHE_ENTRIES:-65536}"
+relation_states="${PG_LOCAL_CACHE_RELATION_STATES:-1024}"
+max_clients="${PG_LOCAL_CACHE_MAX_CLIENTS:-512}"
+max_clients_per_worker="${PG_LOCAL_CACHE_MAX_CLIENTS_PER_WORKER:-64}"
+memory_budget_mb="${PG_LOCAL_CACHE_MEMORY_BUDGET_MB:-768}"
 max_worker_processes="${PG_LOCAL_CACHE_MAX_WORKER_PROCESSES:-16}"
 idle_timeout_ms="${PG_LOCAL_CACHE_IDLE_TIMEOUT_MS:-300000}"
 statement_timeout_ms="${PG_LOCAL_CACHE_STATEMENT_TIMEOUT_MS:-2000}"
@@ -64,6 +68,12 @@ runtime_token_config=""
 require_integer_between "PG_LOCAL_CACHE_PORT" "$port" 0 65535
 require_integer_between "PG_LOCAL_CACHE_WORKERS" "$workers" 1 32
 require_integer_between "PG_LOCAL_CACHE_CACHE_ENTRIES" "$cache_entries" 128 65536
+require_integer_between "PG_LOCAL_CACHE_RELATION_STATES" "$relation_states" 128 8192
+require_integer_between "PG_LOCAL_CACHE_MAX_CLIENTS" "$max_clients" 1 4096
+require_integer_between \
+    "PG_LOCAL_CACHE_MAX_CLIENTS_PER_WORKER" "$max_clients_per_worker" 1 128
+require_integer_between \
+    "PG_LOCAL_CACHE_MEMORY_BUDGET_MB" "$memory_budget_mb" 64 8192
 require_integer_between \
     "PG_LOCAL_CACHE_MAX_WORKER_PROCESSES" "$max_worker_processes" 4 128
 require_integer_between \
@@ -77,8 +87,10 @@ require_integer_between \
 require_integer_between \
     "PG_LOCAL_CACHE_MAX_PIPELINE_COMMANDS" "$max_pipeline_commands" 1 4096
 require_integer_between \
-    "PG_LOCAL_CACHE_MAX_DIRTY_KEYS" "$max_dirty_keys" 128 1048576
+    "PG_LOCAL_CACHE_MAX_DIRTY_KEYS" "$max_dirty_keys" 128 16384
 if (( port != 0 )); then
+	(( max_clients <= workers * max_clients_per_worker )) \
+		|| fail "PG_LOCAL_CACHE_MAX_CLIENTS must not exceed workers x max clients per worker"
     (( max_worker_processes >= workers + 2 )) \
         || fail "PG_LOCAL_CACHE_MAX_WORKER_PROCESSES must be at least workers + 2"
     [[ "$token_file" != "$runtime_token" ]] \
@@ -124,6 +136,10 @@ temporary_config="${runtime_config}.tmp"
     printf "pg_local_cache.port = %s\n" "$port"
     printf "pg_local_cache.workers = %s\n" "$workers"
     printf "pg_local_cache.cache_entries = %s\n" "$cache_entries"
+    printf "pg_local_cache.relation_states = %s\n" "$relation_states"
+    printf "pg_local_cache.max_clients = %s\n" "$max_clients"
+    printf "pg_local_cache.max_clients_per_worker = %s\n" "$max_clients_per_worker"
+    printf "pg_local_cache.memory_budget_mb = %s\n" "$memory_budget_mb"
     printf "pg_local_cache.idle_timeout_ms = %s\n" "$idle_timeout_ms"
     printf "pg_local_cache.statement_timeout_ms = %s\n" "$statement_timeout_ms"
     printf "pg_local_cache.lock_timeout_ms = %s\n" "$lock_timeout_ms"

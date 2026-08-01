@@ -30,17 +30,23 @@ endif
 verify-static: all
 	python3 -m py_compile benchmarks/compare.py benchmarks/scenarios.py \
 		tests/benchmark_test.py tests/cache_contract_test.py \
+		tests/monitoring_contract_test.py \
 		tests/scenario_benchmark_test.py tests/sql_api_test.py \
 		tests/integration.py tests/pipeline_integration.py \
+		tests/oom_monitoring_integration.py \
 		tests/sql_fastpath_integration.py tests/load.py
 	bash -n docker/entrypoint.sh docker/healthcheck.sh docker/attach-table.sh \
 		docker/initdb/010_pg_local_cache.sh tests/docker_smoke.sh \
 		tests/docker_sql_only_smoke.sh \
+		monitoring/postgres/provision-monitor.sh \
 		benchmarks/run.sh
+	python3 -m json.tool \
+		monitoring/grafana/dashboards/pg-local-cache.json >/dev/null
 
 source-test:
 	$(MAKE) -C tests/unit check
-	python3 -m unittest -v tests/cache_contract_test.py tests/sql_api_test.py
+	python3 -m unittest -v tests/cache_contract_test.py \
+		tests/monitoring_contract_test.py tests/sql_api_test.py
 
 source-sanitize:
 	$(MAKE) -C tests/unit sanitize

@@ -9,6 +9,7 @@
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "funcapi.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
@@ -30,6 +31,10 @@ PG_MODULE_MAGIC;
 int			pglc_port = 6380;
 int			pglc_worker_count = 4;
 int			pglc_cache_entries = 16384;
+int			pglc_relation_states = 1024;
+int			pglc_max_clients = 256;
+int			pglc_max_clients_per_worker = 64;
+int			pglc_memory_budget_mb = 256;
 int			pglc_idle_timeout_ms = 300000;
 int			pglc_statement_timeout_ms = 2000;
 int			pglc_lock_timeout_ms = 250;
@@ -87,11 +92,12 @@ PG_FUNCTION_INFO_V1(pg_local_cache_statement_guard);
 PG_FUNCTION_INFO_V1(pg_local_cache_reload);
 PG_FUNCTION_INFO_V1(pg_local_cache_invalidate);
 PG_FUNCTION_INFO_V1(pg_local_cache_stats);
+PG_FUNCTION_INFO_V1(pg_local_cache_metrics_json);
 PG_FUNCTION_INFO_V1(pg_local_cache_forget);
 
 static void pglc_shmem_request(void);
 static void pglc_shmem_startup(void);
-static Size pglc_shmem_size(void);
+static void pglc_validate_startup_limits(void);
 static void pglc_xact_callback(XactEvent event, void *arg);
 static void pglc_backend_exit(int code, Datum arg);
 static void pglc_publish_dirty(void);
@@ -143,6 +149,58 @@ pglc_define_gucs(void)
 							65536,
 							PGC_POSTMASTER,
 							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_local_cache.relation_states",
+							"Maximum number of shared namespace relation states.",
+							NULL,
+							&pglc_relation_states,
+							1024,
+							128,
+							8192,
+							PGC_POSTMASTER,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_local_cache.max_clients",
+							"Global maximum number of concurrent RESP clients.",
+							NULL,
+							&pglc_max_clients,
+							256,
+							1,
+							4096,
+							PGC_POSTMASTER,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_local_cache.max_clients_per_worker",
+							"Preallocated RESP client slots in each worker.",
+							NULL,
+							&pglc_max_clients_per_worker,
+							64,
+							1,
+							PGLC_MAX_CLIENTS_PER_WORKER,
+							PGC_POSTMASTER,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_local_cache.memory_budget_mb",
+							"Hard startup budget for deterministic pg_local_cache shared memory and RESP buffers.",
+							NULL,
+							&pglc_memory_budget_mb,
+							256,
+							64,
+							8192,
+							PGC_POSTMASTER,
+							GUC_UNIT_MB,
 							NULL,
 							NULL,
 							NULL);
@@ -218,7 +276,7 @@ pglc_define_gucs(void)
 							&pglc_max_dirty_keys,
 							4096,
 							128,
-							1048576,
+							16384,
 							PGC_POSTMASTER,
 							0,
 							NULL,
@@ -309,6 +367,7 @@ _PG_init(void)
 		return;
 
 	pglc_was_preloaded = true;
+	pglc_validate_startup_limits();
 
 	previous_shmem_request_hook = shmem_request_hook;
 	shmem_request_hook = pglc_shmem_request;
@@ -335,8 +394,8 @@ _PG_init(void)
 	}
 }
 
-static Size
-pglc_shmem_size(void)
+Size
+pglc_shared_memory_bytes(void)
 {
 	Size		size = MAXALIGN(sizeof(PgLocalCacheSharedState));
 
@@ -344,9 +403,46 @@ pglc_shmem_size(void)
 					hash_estimate_size(pglc_cache_entries,
 									   sizeof(PgLocalCacheCacheEntry)));
 	size = add_size(size,
-					hash_estimate_size(PGLC_RELATION_STATES_MAX,
+					hash_estimate_size(pglc_relation_states,
 									   sizeof(PgLocalCacheRelationState)));
 	return size;
+}
+
+Size
+pglc_estimated_memory_bytes(void)
+{
+	return add_size(pglc_shared_memory_bytes(), pglc_worker_memory_bytes());
+}
+
+static void
+pglc_validate_startup_limits(void)
+{
+	Size		budget_bytes;
+	Size		estimated_bytes;
+	uint64		client_slots;
+
+	if (pglc_port != 0)
+	{
+		client_slots = (uint64) pglc_worker_count *
+			(uint64) pglc_max_clients_per_worker;
+		if ((uint64) pglc_max_clients > client_slots)
+			ereport(FATAL,
+					(errmsg("pg_local_cache.max_clients exceeds allocated RESP client slots"),
+					 errdetail("max_clients is %d, but %d workers x %d slots provides " UINT64_FORMAT " slots.",
+							   pglc_max_clients, pglc_worker_count,
+							   pglc_max_clients_per_worker, client_slots),
+					 errhint("Increase pg_local_cache.workers or pg_local_cache.max_clients_per_worker, or lower pg_local_cache.max_clients.")));
+	}
+
+	budget_bytes = mul_size((Size) pglc_memory_budget_mb,
+							(Size) 1024 * 1024);
+	estimated_bytes = pglc_estimated_memory_bytes();
+	if (estimated_bytes > budget_bytes)
+		ereport(FATAL,
+				(errmsg("pg_local_cache estimated memory exceeds its configured budget"),
+				 errdetail("Estimated deterministic extension memory is %zu bytes; pg_local_cache.memory_budget_mb allows %zu bytes.",
+						   estimated_bytes, budget_bytes),
+				 errhint("Raise pg_local_cache.memory_budget_mb or lower cache_entries, relation_states, workers, or max_clients_per_worker.")));
 }
 
 static void
@@ -355,7 +451,7 @@ pglc_shmem_request(void)
 	if (previous_shmem_request_hook)
 		previous_shmem_request_hook();
 
-	RequestAddinShmemSpace(pglc_shmem_size());
+	RequestAddinShmemSpace(pglc_shared_memory_bytes());
 	RequestNamedLWLockTranche("pg_local_cache", 1);
 }
 
@@ -396,12 +492,21 @@ pglc_shmem_startup(void)
 		pg_atomic_init_u64(&pglc_shared->singleflight_reuses, 0);
 		pg_atomic_init_u64(&pglc_shared->singleflight_timeouts, 0);
 		pg_atomic_init_u64(&pglc_shared->active_clients, 0);
+		pg_atomic_init_u64(&pglc_shared->peak_active_clients, 0);
 		pg_atomic_init_u64(&pglc_shared->rejected_connections, 0);
+		pg_atomic_init_u64(&pglc_shared->client_limit_rejections, 0);
 		pg_atomic_init_u64(&pglc_shared->authentication_failures, 0);
 		pg_atomic_init_u64(&pglc_shared->protocol_errors, 0);
 		pg_atomic_init_u64(&pglc_shared->output_backpressure_events, 0);
 		pg_atomic_init_u64(&pglc_shared->slow_client_drops, 0);
 		pg_atomic_init_u64(&pglc_shared->worker_starts, 0);
+		pg_atomic_init_u64(&pglc_shared->active_workers, 0);
+		pg_atomic_init_u64(&pglc_shared->cache_admission_rejections, 0);
+		pg_atomic_init_u64(&pglc_shared->relation_state_admission_rejections, 0);
+		pg_atomic_init_u64(&pglc_shared->dirty_key_limit_fallbacks, 0);
+		pg_atomic_init_u64(&pglc_shared->mapping_reload_attempts, 0);
+		pg_atomic_init_u64(&pglc_shared->mapping_reload_failures, 0);
+		pg_atomic_init_u64(&pglc_shared->mapping_reload_incomplete_retries, 0);
 	}
 
 	memset(&control, 0, sizeof(control));
@@ -417,8 +522,8 @@ pglc_shmem_startup(void)
 	control.keysize = sizeof(PgLocalCacheRelationKey);
 	control.entrysize = sizeof(PgLocalCacheRelationState);
 	pglc_relation_hash = ShmemInitHash("pg_local_cache relation state",
-									  PGLC_RELATION_STATES_MAX,
-									  PGLC_RELATION_STATES_MAX,
+									  pglc_relation_states,
+									  pglc_relation_states,
 									  &control,
 									  HASH_ELEM | HASH_BLOBS);
 
@@ -470,9 +575,28 @@ get_relation_state(Oid database_oid, Oid relation_oid,
 	bool		found;
 
 	make_relation_key(&key, database_oid, nspace);
-	state = hash_search(pglc_relation_hash, &key,
-						create ? HASH_ENTER_NULL : HASH_FIND,
-						&found);
+	state = hash_search(pglc_relation_hash, &key, HASH_FIND, NULL);
+	found = state != NULL;
+	if (state == NULL && create)
+	{
+		/*
+		 * dynahash's max_size is a sizing hint unless callers enforce it.
+		 * Keep the configured memory estimate true at runtime by refusing a
+		 * new namespace before HASH_ENTER can grow the shared hash.
+		 */
+		if (hash_get_num_entries(pglc_relation_hash) >=
+			(uint64) pglc_relation_states)
+		{
+			pg_atomic_fetch_add_u64(
+				&pglc_shared->relation_state_admission_rejections, 1);
+			return NULL;
+		}
+		state = hash_search(pglc_relation_hash, &key, HASH_ENTER_NULL,
+							&found);
+		if (state == NULL)
+			pg_atomic_fetch_add_u64(
+				&pglc_shared->relation_state_admission_rejections, 1);
+	}
 	if (state != NULL && !found)
 	{
 		PgLocalCacheRelationKey saved_key = state->key;
@@ -559,51 +683,85 @@ evict_one_cache_entry(void)
 	PgLocalCacheCacheEntry *entry;
 	PgLocalCacheCacheKey victim;
 	uint64		oldest = PG_UINT64_MAX;
-	int			sampled = 0;
+	uint32		initial_cursor = pglc_shared->eviction_bucket_cursor;
+	uint32		start_bucket;
+	int			scanned = 0;
+	int			pass;
 	bool		have_victim = false;
 	TimestampTz now = GetCurrentTimestamp();
 
-	hash_seq_init(&sequence, pglc_cache_hash);
-	while ((entry = hash_seq_search(&sequence)) != NULL)
+	/*
+	 * Rotate a strictly bounded dynahash sample so no bucket is permanently
+	 * pinned.  Reclaim a stale entry immediately when the sample encounters one;
+	 * otherwise evict the least recently used live candidate in the sample.
+	 * Counting protected entries keeps admission work bounded even during long
+	 * transactions or abandoned loader leases.
+	 */
+	for (pass = 0; pass < 2; pass++)
 	{
-		PgLocalCacheRelationState *relation_state;
-		uint64		last_access;
-
-		if (entry->dirty_writers != 0)
-			continue;
-		if (cache_load_is_active_locked(entry, now))
-			continue;
-		if (++sampled > PGLC_EVICTION_SAMPLE)
-		{
-			hash_seq_term(&sequence);
+		if (pass == 1 && initial_cursor == 0)
 			break;
-		}
+		start_bucket = pass == 0 ? initial_cursor : 0;
+		hash_seq_init(&sequence, pglc_cache_hash);
+		sequence.curBucket = start_bucket;
+		while ((entry = hash_seq_search(&sequence)) != NULL)
+		{
+			PgLocalCacheRelationState *relation_state;
+			uint64		last_access;
 
-		relation_state = get_relation_state(entry->key.database_oid,
+			scanned++;
+			if (entry->dirty_writers == 0 &&
+				!cache_load_is_active_locked(entry, now))
+			{
+				relation_state = get_relation_state(entry->key.database_oid,
 											entry->relation_oid,
 											entry->key.nspace,
 											false);
-		if (!cache_entry_is_current_locked(entry, relation_state))
-		{
-			victim = entry->key;
-			have_victim = true;
-			hash_seq_term(&sequence);
-			break;
+				if (!cache_entry_is_current_locked(entry, relation_state))
+				{
+					victim = entry->key;
+					have_victim = true;
+					pglc_shared->eviction_bucket_cursor =
+						sequence.curBucket;
+					if (sequence.curEntry != NULL)
+						pglc_shared->eviction_bucket_cursor++;
+					hash_seq_term(&sequence);
+					goto remove_victim;
+				}
+
+				last_access = pg_atomic_read_u64(&entry->last_access);
+				if (last_access <= oldest)
+				{
+					oldest = last_access;
+					victim = entry->key;
+					have_victim = true;
+				}
+			}
+
+			if (scanned >= PGLC_EVICTION_SAMPLE)
+			{
+				pglc_shared->eviction_bucket_cursor = sequence.curBucket;
+				if (sequence.curEntry != NULL)
+					pglc_shared->eviction_bucket_cursor++;
+				hash_seq_term(&sequence);
+				goto sample_complete;
+			}
 		}
 
-		last_access = pg_atomic_read_u64(&entry->last_access);
-		if (last_access <= oldest)
-		{
-			oldest = last_access;
-			victim = entry->key;
-			have_victim = true;
-		}
+		/* hash_seq_search reached the end and terminated the scan. */
+		pglc_shared->eviction_bucket_cursor = 0;
+		if (have_victim || start_bucket == 0 ||
+			scanned >= PGLC_EVICTION_SAMPLE)
+			break;
 	}
 
+sample_complete:
 	if (!have_victim)
 		return false;
 
-	(void) hash_search(pglc_cache_hash, &victim, HASH_REMOVE, NULL);
+remove_victim:
+	if (hash_search(pglc_cache_hash, &victim, HASH_REMOVE, NULL) == NULL)
+		return false;
 	pg_atomic_fetch_add_u64(&pglc_shared->evictions, 1);
 	return true;
 }
@@ -617,12 +775,24 @@ get_cache_entry(Oid database_oid, Oid relation_oid,
 	bool		found;
 
 	make_cache_key(&cache_key, database_oid, nspace, key);
-	entry = hash_search(pglc_cache_hash, &cache_key,
-						create ? HASH_ENTER_NULL : HASH_FIND,
-						&found);
-	if (entry == NULL && create && evict_one_cache_entry())
+	entry = hash_search(pglc_cache_hash, &cache_key, HASH_FIND, NULL);
+	found = entry != NULL;
+	if (entry == NULL && create)
+	{
+		/* Enforce capacity explicitly; dynahash does not do so by default. */
+		if (hash_get_num_entries(pglc_cache_hash) >=
+			(uint64) pglc_cache_entries && !evict_one_cache_entry())
+		{
+			pg_atomic_fetch_add_u64(
+				&pglc_shared->cache_admission_rejections, 1);
+			return NULL;
+		}
 		entry = hash_search(pglc_cache_hash, &cache_key,
 							HASH_ENTER_NULL, &found);
+		if (entry == NULL)
+			pg_atomic_fetch_add_u64(
+				&pglc_shared->cache_admission_rejections, 1);
+	}
 
 	if (entry != NULL && !found)
 	{
@@ -1099,6 +1269,79 @@ pglc_note_database_write(void)
 	pg_atomic_fetch_add_u64(&pglc_shared->database_writes, 1);
 }
 
+void
+pglc_note_client_limit_rejection(void)
+{
+	pg_atomic_fetch_add_u64(&pglc_shared->client_limit_rejections, 1);
+	pg_atomic_fetch_add_u64(&pglc_shared->rejected_connections, 1);
+}
+
+bool
+pglc_try_reserve_client(void)
+{
+	uint64		active = pg_atomic_read_u64(&pglc_shared->active_clients);
+
+	while (active < (uint64) pglc_max_clients)
+	{
+		uint64		desired = active + 1;
+
+		if (pg_atomic_compare_exchange_u64(&pglc_shared->active_clients,
+										   &active, desired))
+		{
+			uint64		peak =
+				pg_atomic_read_u64(&pglc_shared->peak_active_clients);
+
+			while (desired > peak &&
+				   !pg_atomic_compare_exchange_u64(
+					   &pglc_shared->peak_active_clients, &peak, desired))
+				;
+			return true;
+		}
+	}
+	pglc_note_client_limit_rejection();
+	return false;
+}
+
+void
+pglc_release_clients(uint64 count)
+{
+	uint64		active;
+
+	if (count == 0 || pglc_shared == NULL)
+		return;
+	active = pg_atomic_read_u64(&pglc_shared->active_clients);
+	for (;;)
+	{
+		uint64		desired;
+
+		Assert(active >= count);
+		desired = active >= count ? active - count : 0;
+		if (pg_atomic_compare_exchange_u64(&pglc_shared->active_clients,
+										   &active, desired))
+			return;
+	}
+}
+
+void
+pglc_note_worker_start(void)
+{
+	pg_atomic_fetch_add_u64(&pglc_shared->worker_starts, 1);
+	pg_atomic_fetch_add_u64(&pglc_shared->active_workers, 1);
+}
+
+void
+pglc_note_worker_stop(void)
+{
+	uint64		previous;
+
+	if (pglc_shared == NULL)
+		return;
+	previous = pg_atomic_fetch_sub_u64(&pglc_shared->active_workers, 1);
+	Assert(previous > 0);
+	if (previous == 0)
+		pg_atomic_write_u64(&pglc_shared->active_workers, 0);
+}
+
 static HTAB *
 get_local_dirty_hash(void)
 {
@@ -1164,6 +1407,7 @@ pglc_collect_key(Oid database_oid, Oid relation_oid,
 
 	if (hash_get_num_entries(dirty) >= pglc_max_dirty_keys)
 	{
+		pg_atomic_fetch_add_u64(&pglc_shared->dirty_key_limit_fallbacks, 1);
 		pglc_collect_relation(database_oid, relation_oid, nspace);
 		return;
 	}
@@ -1445,25 +1689,25 @@ pglc_finish_dirty(bool committed)
 											   local->relation_oid,
 											   local->key.nspace,
 											   false);
-						if (state != NULL)
-						{
-							PgLocalCacheRelationKey relation_key;
+					if (state != NULL)
+					{
+						PgLocalCacheRelationKey relation_key;
 
-							Assert(state->dirty_writers > 0);
-							state->dirty_writers--;
-							if (state->dirty_writers == 0 &&
-								state->pending_forget)
-							{
-								make_relation_key(
-									&relation_key,
-									local->key.database_oid,
-									local->key.nspace);
-								(void) hash_search(
-									pglc_relation_hash,
-									&relation_key,
-									HASH_REMOVE, NULL);
-							}
+						Assert(state->dirty_writers > 0);
+						state->dirty_writers--;
+						if (state->dirty_writers == 0 &&
+							state->pending_forget)
+						{
+							make_relation_key(
+								&relation_key,
+								local->key.database_oid,
+								local->key.nspace);
+							(void) hash_search(
+								pglc_relation_hash,
+								&relation_key,
+								HASH_REMOVE, NULL);
 						}
+					}
 				}
 			}
 		}
@@ -1781,6 +2025,7 @@ pg_local_cache_invalidate(PG_FUNCTION_ARGS)
 char *
 pglc_stats_json(void)
 {
+	StringInfoData expanded;
 	HASH_SEQ_STATUS sequence;
 	PgLocalCacheCacheEntry *entry;
 	uint64		positive = 0;
@@ -1887,7 +2132,7 @@ pglc_stats_json(void)
 		pg_atomic_read_u64(&pglc_shared->slow_client_drops);
 	worker_starts = pg_atomic_read_u64(&pglc_shared->worker_starts);
 
-	return psprintf(
+	expanded.data = psprintf(
 		"{\"entries\":" UINT64_FORMAT
 		",\"positive_entries\":" UINT64_FORMAT
 		",\"negative_entries\":" UINT64_FORMAT
@@ -1939,12 +2184,151 @@ pglc_stats_json(void)
 		protocol_errors, output_backpressure_events, slow_client_drops,
 		worker_starts,
 		cache_hits, cache_misses, evictions, database_reads);
+	expanded.len = strlen(expanded.data);
+	expanded.maxlen = expanded.len + 1;
+	expanded.cursor = 0;
+	Assert(expanded.len > 0 && expanded.data[expanded.len - 1] == '}');
+	expanded.data[--expanded.len] = '\0';
+	appendStringInfo(
+		&expanded,
+		",\"cache_capacity\":%d"
+		",\"relation_state_capacity\":%d"
+		",\"max_clients\":%d"
+		",\"max_clients_per_worker\":%d"
+		",\"client_slots\":%d"
+		",\"resp_enabled\":%d"
+		",\"peak_active_clients\":" UINT64_FORMAT
+		",\"client_limit_rejections\":" UINT64_FORMAT
+		",\"workers_configured\":%d"
+		",\"workers_running\":" UINT64_FORMAT
+		",\"shared_memory_bytes\":%zu"
+		",\"worker_memory_bytes\":%zu"
+		",\"estimated_memory_bytes\":%zu"
+		",\"memory_budget_bytes\":%zu"
+		",\"dirty_memory_limit_bytes\":%zu"
+		",\"cache_admission_rejections\":" UINT64_FORMAT
+		",\"relation_state_admission_rejections\":" UINT64_FORMAT
+		",\"dirty_key_limit_fallbacks\":" UINT64_FORMAT
+		",\"mapping_reload_attempts\":" UINT64_FORMAT
+		",\"mapping_reload_failures\":" UINT64_FORMAT
+		",\"mapping_reload_incomplete_retries\":" UINT64_FORMAT "}",
+		pglc_cache_entries, pglc_relation_states,
+		pglc_port == 0 ? 0 : pglc_max_clients,
+		pglc_port == 0 ? 0 : pglc_max_clients_per_worker,
+		pglc_port == 0 ? 0 :
+			pglc_worker_count * pglc_max_clients_per_worker,
+		pglc_port == 0 ? 0 : 1,
+		pg_atomic_read_u64(&pglc_shared->peak_active_clients),
+		pg_atomic_read_u64(&pglc_shared->client_limit_rejections),
+		pglc_port == 0 ? 0 : pglc_worker_count,
+		pg_atomic_read_u64(&pglc_shared->active_workers),
+		pglc_shared_memory_bytes(), pglc_worker_memory_bytes(),
+		pglc_estimated_memory_bytes(),
+		mul_size((Size) pglc_memory_budget_mb, (Size) 1024 * 1024),
+		hash_estimate_size(pglc_max_dirty_keys,
+						   sizeof(PgLocalCacheLocalDirtyEntry)),
+		pg_atomic_read_u64(&pglc_shared->cache_admission_rejections),
+		pg_atomic_read_u64(
+			&pglc_shared->relation_state_admission_rejections),
+		pg_atomic_read_u64(&pglc_shared->dirty_key_limit_fallbacks),
+		pg_atomic_read_u64(&pglc_shared->mapping_reload_attempts),
+		pg_atomic_read_u64(&pglc_shared->mapping_reload_failures),
+		pg_atomic_read_u64(
+			&pglc_shared->mapping_reload_incomplete_retries));
+	return expanded.data;
+}
+
+char *
+pglc_metrics_json(void)
+{
+	StringInfoData result;
+	uint64		entries;
+	uint64		relation_states;
+	uint64		global_dirty_writers;
+
+	pglc_require_preload();
+	LWLockAcquire(pglc_shared->lock, LW_SHARED);
+	entries = hash_get_num_entries(pglc_cache_hash);
+	relation_states = hash_get_num_entries(pglc_relation_hash);
+	global_dirty_writers = pglc_shared->global_dirty_writers;
+	LWLockRelease(pglc_shared->lock);
+
+	initStringInfo(&result);
+	appendStringInfo(
+		&result,
+		"{\"up\":1"
+		",\"cache_capacity\":%d"
+		",\"entries\":" UINT64_FORMAT
+		",\"relation_states\":" UINT64_FORMAT
+		",\"relation_state_capacity\":%d"
+		",\"global_dirty_writers\":" UINT64_FORMAT
+		",\"active_clients\":" UINT64_FORMAT
+		",\"peak_active_clients\":" UINT64_FORMAT
+		",\"max_clients\":%d"
+		",\"client_slots\":%d"
+		",\"workers_configured\":%d"
+		",\"workers_running\":" UINT64_FORMAT
+		",\"shared_memory_bytes\":%zu"
+		",\"worker_memory_bytes\":%zu"
+		",\"estimated_memory_bytes\":%zu"
+		",\"memory_budget_bytes\":%zu",
+		pglc_cache_entries, entries, relation_states, pglc_relation_states,
+		global_dirty_writers,
+		pg_atomic_read_u64(&pglc_shared->active_clients),
+		pg_atomic_read_u64(&pglc_shared->peak_active_clients),
+		pglc_port == 0 ? 0 : pglc_max_clients,
+		pglc_port == 0 ? 0 :
+			pglc_worker_count * pglc_max_clients_per_worker,
+		pglc_port == 0 ? 0 : pglc_worker_count,
+		pg_atomic_read_u64(&pglc_shared->active_workers),
+		pglc_shared_memory_bytes(), pglc_worker_memory_bytes(),
+		pglc_estimated_memory_bytes(),
+		mul_size((Size) pglc_memory_budget_mb, (Size) 1024 * 1024));
+
+#define PGLC_APPEND_METRIC_COUNTER(json_name, field_name) \
+	appendStringInfo(&result, ",\"" json_name "\":" UINT64_FORMAT, \
+					 pg_atomic_read_u64(&pglc_shared->field_name))
+	PGLC_APPEND_METRIC_COUNTER("cache_hits_total", cache_hits);
+	PGLC_APPEND_METRIC_COUNTER("cache_misses_total", cache_misses);
+	PGLC_APPEND_METRIC_COUNTER("negative_hits_total", negative_hits);
+	PGLC_APPEND_METRIC_COUNTER("sql_cache_hits_total", sql_cache_hits);
+	PGLC_APPEND_METRIC_COUNTER("sql_cache_misses_total", sql_cache_misses);
+	PGLC_APPEND_METRIC_COUNTER("sql_cache_fills_total", sql_cache_fills);
+	PGLC_APPEND_METRIC_COUNTER("sql_cache_bypasses_total", sql_cache_bypasses);
+	PGLC_APPEND_METRIC_COUNTER("database_reads_total", database_reads);
+	PGLC_APPEND_METRIC_COUNTER("database_writes_total", database_writes);
+	PGLC_APPEND_METRIC_COUNTER("invalidations_total", invalidations);
+	PGLC_APPEND_METRIC_COUNTER("evictions_total", evictions);
+	PGLC_APPEND_METRIC_COUNTER("singleflight_leaders_total", singleflight_leaders);
+	PGLC_APPEND_METRIC_COUNTER("singleflight_waiters_total", singleflight_waiters);
+	PGLC_APPEND_METRIC_COUNTER("singleflight_reuses_total", singleflight_reuses);
+	PGLC_APPEND_METRIC_COUNTER("singleflight_timeouts_total", singleflight_timeouts);
+	PGLC_APPEND_METRIC_COUNTER("rejected_connections_total", rejected_connections);
+	PGLC_APPEND_METRIC_COUNTER("client_limit_rejections_total", client_limit_rejections);
+	PGLC_APPEND_METRIC_COUNTER("authentication_failures_total", authentication_failures);
+	PGLC_APPEND_METRIC_COUNTER("protocol_errors_total", protocol_errors);
+	PGLC_APPEND_METRIC_COUNTER("output_backpressure_events_total", output_backpressure_events);
+	PGLC_APPEND_METRIC_COUNTER("slow_client_drops_total", slow_client_drops);
+	PGLC_APPEND_METRIC_COUNTER("worker_starts_total", worker_starts);
+	PGLC_APPEND_METRIC_COUNTER("dirty_key_limit_fallbacks_total", dirty_key_limit_fallbacks);
+	PGLC_APPEND_METRIC_COUNTER("mapping_reload_failures_total", mapping_reload_failures);
+#undef PGLC_APPEND_METRIC_COUNTER
+	appendStringInfoChar(&result, '}');
+	return result.data;
 }
 
 Datum
 pg_local_cache_stats(PG_FUNCTION_ARGS)
 {
 	char	   *json = pglc_stats_json();
+
+	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json)));
+}
+
+Datum
+pg_local_cache_metrics_json(PG_FUNCTION_ARGS)
+{
+	char	   *json = pglc_metrics_json();
 
 	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json)));
 }

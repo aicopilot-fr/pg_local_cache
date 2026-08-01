@@ -11,6 +11,8 @@ services:
     restart: unless-stopped
     stop_grace_period: 60s
     shm_size: 1gb
+    mem_limit: ${PG_LOCAL_CACHE_CONTAINER_MEMORY_LIMIT:-2g}
+    mem_reservation: ${PG_LOCAL_CACHE_CONTAINER_MEMORY_RESERVATION:-1g}
     environment:
       POSTGRES_DB: app
       POSTGRES_USER: postgres
@@ -21,6 +23,10 @@ services:
       PG_LOCAL_CACHE_PORT: "6380"
       PG_LOCAL_CACHE_WORKERS: "8"
       PG_LOCAL_CACHE_CACHE_ENTRIES: "65536"
+      PG_LOCAL_CACHE_RELATION_STATES: "1024"
+      PG_LOCAL_CACHE_MAX_CLIENTS: "512"
+      PG_LOCAL_CACHE_MAX_CLIENTS_PER_WORKER: "64"
+      PG_LOCAL_CACHE_MEMORY_BUDGET_MB: "768"
       PG_LOCAL_CACHE_MAX_WORKER_PROCESSES: "16"
       PG_LOCAL_CACHE_IDLE_TIMEOUT_MS: "300000"
       PG_LOCAL_CACHE_STATEMENT_TIMEOUT_MS: "2000"

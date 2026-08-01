@@ -8,6 +8,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -57,6 +58,7 @@ typedef struct PgLocalCacheClient
 } PgLocalCacheClient;
 
 static MemoryContext mapping_context = NULL;
+static MemoryContext reload_context = NULL;
 static MemoryContext command_context = NULL;
 static PgLocalCacheMapping *worker_mappings = NULL;
 static int	worker_mapping_count = 0;
@@ -64,8 +66,12 @@ static uint64 worker_mapping_generation = 0;
 static TimestampTz worker_next_mapping_retry = 0;
 static bool worker_mappings_incomplete = false;
 static char *worker_auth_token = NULL;
+static uint64 worker_client_reservations = 0;
+static bool worker_counted_active = false;
 
 static void load_auth_token(void);
+static void worker_before_exit(int code, Datum arg);
+static void validate_file_descriptor_limit(void);
 static int create_listener(void);
 static void run_server(int listener);
 static void close_client(PgLocalCacheClient *client);
@@ -116,11 +122,17 @@ pg_local_cache_worker_main(Datum main_arg)
 				(errmsg("pg_local_cache refuses to run RESP workers as a superuser"),
 				 errhint("Create a dedicated LOGIN role and set pg_local_cache.role, or enable pg_local_cache.allow_superuser only for development.")));
 	load_auth_token();
-	pg_atomic_fetch_add_u64(&pglc_shared->worker_starts, 1);
+	validate_file_descriptor_limit();
+	before_shmem_exit(worker_before_exit, (Datum) 0);
+	pglc_note_worker_start();
+	worker_counted_active = true;
 
 	mapping_context = AllocSetContextCreate(TopMemoryContext,
 										"pg_local_cache mappings",
 										ALLOCSET_DEFAULT_SIZES);
+	reload_context = AllocSetContextCreate(TopMemoryContext,
+									   "pg_local_cache mapping reload scratch",
+									   ALLOCSET_SMALL_SIZES);
 	command_context = AllocSetContextCreate(TopMemoryContext,
 										"pg_local_cache command",
 										ALLOCSET_SMALL_SIZES);
@@ -134,6 +146,65 @@ pg_local_cache_worker_main(Datum main_arg)
 	run_server(listener);
 	close(listener);
 	proc_exit(0);
+}
+
+Size
+pglc_worker_memory_bytes_per_worker(void)
+{
+	Size		slots;
+	Size		bytes;
+
+	if (pglc_port == 0)
+		return 0;
+	slots = (Size) pglc_max_clients_per_worker;
+	bytes = mul_size(slots, sizeof(PgLocalCacheClient));
+	bytes = add_size(bytes,
+					 mul_size(slots + 1, sizeof(struct pollfd)));
+	bytes = add_size(bytes, mul_size(slots + 1, sizeof(int)));
+	return bytes;
+}
+
+Size
+pglc_worker_memory_bytes(void)
+{
+	if (pglc_port == 0)
+		return 0;
+	return mul_size((Size) pglc_worker_count,
+					pglc_worker_memory_bytes_per_worker());
+}
+
+static void
+worker_before_exit(int code, Datum arg)
+{
+	if (worker_client_reservations > 0)
+	{
+		pglc_release_clients(worker_client_reservations);
+		worker_client_reservations = 0;
+	}
+	if (worker_counted_active)
+	{
+		pglc_note_worker_stop();
+		worker_counted_active = false;
+	}
+}
+
+static void
+validate_file_descriptor_limit(void)
+{
+	struct rlimit descriptor_limit;
+	rlim_t		required = (rlim_t) pglc_max_clients_per_worker + 33;
+
+	if (getrlimit(RLIMIT_NOFILE, &descriptor_limit) != 0)
+		ereport(FATAL,
+				(errmsg("could not read the pg_local_cache worker file descriptor limit: %m")));
+	if (descriptor_limit.rlim_cur != RLIM_INFINITY &&
+		descriptor_limit.rlim_cur < required)
+		ereport(FATAL,
+				(errmsg("file descriptor limit is too low for pg_local_cache"),
+				 errdetail("Each RESP worker needs at least %llu descriptors; the soft RLIMIT_NOFILE is %llu.",
+						   (unsigned long long) required,
+						   (unsigned long long) descriptor_limit.rlim_cur),
+				 errhint("Raise the container/process nofile limit or lower pg_local_cache.max_clients_per_worker.")));
 }
 
 static void
@@ -317,8 +388,9 @@ static void
 run_server(int listener)
 {
 	PgLocalCacheClient *clients;
-	struct pollfd poll_fds[PGLC_MAX_CLIENTS_PER_WORKER + 1];
-	int			poll_to_client[PGLC_MAX_CLIENTS_PER_WORKER + 1];
+	struct pollfd *poll_fds;
+	int		   *poll_to_client;
+	int			client_slots = pglc_max_clients_per_worker;
 	int			next_ready_client = 0;
 	int			i;
 
@@ -328,8 +400,12 @@ run_server(int listener)
 	 */
 	clients = MemoryContextAllocZero(TopMemoryContext,
 									 sizeof(PgLocalCacheClient) *
-									 PGLC_MAX_CLIENTS_PER_WORKER);
-	for (i = 0; i < PGLC_MAX_CLIENTS_PER_WORKER; i++)
+									 client_slots);
+	poll_fds = MemoryContextAlloc(TopMemoryContext,
+								  sizeof(struct pollfd) * (client_slots + 1));
+	poll_to_client = MemoryContextAlloc(TopMemoryContext,
+									   sizeof(int) * (client_slots + 1));
+	for (i = 0; i < client_slots; i++)
 		clients[i].fd = -1;
 
 	for (;;)
@@ -351,10 +427,10 @@ run_server(int listener)
 		 * for more socket events; TCP does not generate another POLLIN edge for
 		 * bytes which are already in userspace.
 		 */
-		for (step = 0; step < PGLC_MAX_CLIENTS_PER_WORKER; step++)
+		for (step = 0; step < client_slots; step++)
 		{
 			int			client_index =
-				(ready_scan_start + step) % PGLC_MAX_CLIENTS_PER_WORKER;
+				(ready_scan_start + step) % client_slots;
 			PgLocalCacheClient *client = &clients[client_index];
 
 			if (client->fd < 0 || !client->input_ready ||
@@ -364,20 +440,20 @@ run_server(int listener)
 			if (!process_client(client))
 				close_client(client);
 			next_ready_client =
-				(client_index + 1) % PGLC_MAX_CLIENTS_PER_WORKER;
+				(client_index + 1) % client_slots;
 			if (++ready_clients_processed >= PGLC_READY_CLIENTS_PER_TURN)
 				break;
 		}
 		if (ready_clients_processed == 0)
 			next_ready_client =
-				(next_ready_client + 1) % PGLC_MAX_CLIENTS_PER_WORKER;
+				(next_ready_client + 1) % client_slots;
 
 		poll_fds[0].fd = listener;
 		poll_fds[0].events = POLLIN;
 		poll_fds[0].revents = 0;
 		poll_to_client[0] = -1;
 
-		for (i = 0; i < PGLC_MAX_CLIENTS_PER_WORKER; i++)
+		for (i = 0; i < client_slots; i++)
 		{
 			if (clients[i].fd >= 0)
 			{
@@ -448,7 +524,7 @@ run_server(int listener)
 					break;
 				}
 
-				for (i = 0; i < PGLC_MAX_CLIENTS_PER_WORKER; i++)
+				for (i = 0; i < client_slots; i++)
 				{
 					if (clients[i].fd < 0)
 					{
@@ -458,11 +534,16 @@ run_server(int listener)
 				}
 				if (slot < 0)
 				{
-					pg_atomic_fetch_add_u64(
-						&pglc_shared->rejected_connections, 1);
+					pglc_note_client_limit_rejection();
 					close(client_fd);
 					continue;
 				}
+				if (!pglc_try_reserve_client())
+				{
+					close(client_fd);
+					continue;
+				}
+				worker_client_reservations++;
 
 				flags = fcntl(client_fd, F_GETFL, 0);
 				if (flags < 0 ||
@@ -470,6 +551,8 @@ run_server(int listener)
 				{
 					pg_atomic_fetch_add_u64(
 						&pglc_shared->rejected_connections, 1);
+					pglc_release_clients(1);
+					worker_client_reservations--;
 					close(client_fd);
 					continue;
 				}
@@ -480,6 +563,8 @@ run_server(int listener)
 				{
 					pg_atomic_fetch_add_u64(
 						&pglc_shared->rejected_connections, 1);
+					pglc_release_clients(1);
+					worker_client_reservations--;
 					close(client_fd);
 					continue;
 				}
@@ -495,7 +580,6 @@ run_server(int listener)
 				clients[slot].last_activity = GetCurrentTimestamp();
 				clients[slot].authenticated =
 					worker_auth_token == NULL || worker_auth_token[0] == '\0';
-				pg_atomic_fetch_add_u64(&pglc_shared->active_clients, 1);
 			}
 		}
 
@@ -556,8 +640,10 @@ run_server(int listener)
 		}
 	}
 
-	for (i = 0; i < PGLC_MAX_CLIENTS_PER_WORKER; i++)
+	for (i = 0; i < client_slots; i++)
 		close_client(&clients[i]);
+	pfree(poll_to_client);
+	pfree(poll_fds);
 	pfree(clients);
 }
 
@@ -567,7 +653,9 @@ close_client(PgLocalCacheClient *client)
 	if (client->fd >= 0)
 	{
 		close(client->fd);
-		pg_atomic_fetch_sub_u64(&pglc_shared->active_clients, 1);
+		pglc_release_clients(1);
+		Assert(worker_client_reservations > 0);
+		worker_client_reservations--;
 	}
 	client->fd = -1;
 	client->input_start = 0;
@@ -1443,6 +1531,9 @@ reload_mappings(void)
 	uint64		target_generation = pglc_config_generation();
 	bool		success = false;
 
+	MemoryContextReset(reload_context);
+	pg_atomic_fetch_add_u64(&pglc_shared->mapping_reload_attempts, 1);
+
 	PG_TRY();
 	{
 		int			result;
@@ -1460,8 +1551,10 @@ reload_mappings(void)
 			worker_mapping_count = 0;
 			MemoryContextReset(mapping_context);
 
-			result = SPI_execute(
-				"SELECT count(*) FROM local_cache.mapping", true, 0);
+		result = SPI_execute(
+			"SELECT count(*) FROM ("
+			"SELECT 1 FROM local_cache.mapping LIMIT 129"
+			") AS bounded_mappings", true, 1);
 			if (result != SPI_OK_SELECT || SPI_processed != 1)
 				elog(ERROR, "could not count pg_local_cache mappings");
 			count_tuple = SPI_tuptable->vals[0];
@@ -1571,8 +1664,8 @@ reload_mappings(void)
 			"          AND i.indpred IS NULL "
 			"          AND i.indnkeyatts = 1 "
 			"          AND i.indkey[0] = ka.attnum) "
-			" ORDER BY m.namespace",
-			true, 0);
+			" ORDER BY m.namespace LIMIT 129",
+			true, PGLC_MAX_MAPPINGS + 1);
 		if (result != SPI_OK_SELECT)
 			elog(ERROR, "could not load pg_local_cache mappings");
 		if (SPI_processed > PGLC_MAX_MAPPINGS)
@@ -1650,6 +1743,7 @@ reload_mappings(void)
 		for (row = 0; row < mapping_count; row++)
 		{
 			PgLocalCacheMapping *mapping = &new_mappings[row];
+			MemoryContext query_old_context;
 			char	   *qualified_relation;
 			const char *quoted_key;
 			const char *quoted_value;
@@ -1660,6 +1754,7 @@ reload_mappings(void)
 			char	   *delete_query;
 			Oid			delete_types[1];
 
+			query_old_context = MemoryContextSwitchTo(reload_context);
 			qualified_relation = quote_qualified_identifier(
 				mapping->schema_name, mapping->relation_name);
 			quoted_key = quote_identifier(mapping->key_column);
@@ -1687,17 +1782,21 @@ reload_mappings(void)
 										qualified_relation, quoted_key);
 				delete_types[0] = mapping->key_type;
 				mapping->delete_plan = prepare_kept_plan(delete_query, 1,
-														 delete_types);
+												 delete_types);
 			}
+			MemoryContextSwitchTo(query_old_context);
 		}
 
-			commit_spi_transaction();
-			worker_mapping_generation = target_generation;
-			worker_mappings_incomplete =
-				mapping_count != configured_mapping_count;
-			worker_next_mapping_retry = worker_mappings_incomplete ?
-				TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 1000) : 0;
-			success = true;
+		commit_spi_transaction();
+		worker_mapping_generation = target_generation;
+		worker_mappings_incomplete =
+			mapping_count != configured_mapping_count;
+		if (worker_mappings_incomplete)
+			pg_atomic_fetch_add_u64(
+				&pglc_shared->mapping_reload_incomplete_retries, 1);
+		worker_next_mapping_retry = worker_mappings_incomplete ?
+			TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 1000) : 0;
+		success = true;
 	}
 	PG_CATCH();
 	{
@@ -1712,11 +1811,12 @@ reload_mappings(void)
 		QueryCancelPending = false;
 		if (IsTransactionState())
 			AbortCurrentTransaction();
+		pg_atomic_fetch_add_u64(&pglc_shared->mapping_reload_failures, 1);
 		free_mapping_plans();
 		MemoryContextReset(mapping_context);
-			worker_mappings = NULL;
-			worker_mapping_count = 0;
-			worker_mappings_incomplete = true;
+		worker_mappings = NULL;
+		worker_mapping_count = 0;
+		worker_mappings_incomplete = true;
 		worker_next_mapping_retry =
 			TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 1000);
 		ereport(LOG,
@@ -1725,5 +1825,6 @@ reload_mappings(void)
 		FreeErrorData(error_data);
 	}
 	PG_END_TRY();
+	MemoryContextReset(reload_context);
 	return success;
 }

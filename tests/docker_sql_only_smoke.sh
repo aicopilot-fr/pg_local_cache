@@ -98,4 +98,12 @@ PG_LOCAL_CACHE_TEST_APP_PASSWORD="$app_password" \
 PG_LOCAL_CACHE_TEST_APP_HOST="127.0.0.1" \
     python3 -B "${repository_directory}/tests/sql_fastpath_integration.py"
 
+sql_only_metrics="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
+        "SELECT m.up, m.workers_configured, m.workers_running, m.active_clients, m.max_clients, m.worker_memory_bytes, m.estimated_memory_bytes <= m.memory_budget_bytes, (local_cache.health() ->> 'ready')::boolean FROM local_cache.metrics() AS m"
+)"
+[[ "$sql_only_metrics" == "1|0|0|0|0|0|t|t" ]]
+
 printf 'ok: SQL-only Docker profile, zero RESP workers, ordinary-role transparent cache\n'

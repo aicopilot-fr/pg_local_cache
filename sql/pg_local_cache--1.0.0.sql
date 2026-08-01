@@ -172,9 +172,144 @@ RETURNS jsonb
 AS 'MODULE_PATHNAME', 'pg_local_cache_stats'
 LANGUAGE C STABLE;
 
+CREATE FUNCTION _metrics_json()
+RETURNS jsonb
+AS 'MODULE_PATHNAME', 'pg_local_cache_metrics_json'
+LANGUAGE C STABLE PARALLEL RESTRICTED;
+
+CREATE FUNCTION metrics()
+RETURNS TABLE (
+    up bigint,
+    cache_capacity bigint,
+    entries bigint,
+    relation_states bigint,
+    relation_state_capacity bigint,
+    global_dirty_writers bigint,
+    active_clients bigint,
+    peak_active_clients bigint,
+    max_clients bigint,
+    client_slots bigint,
+    workers_configured bigint,
+    workers_running bigint,
+    shared_memory_bytes bigint,
+    worker_memory_bytes bigint,
+    estimated_memory_bytes bigint,
+    memory_budget_bytes bigint,
+    cache_hits_total bigint,
+    cache_misses_total bigint,
+    negative_hits_total bigint,
+    sql_cache_hits_total bigint,
+    sql_cache_misses_total bigint,
+    sql_cache_fills_total bigint,
+    sql_cache_bypasses_total bigint,
+    database_reads_total bigint,
+    database_writes_total bigint,
+    invalidations_total bigint,
+    evictions_total bigint,
+    singleflight_leaders_total bigint,
+    singleflight_waiters_total bigint,
+    singleflight_reuses_total bigint,
+    singleflight_timeouts_total bigint,
+    rejected_connections_total bigint,
+    client_limit_rejections_total bigint,
+    authentication_failures_total bigint,
+    protocol_errors_total bigint,
+    output_backpressure_events_total bigint,
+    slow_client_drops_total bigint,
+    worker_starts_total bigint,
+    dirty_key_limit_fallbacks_total bigint,
+    mapping_reload_failures_total bigint
+)
+LANGUAGE sql
+STABLE
+PARALLEL RESTRICTED
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $function$
+WITH snapshot AS MATERIALIZED (
+    SELECT local_cache._metrics_json() AS payload
+)
+SELECT
+    (payload ->> 'up')::bigint,
+    (payload ->> 'cache_capacity')::bigint,
+    (payload ->> 'entries')::bigint,
+    (payload ->> 'relation_states')::bigint,
+    (payload ->> 'relation_state_capacity')::bigint,
+    (payload ->> 'global_dirty_writers')::bigint,
+    (payload ->> 'active_clients')::bigint,
+    (payload ->> 'peak_active_clients')::bigint,
+    (payload ->> 'max_clients')::bigint,
+    (payload ->> 'client_slots')::bigint,
+    (payload ->> 'workers_configured')::bigint,
+    (payload ->> 'workers_running')::bigint,
+    (payload ->> 'shared_memory_bytes')::bigint,
+    (payload ->> 'worker_memory_bytes')::bigint,
+    (payload ->> 'estimated_memory_bytes')::bigint,
+    (payload ->> 'memory_budget_bytes')::bigint,
+    (payload ->> 'cache_hits_total')::bigint,
+    (payload ->> 'cache_misses_total')::bigint,
+    (payload ->> 'negative_hits_total')::bigint,
+    (payload ->> 'sql_cache_hits_total')::bigint,
+    (payload ->> 'sql_cache_misses_total')::bigint,
+    (payload ->> 'sql_cache_fills_total')::bigint,
+    (payload ->> 'sql_cache_bypasses_total')::bigint,
+    (payload ->> 'database_reads_total')::bigint,
+    (payload ->> 'database_writes_total')::bigint,
+    (payload ->> 'invalidations_total')::bigint,
+    (payload ->> 'evictions_total')::bigint,
+    (payload ->> 'singleflight_leaders_total')::bigint,
+    (payload ->> 'singleflight_waiters_total')::bigint,
+    (payload ->> 'singleflight_reuses_total')::bigint,
+    (payload ->> 'singleflight_timeouts_total')::bigint,
+    (payload ->> 'rejected_connections_total')::bigint,
+    (payload ->> 'client_limit_rejections_total')::bigint,
+    (payload ->> 'authentication_failures_total')::bigint,
+    (payload ->> 'protocol_errors_total')::bigint,
+    (payload ->> 'output_backpressure_events_total')::bigint,
+    (payload ->> 'slow_client_drops_total')::bigint,
+    (payload ->> 'worker_starts_total')::bigint,
+    (payload ->> 'dirty_key_limit_fallbacks_total')::bigint,
+    (payload ->> 'mapping_reload_failures_total')::bigint
+FROM snapshot;
+$function$;
+
+CREATE FUNCTION health()
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+PARALLEL RESTRICTED
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $function$
+WITH snapshot AS MATERIALIZED (
+    SELECT local_cache._metrics_json() AS payload
+)
+SELECT pg_catalog.jsonb_build_object(
+    'ready',
+        (payload ->> 'estimated_memory_bytes')::bigint <=
+            (payload ->> 'memory_budget_bytes')::bigint
+        AND (payload ->> 'workers_running')::bigint =
+            (payload ->> 'workers_configured')::bigint
+        AND (payload ->> 'active_clients')::bigint <=
+            (payload ->> 'max_clients')::bigint,
+    'resp_enabled', (payload ->> 'workers_configured')::bigint > 0,
+    'workers_configured', (payload ->> 'workers_configured')::bigint,
+    'workers_running', (payload ->> 'workers_running')::bigint,
+    'active_clients', (payload ->> 'active_clients')::bigint,
+    'max_clients', (payload ->> 'max_clients')::bigint,
+    'estimated_memory_bytes', (payload ->> 'estimated_memory_bytes')::bigint,
+    'memory_budget_bytes', (payload ->> 'memory_budget_bytes')::bigint
+)
+FROM snapshot;
+$function$;
+
 REVOKE ALL ON FUNCTION _reload() FROM PUBLIC;
 REVOKE ALL ON FUNCTION _forget(text, oid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION invalidate(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION stats() FROM PUBLIC;
+REVOKE ALL ON FUNCTION _metrics_json() FROM PUBLIC;
+REVOKE ALL ON FUNCTION metrics() FROM PUBLIC;
+REVOKE ALL ON FUNCTION health() FROM PUBLIC;
 
 CREATE FUNCTION register_mapping(
     p_namespace text,

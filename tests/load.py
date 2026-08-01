@@ -280,19 +280,31 @@ def get_stats() -> dict[str, int]:
 
 
 def warm_cache(frames: list[bytes], expected: bytes) -> None:
-    connection = RespConnection()
-    try:
-        for start in range(0, len(frames), PIPELINE):
-            batch = frames[start : start + PIPELINE]
-            connection.socket.sendall(b"".join(batch))
-            for _ in batch:
-                response = connection.read_response()
-                if response != expected:
-                    raise AssertionError(
-                        f"warm GET returned an unexpected value: {response!r}"
-                    )
-    finally:
-        connection.close()
+    for attempt in range(1, 9):
+        before = get_stats()
+        connection = RespConnection()
+        try:
+            for start in range(0, len(frames), PIPELINE):
+                batch = frames[start : start + PIPELINE]
+                connection.socket.sendall(b"".join(batch))
+                for _ in batch:
+                    response = connection.read_response()
+                    if response != expected:
+                        raise AssertionError(
+                            "warm GET returned an unexpected value: "
+                            f"{response!r}"
+                        )
+        finally:
+            connection.close()
+        after = get_stats()
+        if (
+            after.get("database_reads", 0) == before.get("database_reads", 0)
+            and after.get("cache_misses", 0) == before.get("cache_misses", 0)
+        ):
+            return
+    raise AssertionError(
+        f"warm cache did not converge after {attempt} complete passes"
+    )
 
 
 @dataclass

@@ -119,8 +119,10 @@ class CacheOwnershipSourceTests(unittest.TestCase):
     def test_eviction_skips_live_loads_but_can_reclaim_expired_ones(self) -> None:
         eviction = c_function(CORE, "evict_one_cache_entry")
         active_check = eviction.index("cache_load_is_active_locked(entry, now)")
-        sample = eviction.index("++sampled")
-        self.assertLess(active_check, sample)
+        counted = eviction.index("scanned++")
+        sample_bound = eviction.index("scanned >= PGLC_EVICTION_SAMPLE")
+        self.assertLess(counted, active_check)
+        self.assertLess(active_check, sample_bound)
         expiry = c_function(CORE, "cache_load_is_active_locked")
         self.assertIn("TimestampDifferenceExceeds", expiry)
         self.assertIn("entry->version = next_entry_generation();", expiry)

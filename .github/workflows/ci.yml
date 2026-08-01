@@ -31,6 +31,50 @@ jobs:
       - name: Test the benchmark source
         run: make benchmark-test
 
+  monitoring-config:
+    name: monitoring-config (Prometheus + Grafana + Compose)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate source contracts and Grafana JSON
+        run: |
+          python3 -m unittest -v tests/monitoring_contract_test.py
+          python3 -m json.tool \
+            monitoring/grafana/dashboards/pg-local-cache.json >/dev/null
+          bash -n monitoring/postgres/provision-monitor.sh
+
+      - name: Validate Prometheus config, alerts, and rule tests
+        run: |
+          docker run --rm \
+            --entrypoint /bin/promtool \
+            --volume "$PWD/monitoring/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v3.12.0 \
+            check config /etc/prometheus/prometheus.yml
+          docker run --rm \
+            --entrypoint /bin/promtool \
+            --volume "$PWD/monitoring/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v3.12.0 \
+            test rules /etc/prometheus/alerts.test.yml
+
+      - name: Validate monitoring overlay for RESP and SQL-only profiles
+        run: |
+          mkdir -p secrets
+          touch secrets/postgres_password \
+            secrets/pg_local_cache_auth_token \
+            secrets/monitor_password \
+            secrets/grafana_admin_password
+          docker compose \
+            --file compose.yaml \
+            --file compose.monitoring.yaml \
+            config --quiet
+          docker compose \
+            --file compose.sql-only.yaml \
+            --file compose.monitoring.yaml \
+            config --quiet
+
   comparative-docker-smoke:
     name: comparative-docker-smoke
     runs-on: ubuntu-24.04
@@ -122,6 +166,7 @@ jobs:
             tests/cache_contract_test.py \
             tests/scenario_benchmark_test.py \
             tests/integration.py \
+            tests/oom_monitoring_integration.py \
             tests/pipeline_integration.py \
             tests/sql_fastpath_integration.py \
             tests/sql_api_test.py \

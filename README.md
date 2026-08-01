@@ -36,6 +36,8 @@ Redis/Valkey-процесс не нужен: TCP listener, shared cache, SQL fal
   стандартный B-tree equality opclass;
 - statement/lock/idle timeouts, bounded per-client event-loop budget, AUTH
   failure limit, batched nonblocking socket output и operational counters;
+- startup memory budget, global client CAS-limit, bounded per-worker buffers и
+  per-transaction dirty-key fallback для защиты от OOM;
 - отказ от `PREPARE TRANSACTION`, если транзакция меняла mapped table.
 
 ## Быстрый запуск в Docker
@@ -60,6 +62,11 @@ docker compose ps
 проверяет PostgreSQL, extension, все RESP workers, `AUTH` и `PING`.
 Runtime-копия AUTH token хранится в отдельном `tmpfs` с mode `0600`, а не в
 writable layer контейнера.
+
+Production Compose ограничивает PostgreSQL container двумя GiB и одновременно
+задаёт extension-owned budget 768 MiB. Это разные границы: первая защищает весь
+процесс PostgreSQL через cgroup, вторая ещё до старта отклоняет комбинацию
+cache/workers/client buffers, которая не помещается в заявленный бюджет.
 
 `Dockerfile` — multi-stage образ: compiler и PostgreSQL headers остаются в
 builder stage, а runtime содержит только PostgreSQL 16, extension, init,
@@ -342,6 +349,10 @@ GRANT SELECT ON TABLE local_cache.mapping TO local_cache_worker;
 | `pg_local_cache.bind_address` | `127.0.0.1` | `127.0.0.1` или `0.0.0.0` |
 | `pg_local_cache.workers` | `4` | RESP workers, `1..32` |
 | `pg_local_cache.cache_entries` | `16384` | Shared entries, `128..65536` |
+| `pg_local_cache.relation_states` | `1024` | Shared namespace states, `128..8192` |
+| `pg_local_cache.max_clients` | `256` | Глобальный предел RESP clients, `1..4096` |
+| `pg_local_cache.max_clients_per_worker` | `64` | Заранее выделенные slots/worker, `1..128` |
+| `pg_local_cache.memory_budget_mb` | `256` | Startup budget extension memory, `64..8192 MiB` |
 | `pg_local_cache.idle_timeout_ms` | `300000` | Idle/slow-client deadline |
 | `pg_local_cache.statement_timeout_ms` | `2000` | Полный SQL command deadline |
 | `pg_local_cache.lock_timeout_ms` | `250` | Lock wait deadline |
@@ -354,9 +365,20 @@ GRANT SELECT ON TABLE local_cache.mapping TO local_cache_worker;
 
 Одна cache entry занимает примерно 8.6 KiB до hash overhead. Значение
 `65536`, используемое Docker-профилем, требует около 0.55 GiB только для
-cache; планируйте память PostgreSQL и контейнера с запасом. Увеличьте
+cache. Каждый RESP slot содержит фиксированные request/output buffers;
+`memory_budget_mb` учитывает shared hashes и все такие slots во всех workers и
+останавливает postmaster с понятной ошибкой, если план больше budget. Он не
+учитывает основной PostgreSQL, `shared_buffers`, `work_mem` и память обычных
+backend-процессов, поэтому cgroup/container limit и запас всё равно обязательны. Увеличьте
 `max_worker_processes` как минимум на число extension workers, не забирая
 слоты у replication/parallel jobs.
+
+`max_clients` не может быть больше `workers * max_clients_per_worker`.
+Подключение резервирует общий slot атомарно до назначения socket клиенту;
+любой setup error, disconnect или завершение worker возвращает reservation.
+`max_dirty_keys` имеет hard maximum `16384`: после достижения лимита
+транзакция переходит на relation-wide invalidation, сохраняя commit/rollback
+целостность без неограниченного роста backend memory.
 
 Для `0.0.0.0` обязателен token не короче 32 bytes. Inline
 `pg_local_cache.auth_token` оставлен только для тестов: secret в production
@@ -389,6 +411,8 @@ SQL API:
 
 ```sql
 SELECT local_cache.stats();
+SELECT * FROM local_cache.metrics();
+SELECT local_cache.health();
 SELECT local_cache.invalidate('items');
 SELECT local_cache.unregister_mapping('items');
 ```
@@ -669,6 +693,32 @@ comparative stack и `pgbench`, correctness с cache `128`, включённым
   events и slow-client drops;
 - worker starts и pending forget markers.
 
+Для частого scrape используйте `local_cache.metrics()`: это типизированная
+однострочная O(1) функция, которая не сканирует все cache entries. Тяжёлый
+`stats()` оставлен для диагностики. `health()` также O(1) и сообщает worker
+quorum, client capacity и memory-budget invariant. Все три функции отозваны у
+`PUBLIC`; отдельной monitor role выдаются только `USAGE` схемы и `EXECUTE`.
+
+Готовый optional stack находится в `compose.monitoring.yaml`: отдельная
+`local_cache_monitor` role, `postgres_exporter`, Prometheus rules и
+provisioned Grafana dashboard. Создайте дополнительные secrets и запустите
+overlay:
+
+```bash
+install -d -m 0700 secrets
+openssl rand -base64 36 | tr -d '\n' > secrets/monitor_password
+openssl rand -base64 36 | tr -d '\n' > secrets/grafana_admin_password
+chmod 0444 secrets/monitor_password secrets/grafana_admin_password
+
+docker compose -f compose.yaml -f compose.monitoring.yaml \
+  up --detach --build --wait
+```
+
+Grafana доступна только на `127.0.0.1:3000`; exporter и Prometheus наружу не
+публикуются. Opt-in profile `host-metrics` включает privileged cAdvisor для
+реального container working set и OOM events. Подробности и команды проверки
+alert rules: [monitoring/README.md](monitoring/README.md).
+
 Следите за hit ratio, неожиданными SQL reads, evictions, rejected connections,
 timeout errors и рестартами workers. Cache недолговечен и прогревается заново
 после restart/failover.
@@ -699,7 +749,8 @@ timeout errors и рестартами workers. Cache недолговечен �
 - нет TTL, `MGET`, `MULTI/WATCH`, Lua, Pub/Sub, NX/XX/EX/PX и RESP3;
 - namespace: 1–63 ASCII `[A-Za-z0-9_.-]`, key <256 bytes, value <=8192 bytes,
   request <=64 KiB;
-- максимум 128 mappings и 128 clients на worker;
+- максимум 128 mappings; `1..128` client slots на worker и отдельный
+  глобальный `max_clients`;
 - listener только IPv4; несколько workers требуют `SO_REUSEPORT`;
 - не выдавайте untrusted ролям DDL-права в application schemas: явный
   permanent `DROP INDEX` вызывает консервативную global invalidation;
