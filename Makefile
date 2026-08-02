@@ -34,6 +34,8 @@ verify-static: all
 		scripts/validate_benchmark_evidence.py \
 		tests/cache_contract_test.py \
 		tests/monitoring_contract_test.py \
+		tests/sql_counter_contract_test.py \
+		tests/sql_executor_fastpath_contract_test.py \
 		tests/row_payload_contract_test.py \
 		tests/whole_row_benchmark_test.py \
 		tests/sql_api_test.py tests/sql_only_benchmark_test.py \
@@ -53,7 +55,9 @@ verify-static: all
 source-test:
 	$(MAKE) -C tests/unit check
 	python3 -m unittest -v tests/cache_contract_test.py \
-		tests/monitoring_contract_test.py tests/row_payload_contract_test.py \
+		tests/monitoring_contract_test.py tests/sql_counter_contract_test.py \
+		tests/sql_executor_fastpath_contract_test.py \
+		tests/row_payload_contract_test.py \
 		tests/sql_api_test.py tests/worker_kvik_contract_test.py \
 		tests/installer_release_contract_test.py tests/pages_contract_test.py \
 		tests/release_evidence_test.py

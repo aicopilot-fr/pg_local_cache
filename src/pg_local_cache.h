@@ -72,6 +72,26 @@ typedef struct PgLocalCacheRelationState
 	bool		pending_forget;
 } PgLocalCacheRelationState;
 
+/*
+ * One SQL counter slot belongs to one PostgreSQL process slot for its entire
+ * lifetime.  The union fixes the stride at a cache line; shared-memory
+ * startup additionally aligns the first element to the same boundary.
+ */
+typedef union PgLocalCacheSqlCounterSlot
+{
+	struct
+	{
+		pg_atomic_uint64 hits;
+		pg_atomic_uint64 misses;
+		pg_atomic_uint64 fills;
+		pg_atomic_uint64 bypasses;
+	} counters;
+	char		padding[PG_CACHE_LINE_SIZE];
+} PgLocalCacheSqlCounterSlot;
+
+StaticAssertDecl(sizeof(PgLocalCacheSqlCounterSlot) == PG_CACHE_LINE_SIZE,
+				 "SQL counter slot must occupy exactly one cache line");
+
 typedef struct PgLocalCacheSharedState
 {
 	LWLock	   *lock;
@@ -87,6 +107,7 @@ typedef struct PgLocalCacheSharedState
 	pg_atomic_uint64 cache_misses;
 	pg_atomic_uint64 negative_hits;
 	pg_atomic_uint64 negative_writes;
+	/* Compatibility/fallback totals for callers without a backend slot. */
 	pg_atomic_uint64 sql_cache_hits;
 	pg_atomic_uint64 sql_cache_misses;
 	pg_atomic_uint64 sql_cache_fills;
@@ -240,6 +261,10 @@ extern void pglc_cache_release_load(const PgLocalCacheMapping *mapping,
 extern void pglc_note_singleflight_waiter(void);
 extern void pglc_note_singleflight_reuse(void);
 extern void pglc_note_singleflight_timeout(void);
+extern void pglc_note_sql_cache_hit(void);
+extern void pglc_note_sql_cache_miss(void);
+extern void pglc_note_sql_cache_fill(void);
+extern void pglc_note_sql_cache_bypass(void);
 extern bool pglc_current_transaction_is_dirty(void);
 extern uint64 pglc_cache_invalidate_namespace(Oid database_oid,
 											 const char *nspace);
@@ -257,6 +282,7 @@ extern void pglc_note_client_limit_rejection(void);
 extern void pglc_note_worker_start(void);
 extern void pglc_note_worker_stop(void);
 extern Size pglc_shared_memory_bytes(void);
+extern Size pglc_sql_counter_memory_bytes(void);
 extern Size pglc_worker_memory_bytes(void);
 extern Size pglc_worker_memory_bytes_per_worker(void);
 extern Size pglc_estimated_memory_bytes(void);

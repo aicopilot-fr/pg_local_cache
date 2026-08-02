@@ -91,7 +91,7 @@ class RowPayloadWireContractTests(unittest.TestCase):
 
 class RowPayloadSourceContractTests(unittest.TestCase):
     def test_checksum_precedes_any_tuple_interpretation(self) -> None:
-        decode_at = SOURCE.index("pglc_row_payload_decode(")
+        decode_at = SOURCE.index("pglc_row_payload_decode_internal(")
         checksum_at = SOURCE.index("pglc_row_payload_checksum(payload", decode_at)
         allocation_at = SOURCE.index("palloc(composite_len)", decode_at)
         tuple_read_at = SOURCE.index("HeapTupleHeaderGetDatumLength", decode_at)
@@ -99,7 +99,7 @@ class RowPayloadSourceContractTests(unittest.TestCase):
         self.assertLess(checksum_at, tuple_read_at)
 
     def test_unaligned_input_is_copied_before_tuple_access(self) -> None:
-        decode_at = SOURCE.index("pglc_row_payload_decode(")
+        decode_at = SOURCE.index("pglc_row_payload_decode_internal(")
         copy_at = SOURCE.index(
             "memcpy(composite, payload + PGLC_ROW_PAYLOAD_HEADER_SIZE",
             decode_at,
@@ -110,6 +110,16 @@ class RowPayloadSourceContractTests(unittest.TestCase):
             "(HeapTupleHeader) (payload",
             SOURCE[decode_at:tuple_read_at],
         )
+
+    def test_sql_can_decode_an_aligned_backend_buffer_without_a_copy(self) -> None:
+        internal_at = SOURCE.index("pglc_row_payload_decode_internal(")
+        public_at = SOURCE.index("pglc_row_payload_decode(", internal_at)
+        internal = SOURCE[internal_at:public_at]
+        self.assertIn("if (use_input_buffer)", internal)
+        self.assertIn("MAXALIGN(composite_address)", internal)
+        self.assertIn("composite = (HeapTupleHeader) composite_address", internal)
+        self.assertIn("if (!use_input_buffer)", internal)
+        self.assertIn("pglc_row_payload_decode_in_place", SOURCE[public_at:])
 
     def test_encode_flattens_external_toast_and_checks_exact_size(self) -> None:
         self.assertIn("heap_copy_tuple_as_datum(tuple, descriptor)", SOURCE)
@@ -145,9 +155,9 @@ class RowPayloadSourceContractTests(unittest.TestCase):
         self.assertNotIn("sizeof(FormData_pg_attribute)", fingerprint)
 
     def test_decode_uses_the_prevalidated_descriptor_fingerprint(self) -> None:
-        decode_at = SOURCE.index("pglc_row_payload_decode(")
-        get_json_at = SOURCE.index("pglc_row_payload_get_json(", decode_at)
-        decode = SOURCE[decode_at:get_json_at]
+        decode_at = SOURCE.index("pglc_row_payload_decode_internal(")
+        public_at = SOURCE.index("pglc_row_payload_decode(", decode_at)
+        decode = SOURCE[decode_at:public_at]
 
         self.assertIn("uint64 expected_descriptor_fingerprint", decode)
         self.assertIn("fingerprint != expected_descriptor_fingerprint", decode)
@@ -175,8 +185,15 @@ class RowPayloadSourceContractTests(unittest.TestCase):
 
     def test_composite_keys_use_length_prefixed_components(self) -> None:
         self.assertIn("pglc_canonical_key(", KEY_CODEC)
-        self.assertIn("encoded[used++] = ':'", KEY_CODEC)
-        self.assertIn("encoded[used++] = ';'", KEY_CODEC)
+        self.assertIn("destination[used++] = ':'", KEY_CODEC)
+        self.assertIn("destination[used++] = ';'", KEY_CODEC)
+
+    def test_key_codec_writes_once_into_caller_buffer(self) -> None:
+        self.assertNotIn("encoded[PGLC_KEY_MAX]", KEY_CODEC)
+        self.assertNotIn("memcpy(destination, encoded", KEY_CODEC)
+        self.assertIn(
+            "used >= destination_capacity - part_len", KEY_CODEC
+        )
         self.assertIn("if (nulls[component])", KEY_CODEC)
         self.assertIn("PGLC_MAX_KEY_COLUMNS", KEY_CODEC)
 

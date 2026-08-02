@@ -27,7 +27,7 @@
 
 typedef struct PgLocalCacheRowPayloadView
 {
-	/* Aligned, self-contained copy owned by result_context. */
+	/* Aligned composite owned by result_context or the input buffer's owner. */
 	Datum		composite;
 	/* Slice into the input payload; it is not NUL-terminated or owned here. */
 	const char *json;
@@ -54,6 +54,13 @@ extern bool pglc_row_payload_decode(const char *payload,
 									uint64 expected_descriptor_fingerprint,
 									MemoryContext result_context,
 									PgLocalCacheRowPayloadView *view);
+/* The input must be MAXALIGNed and remain valid while view is in use. */
+extern bool pglc_row_payload_decode_in_place(
+	char *payload,
+	Size payload_len,
+	TupleDesc expected_descriptor,
+	uint64 expected_descriptor_fingerprint,
+	PgLocalCacheRowPayloadView *view);
 extern bool pglc_row_payload_get_json(const PgLocalCacheRowPayloadView *view,
 									  const char **json,
 									  Size *json_len);

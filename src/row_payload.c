@@ -372,12 +372,13 @@ pglc_row_payload_encode(TupleTableSlot *slot, TupleDesc relation_descriptor,
 	return encoded;
 }
 
-bool
-pglc_row_payload_decode(const char *payload, Size payload_len,
-							TupleDesc expected_descriptor,
-							uint64 expected_descriptor_fingerprint,
-							MemoryContext result_context,
-							PgLocalCacheRowPayloadView *view)
+static bool
+pglc_row_payload_decode_internal(const char *payload, Size payload_len,
+								 TupleDesc expected_descriptor,
+								 uint64 expected_descriptor_fingerprint,
+								 MemoryContext result_context,
+								 bool use_input_buffer,
+								 PgLocalCacheRowPayloadView *view)
 {
 	uint16		version;
 	uint16		flags;
@@ -395,7 +396,8 @@ pglc_row_payload_decode(const char *payload, Size payload_len,
 
 	if (view != NULL)
 		MemSet(view, 0, sizeof(*view));
-	if (payload == NULL || view == NULL || result_context == NULL ||
+	if (payload == NULL || view == NULL ||
+		(!use_input_buffer && result_context == NULL) ||
 		!pglc_row_descriptor_supported(expected_descriptor) ||
 		expected_descriptor_fingerprint == 0 ||
 		payload_len < PGLC_ROW_PAYLOAD_HEADER_SIZE ||
@@ -439,16 +441,30 @@ pglc_row_payload_decode(const char *payload, Size payload_len,
 		(payload[expected_total] != '{' || payload[payload_len - 1] != '}'))
 		return false;
 
-	old_context = MemoryContextSwitchTo(result_context);
-	composite = (HeapTupleHeader) palloc(composite_len);
-	MemoryContextSwitchTo(old_context);
-	memcpy(composite, payload + PGLC_ROW_PAYLOAD_HEADER_SIZE, composite_len);
+	if (use_input_buffer)
+	{
+		uintptr_t	composite_address = (uintptr_t)
+			(payload + PGLC_ROW_PAYLOAD_HEADER_SIZE);
+
+		if (MAXALIGN(composite_address) != composite_address)
+			return false;
+		composite = (HeapTupleHeader) composite_address;
+	}
+	else
+	{
+		old_context = MemoryContextSwitchTo(result_context);
+		composite = (HeapTupleHeader) palloc(composite_len);
+		MemoryContextSwitchTo(old_context);
+		memcpy(composite, payload + PGLC_ROW_PAYLOAD_HEADER_SIZE,
+			   composite_len);
+	}
 
 	/*
-	 * Never cast the unaligned shared-memory byte array.  Only the aligned copy
-	 * is interpreted as a HeapTupleHeader, and only after CRC/length/shape
-	 * validation.  heap_copy_tuple_as_datum() flattened external TOAST fields
-	 * during encode, so a positive cache entry owns every byte it references.
+	 * Shared-memory bytes are never cast in place.  The caller can either ask
+	 * for an aligned copy or provide an aligned backend-owned buffer.  Tuple
+	 * bytes are interpreted only after CRC, length and descriptor validation.
+	 * heap_copy_tuple_as_datum() flattened external TOAST fields during encode,
+	 * so a positive cache entry owns every byte it references.
 	 */
 	if (!VARATT_IS_4B_U(composite) ||
 		HeapTupleHeaderGetDatumLength(composite) != composite_len ||
@@ -457,7 +473,8 @@ pglc_row_payload_decode(const char *payload, Size payload_len,
 		HeapTupleHeaderGetNatts(composite) != natts ||
 		(composite->t_infomask & HEAP_HASEXTERNAL) != 0)
 	{
-		pfree(composite);
+		if (!use_input_buffer)
+			pfree(composite);
 		return false;
 	}
 	expected_header_offset = SizeofHeapTupleHeader;
@@ -467,7 +484,8 @@ pglc_row_payload_decode(const char *payload, Size payload_len,
 	if (composite->t_hoff != expected_header_offset ||
 		expected_header_offset > composite_len)
 	{
-		pfree(composite);
+		if (!use_input_buffer)
+			pfree(composite);
 		return false;
 	}
 
@@ -481,6 +499,28 @@ pglc_row_payload_decode(const char *payload, Size payload_len,
 	view->checksum_crc32c = stored_checksum;
 	view->descriptor_fingerprint = fingerprint;
 	return true;
+}
+
+bool
+pglc_row_payload_decode(const char *payload, Size payload_len,
+							TupleDesc expected_descriptor,
+							uint64 expected_descriptor_fingerprint,
+							MemoryContext result_context,
+							PgLocalCacheRowPayloadView *view)
+{
+	return pglc_row_payload_decode_internal(payload, payload_len,
+		expected_descriptor, expected_descriptor_fingerprint, result_context,
+		false, view);
+}
+
+bool
+pglc_row_payload_decode_in_place(char *payload, Size payload_len,
+								 TupleDesc expected_descriptor,
+								 uint64 expected_descriptor_fingerprint,
+								 PgLocalCacheRowPayloadView *view)
+{
+	return pglc_row_payload_decode_internal(payload, payload_len,
+		expected_descriptor, expected_descriptor_fingerprint, NULL, true, view);
 }
 
 bool

@@ -30,7 +30,6 @@ pglc_canonical_key_typed(const Datum *values, const bool *nulls, int key_count,
 					 char *destination, Size destination_capacity,
 					 Size *key_len)
 {
-	char		encoded[PGLC_KEY_MAX];
 	Size		used = 0;
 	int		component;
 
@@ -81,29 +80,28 @@ pglc_canonical_key_typed(const Datum *values, const bool *nulls, int key_count,
 		}
 		digits_len = pglc_key_length_digits(rendered_len, digits);
 		part_len = (Size) digits_len + 1 + rendered_len + 1;
-		if (part_len >= PGLC_KEY_MAX || used >= PGLC_KEY_MAX - part_len)
+		if (part_len >= PGLC_KEY_MAX || used >= PGLC_KEY_MAX - part_len ||
+			part_len >= destination_capacity ||
+			used >= destination_capacity - part_len)
 		{
 			if (free_rendered)
 				pfree(rendered);
 			return false;
 		}
 
-		memcpy(encoded + used, digits, digits_len);
+		memcpy(destination + used, digits, digits_len);
 		used += digits_len;
-		encoded[used++] = ':';
+		destination[used++] = ':';
 		if (rendered_len > 0)
 		{
-			memcpy(encoded + used, rendered, rendered_len);
+			memcpy(destination + used, rendered, rendered_len);
 			used += rendered_len;
 		}
-		encoded[used++] = ';';
+		destination[used++] = ';';
 		if (free_rendered)
 			pfree(rendered);
 	}
 
-	if (used >= destination_capacity)
-		return false;
-	memcpy(destination, encoded, used);
 	destination[used] = '\0';
 	*key_len = used;
 	return true;
