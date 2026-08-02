@@ -39,10 +39,9 @@ COPY --from=builder \
     /stage/usr/share/postgresql/16/extension/pg_local_cache--1.0.0.sql \
     /usr/share/postgresql/16/extension/
 
-# `extension` deliberately keeps the upstream PostgreSQL entrypoint.  It is
-# the minimal image for an existing PGDATA volume whose configuration and
-# restart are owned by the operator.  `runtime` below is the batteries-included
-# new-cluster image used by this repository's Compose profiles.
+# The `extension` stage preserves the upstream PostgreSQL entrypoint and adds
+# only the extension files. The `runtime` stage adds this repository's
+# new-cluster entrypoint, health check, and table-attachment helper.
 FROM extension AS runtime
 
 COPY --chmod=0755 docker/entrypoint.sh \

@@ -1,3 +1,11 @@
+---
+layout: doc
+title: Install on an existing PostgreSQL server
+description: Preflight, stage, restart, verify and roll back pg_local_cache on a PostgreSQL 16 cluster.
+section: Existing database
+permalink: /docs/INSTALL_EXISTING.html
+---
+
 # Installing pg_local_cache on an existing PostgreSQL server
 
 This guide installs `pg_local_cache` without replacing the database cluster or
@@ -17,10 +25,10 @@ The first installation cannot be completely restartless.
 PostgreSQL constraint, not an installer choice. See the official PostgreSQL 16
 [shared library preloading documentation](https://www.postgresql.org/docs/16/runtime-config-client.html#RUNTIME-CONFIG-CLIENT-PRELOAD).
 
-All preparation is online. On a healthy standalone cluster, the final restart
-often fits a 30-second operational budget, but it is not a universal SLA:
-long-running sessions, shutdown behavior, storage and recovery can extend it.
-The installer waits for readiness without escalating to an immediate shutdown.
+All preparation is online. The installer treats 30 seconds as a warning target,
+not an availability guarantee. Actual downtime depends on open sessions,
+shutdown behavior, storage and recovery. The installer waits for readiness
+without escalating to an immediate shutdown.
 PostgreSQL itself cautions that startup recovery may exceed service-manager
 timeouts in its [server startup documentation](https://www.postgresql.org/docs/16/server-start.html).
 
@@ -40,32 +48,65 @@ Do not run the standalone configuration step against Patroni, a Kubernetes
 operator or a managed service. Those systems own PostgreSQL configuration and
 restart orchestration; use the dedicated sections below.
 
-The ready-made binary release is deliberately labelled
-`pg16-bookworm-amd64`. It is only for PostgreSQL 16 on Debian 12/bookworm,
-amd64 and compatible glibc packaging. There is no universal Linux `.so`.
-Use the source archive and local PGXS build for a different distribution or
-architecture.
+The binary archive name includes `pg16-bookworm-amd64`. Use it only for
+PostgreSQL 16 on Debian 12/bookworm, amd64, and the matching glibc packaging.
+There is no universal Linux `.so`; use the source archive and a local PGXS
+build for a different distribution or architecture.
+
+### Package requirements
+
+Both installation paths require local superuser access, `sha256sum`, `tar`,
+and the target server's `pg_config`. The download commands below use `gh`; the
+archive can instead be downloaded and verified on an administration host, then
+copied to the server.
+
+| Archive | Additional requirements |
+|---|---|
+| `pg16-bookworm-amd64` binary | PostgreSQL 16 on Debian 12/bookworm amd64 with matching server paths; no compiler is needed. |
+| Source | GNU Make, a C compiler, PostgreSQL 16 PGXS, and matching server development headers. |
+
+For Debian or Ubuntu with the PostgreSQL packages already configured, the
+source toolchain is typically installed with:
+
+```bash
+sudo apt-get update
+sudo apt-get install --yes build-essential postgresql-server-dev-16
+```
+
+Package names differ for PGDG, RPM-based distributions, and vendor builds. Use
+the development package that supplies PGXS for the exact target server, then
+confirm its path:
+
+```bash
+/usr/lib/postgresql/16/bin/pg_config --pgxs
+```
 
 ## 1. Download and verify
 
-Download either release archive and `SHA256SUMS` from the private repository's
-GitHub Release. Private release downloads require GitHub authentication.
+The commands below select the newest non-draft release, including a prerelease.
+Set `PGLC_RELEASE_TAG` to install a reviewed tag explicitly.
 
 ```bash
-gh auth login
-gh release download v1.0.0 \
-  --repo aicopilot-fr/pg_local_cache
+repository=aicopilot-fr/pg_local_cache
+release_tag="${PGLC_RELEASE_TAG:-$(
+  gh api "repos/${repository}/releases" \
+    --jq '[.[] | select(.draft == false)][0].tag_name // empty'
+)}"
+test -n "$release_tag"
+
+gh release download "$release_tag" --repo "$repository"
 sha256sum --check SHA256SUMS
 
-tar -xzf pg_local_cache-1.0.0-source.tar.gz
-cd pg_local_cache-1.0.0-source
+tar -xzf pg_local_cache-*-source.tar.gz
+cd pg_local_cache-*-source
 ```
 
-For the binary archive:
+Set `PGLC_RELEASE_TAG` to a reviewed tag when automatic latest-release selection
+is not appropriate. To use the platform-labelled binary instead of source:
 
 ```bash
-tar -xzf pg_local_cache-1.0.0-pg16-bookworm-amd64.tar.gz
-cd pg_local_cache-1.0.0-pg16-bookworm-amd64
+tar -xzf pg_local_cache-*-pg16-bookworm-amd64.tar.gz
+cd pg_local_cache-*-pg16-bookworm-amd64
 ```
 
 The source archive exposes `scripts/install-existing.sh`; the binary archive
@@ -77,7 +118,7 @@ history.
 
 ## 2. Run preflight
 
-The default and recommended first deployment is SQL-only:
+The default first deployment is SQL-only:
 
 ```bash
 sudo ./install.sh preflight \
@@ -171,8 +212,8 @@ generations.
 
 ### Explicit operator restart
 
-The safest default is to let your existing service management perform the
-restart, drain and connection-pool handling:
+Use your existing service manager for the restart, drain, and connection-pool
+handling:
 
 ```bash
 sudo systemctl restart postgresql@16-main
@@ -241,8 +282,7 @@ COMMIT;
 `attach_table` caches the whole row and discovers the complete primary key in
 index-column order. It supports 1–16 PK columns. It acquires
 `ShareRowExclusiveLock` while installing and validating extension-owned
-triggers, so it can briefly conflict with DML/DDL; it is not advertised as a
-lock-free online schema change.
+triggers, so it can briefly conflict with DML and DDL.
 
 Application users need only their normal privileges on the source table:
 
@@ -267,15 +307,15 @@ SELECT local_cache.health();
 SELECT * FROM local_cache.metrics();
 ```
 
-A supported cold lookup reads the source table and fills the cache. A missing
-or unsafe entry never turns into an application-visible cache error: ordinary
-SQL falls back to PostgreSQL's normal plan and returns the authoritative row.
+A supported cold lookup reads the source table and fills the cache. For a
+missing or unsafe entry, ordinary SQL runs PostgreSQL's normal plan and returns
+the authoritative result.
 
 ## Optional RESP mode
 
-Create a persistent token file before preflight. `/run` is appropriate only
-when another system recreates it on every boot; `/etc/pg_local_cache` is a
-safer standalone default.
+Create a persistent token file before preflight. Use `/run` only when a secret
+manager recreates the file on every boot. The example below uses
+`/etc/pg_local_cache` for a standalone host.
 
 ```bash
 sudo install -d -o postgres -g postgres -m 0700 /etc/pg_local_cache
@@ -334,15 +374,15 @@ A process restart without changing to the image containing the `.so` will not
 work. Validate SQL readiness and `local_cache.health()` before admitting
 traffic.
 
-The repository's default `runtime` image is a complete managed example with a
-custom entrypoint, secrets and healthcheck. It is convenient for a new volume;
-the minimal `extension` target is the safer building block for an already
-managed Docker database.
+The repository's `runtime` image adds a custom entrypoint, secrets, and a
+health check for a new volume. The `extension` target preserves the official
+PostgreSQL entrypoint and is the intended base for an existing managed Docker
+database.
 
 ## Patroni and HA
 
-Do not let the standalone installer write `ALTER SYSTEM` or restart one random
-member. A safe outline is:
+Do not use the standalone installer to write `ALTER SYSTEM` or restart an
+individual Patroni member. Use this sequence:
 
 1. install the identical binary and token file on every member;
 2. add `pg_local_cache` and its GUCs through Patroni's dynamic configuration;
@@ -360,8 +400,8 @@ workflows and follow its
 
 Apply the same principle to CloudNativePG or another operator: build a custom
 image, place configuration in the operator-owned resource and request its
-rolling update. Never edit an operator-managed `postgresql.auto.conf` behind
-its back.
+rolling update. Do not edit an operator-managed `postgresql.auto.conf`
+directly.
 
 ## Managed PostgreSQL
 
@@ -369,7 +409,7 @@ Amazon RDS/Aurora, Cloud SQL, Azure Database for PostgreSQL, Supabase and
 similar managed services normally prohibit arbitrary `.so` files and custom
 `shared_preload_libraries` entries. `pg_local_cache` is unsupported there
 unless the provider explicitly packages and permits this extension. The
-installer intentionally does not attempt to bypass that boundary.
+installer does not attempt to bypass that boundary.
 
 ## Rollback and uninstall
 
@@ -395,12 +435,12 @@ For an active installation:
 Never remove the binary first. Existing mapping triggers call C functions and
 would fail if the library disappeared while SQL objects remained.
 
-## Post-install production gate
+## Post-install validation gate
 
 Before routing production traffic:
 
-- run `tests/docker_sql_only_smoke.sh` or the equivalent native integration
-  suite;
+- run the repository Docker suite before rollout and equivalent integration
+  checks against the target cluster;
 - run the dedicated SQL-only benchmark on the target CPU/storage profile;
 - require prepared and unnamed-extended cached lanes to pass independently;
 - verify every timed successful lookup increments `sql_cache_hits`, with no
@@ -408,5 +448,5 @@ Before routing production traffic:
 - exercise a committed update, rollback, PK change and DDL/reconcile path;
 - record actual restart and recovery time instead of assuming 30 seconds.
 
-See [Benchmarks](BENCHMARKS.md) and the complete
-[technical reference](TECHNICAL.md).
+See [Benchmarks]({{ '/docs/BENCHMARKS.html' | relative_url }}) and the complete
+[technical reference]({{ '/docs/TECHNICAL.html' | relative_url }}).

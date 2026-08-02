@@ -19,6 +19,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install-existing.sh"
 RELEASE = ROOT / ".github" / "workflows" / "release.yml"
+CI = ROOT / ".github" / "workflows" / "ci.yml"
+BENCHMARK = ROOT / ".github" / "workflows" / "benchmark.yml"
 
 
 def _write_executable(path: Path, source: str) -> None:
@@ -597,6 +599,7 @@ class ReleaseContracts(unittest.TestCase):
         self.assertIn("distribution=debian12-bookworm", workflow)
         self.assertIn("scripts/install-existing.sh", workflow)
         self.assertIn("benchmarks/SCENARIOS.md", workflow)
+        self.assertIn("docs/MONITORING.md", workflow)
         self.assertIn("monitoring/README.md", workflow)
         self.assertIn("AS extension", dockerfile)
         self.assertIn("FROM extension AS runtime", dockerfile)
@@ -610,11 +613,36 @@ class ReleaseContracts(unittest.TestCase):
         evidence_step = source[start:end]
         self.assertIn("comparison-smoke", evidence_step)
         self.assertIn("sql-only-benchmark-smoke", evidence_step)
-        self.assertIn("source_revision", evidence_step)
-        self.assertIn("RELEASE_SHA", evidence_step)
+        self.assertIn("scripts/validate_benchmark_evidence.py", evidence_step)
+        self.assertIn('--revision "$RELEASE_SHA"', evidence_step)
+        self.assertIn(
+            "--whole ci-evidence/comparison/whole-row.json", evidence_step
+        )
+        self.assertIn(
+            "--sql-only ci-evidence/sql-only/sql-only.json", evidence_step
+        )
+        self.assertNotIn("comparison.json", evidence_step)
         self.assertNotIn("if ! gh run download", evidence_step)
         self.assertNotIn("artifact was not available", evidence_step)
         self.assertNotIn("if: env.TRIGGER_RUN_ID != ''", evidence_step)
+        self.assertNotIn("<<'PY'", evidence_step)
+
+    def test_whole_row_workflows_use_only_active_regression_gates(self) -> None:
+        ci = CI.read_text(encoding="utf-8")
+        benchmark = BENCHMARK.read_text(encoding="utf-8")
+        combined = ci + benchmark
+        for obsolete in (
+            "PGLC_BENCH_REQUIRE_SINGLE_FLIGHT",
+            "PGLC_BENCH_SQL_DIRECT_SETUP",
+            "PGLC_BENCH_SQL_FAST_PATH_SETUP",
+            "PGLC_BENCH_SQL_MIN_OPS",
+            "PGLC_BENCH_MIN_OPS",
+        ):
+            self.assertNotIn(obsolete, combined)
+        self.assertIn('PGLC_BENCH_SINGLEFLIGHT_WAIT_MS: "250"', ci)
+        self.assertIn('PGLC_BENCH_ROW_RESP_MIN_OPS: "10000"', ci)
+        self.assertIn('PGLC_BENCH_ROW_SQL_MIN_OPS: "10000"', ci)
+        self.assertIn('PGLC_BENCH_ROW_WIDTH_MIN_OPS: "0"', ci)
 
 
 class DocumentationContracts(unittest.TestCase):
@@ -625,6 +653,18 @@ class DocumentationContracts(unittest.TestCase):
             source = document.read_text(encoding="utf-8")
             for target in re.findall(r"\[[^]]*\]\(([^)]+)\)", source):
                 if target.startswith(("http://", "https://", "#", "mailto:")):
+                    continue
+                pages_target = re.fullmatch(
+                    r"\{\{ '(/docs/[^']+\.html)' \| relative_url \}\}",
+                    target,
+                )
+                if pages_target:
+                    source_path = pages_target.group(1).removeprefix("/")
+                    source_path = source_path.removesuffix(".html") + ".md"
+                    if not (ROOT / source_path).exists():
+                        failures.append(
+                            f"{document.relative_to(ROOT)} -> {target}"
+                        )
                     continue
                 path = target.split("#", 1)[0]
                 if path and not (document.parent / path).resolve().exists():

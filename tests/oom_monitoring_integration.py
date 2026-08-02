@@ -7,7 +7,8 @@ import json
 import os
 import time
 
-from integration import RespClient, sql, sql_identifier
+from pipeline_integration import RespConnection as RespClient
+from pipeline_integration import sql, sql_identifier
 
 
 APP_ROLE = os.environ.get("PG_LOCAL_CACHE_TEST_APP_ROLE", "")
@@ -62,9 +63,20 @@ def drop_monitor_role() -> None:
     sql(f"DROP OWNED BY {quoted}; DROP ROLE {quoted}")
 
 
+def wait_for_mapping_ready() -> None:
+    wait_until(
+        "workers to apply the transactional ACL reload",
+        lambda: sql(
+            "SELECT (local_cache.health() ->> 'ready')::boolean"
+        )
+        == "t",
+    )
+
+
 def assert_monitor_acl() -> None:
     assert APP_ROLE, "PG_LOCAL_CACHE_TEST_APP_ROLE is required"
     create_monitor_role()
+    wait_for_mapping_ready()
     quoted = sql_identifier(MONITOR_ROLE)
     try:
         result = sql(
@@ -90,6 +102,7 @@ def assert_monitor_acl() -> None:
         assert app_acl == "f|f|f|f", app_acl
     finally:
         drop_monitor_role()
+        wait_for_mapping_ready()
 
 
 def assert_metrics_contract() -> dict[str, int]:

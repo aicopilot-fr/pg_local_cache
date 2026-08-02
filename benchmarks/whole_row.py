@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Whole-row/KVik benchmarks kept separate from the scalar comparison.
+"""Whole-row RESP and ordinary-SQL comparative benchmark.
 
-The RESP comparison sends the same GET frames and validates the exact,
-per-key full-row JSON bytes on pg_local_cache, Valkey, and Redis.  Ordinary
-SQL lanes use the same SELECT text against mapped and stock PostgreSQL.  No
-number emitted here is pooled with the historical scalar ``comparison.json``.
+The RESP comparison sends identical GET frames and validates the exact,
+per-key row JSON on pg_local_cache, Valkey, and Redis. Ordinary SQL lanes use
+the same SELECT text against mapped and stock PostgreSQL.
 """
 
 from __future__ import annotations
 
 from array import array
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import math
@@ -63,8 +62,6 @@ SQL_LANES = {
 @dataclass(frozen=True)
 class WholeRowConfig:
     base: compare.Config
-    duration: float
-    repetitions: int
     value_size: int
     payload_sizes: tuple[int, ...]
     resp_min_ops: float
@@ -85,15 +82,6 @@ class WholeRowConfig:
         )
         return cls(
             base=base,
-            duration=compare.env_float(
-                "PGLC_BENCH_ROW_DURATION",
-                min(base.duration, 30.0),
-                1,
-                3600,
-            ),
-            repetitions=compare.env_int(
-                "PGLC_BENCH_ROW_REPETITIONS", base.repetitions, 1, 20
-            ),
             value_size=value_size,
             payload_sizes=payload_sizes,
             resp_min_ops=compare.env_float(
@@ -105,14 +93,6 @@ class WholeRowConfig:
             width_min_ops=compare.env_float(
                 ROW_WIDTH_MIN_OPS_ENV, 0, 0, 1e12
             ),
-        )
-
-    def load_config(self) -> compare.Config:
-        return replace(
-            self.base,
-            duration=self.duration,
-            repetitions=self.repetitions,
-            warmup_seconds=min(self.base.warmup_seconds, 5.0),
         )
 
 
@@ -187,8 +167,7 @@ def setup_mapped_postgres(
     setup_role(config, compare.PG_HOST)
     compare.psql(
         config,
-        f"SELECT local_cache.unregister_mapping('{ROW_NAMESPACE}');"
-        + row_table_sql(config.keys, payload_size)
+        row_table_sql(config.keys, payload_size)
         + f"SELECT local_cache.attach_table("
         f"'public.{ROW_TABLE}'::regclass, false, '{ROW_NAMESPACE}');",
     )
@@ -841,9 +820,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"Generated: `{report['generated_at_utc']}`",
         "",
-        "These results are deliberately separate from the historical scalar "
-        "benchmark. Every RESP target receives the same key stream and the "
-        "same byte-identical, per-key full-row JSON values.",
+        "Every RESP target receives the same key stream and byte-identical "
+        "per-key row JSON values.",
         "",
         "## Full-row RESP GET",
         "",
@@ -928,7 +906,7 @@ def write_failure_report(error: BaseException, output: Path) -> None:
     (output / "whole-row.json").unlink(missing_ok=True)
     (output / "whole-row.md").unlink(missing_ok=True)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "status": "FAIL",
         "error_type": type(error).__name__,
@@ -955,9 +933,63 @@ def write_failure_report(error: BaseException, output: Path) -> None:
     os.replace(markdown, output / "whole-row-failure.md")
 
 
+def report_environment() -> dict[str, Any]:
+    image_variables = {
+        "postgres": ("PGLC_BENCH_POSTGRES_IMAGE", "PGLC_BENCH_POSTGRES_IMAGE_IDENTITY"),
+        "valkey": ("PGLC_BENCH_VALKEY_IMAGE", "PGLC_BENCH_VALKEY_IMAGE_IDENTITY"),
+        "redis": ("PGLC_BENCH_REDIS_IMAGE", "PGLC_BENCH_REDIS_IMAGE_IDENTITY"),
+        "pg_local_cache": ("PGLC_BENCH_PGLC_IMAGE", "PGLC_BENCH_PG_LOCAL_CACHE_IMAGE_IDENTITY"),
+        "benchmark_client": ("PGLC_BENCH_RUNNER_IMAGE", "PGLC_BENCH_RUNNER_IMAGE_IDENTITY"),
+    }
+    return {
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "python": platform.python_version(),
+        "source_revision": os.environ.get("PGLC_BENCH_SOURCE_REVISION", "unknown"),
+        "harness_sha256": os.environ.get(
+            "PGLC_BENCH_WHOLE_ROW_HARNESS_SHA256", "unknown"
+        ),
+        "container_runtime": {
+            "docker_version": os.environ.get("PGLC_BENCH_DOCKER_VERSION", "unknown"),
+            "compose_version": os.environ.get("PGLC_BENCH_COMPOSE_VERSION", "unknown"),
+        },
+        "images": {
+            name: {
+                "reference": os.environ.get(reference_variable, "unknown"),
+                "identity": os.environ.get(identity_variable, "unknown"),
+            }
+            for name, (reference_variable, identity_variable) in image_variables.items()
+        },
+        "benchmark_client": compare.discover_runtime_resources(),
+    }
+
+
+def report_workload(
+    whole: WholeRowConfig, config: compare.Config, capacity: int
+) -> dict[str, Any]:
+    return {
+        "duration_seconds": config.duration,
+        "warmup_seconds": config.warmup_seconds,
+        "repetitions": config.repetitions,
+        "concurrency": config.concurrency,
+        "pipeline": config.pipeline,
+        "keys": config.keys,
+        "row_text_bytes": whole.value_size,
+        "payload_widths_bytes": list(whole.payload_sizes),
+        "max_latency_samples": config.max_latency_samples,
+        "cache_capacity": capacity,
+        "client_cpus": config.client_cpus,
+        "server_cpus_per_target": config.server_cpus,
+        "client_memory": config.client_memory,
+        "server_memory_per_target": config.server_memory,
+        "pg_local_cache_workers": config.pg_local_cache_workers,
+        "pgbench_jobs": config.pg_jobs,
+    }
+
+
 def main() -> int:
     whole = WholeRowConfig.from_environment()
-    config = whole.load_config()
+    config = whole.base
     if sys.platform != "linux":
         raise RuntimeError("whole-row benchmark requires Linux/fork")
 
@@ -971,30 +1003,11 @@ def main() -> int:
     widths, width_failures = width_sweep(whole, config)
     failures = resp_failures + sql_failures + width_failures
     report: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "workload": {
-            "duration_seconds": config.duration,
-            "warmup_seconds": config.warmup_seconds,
-            "repetitions": config.repetitions,
-            "concurrency": config.concurrency,
-            "pipeline": config.pipeline,
-            "keys": config.keys,
-            "cache_capacity": capacity,
-        },
-        "environment": {
-            "platform": platform.platform(),
-            "machine": platform.machine(),
-            "python": platform.python_version(),
-            "source_revision": os.environ.get(
-                "PGLC_BENCH_SOURCE_REVISION", "unknown"
-            ),
-            "harness_sha256": os.environ.get(
-                "PGLC_BENCH_WHOLE_ROW_HARNESS_SHA256", "unknown"
-            ),
-        },
+        "workload": report_workload(whole, config, capacity),
+        "environment": report_environment(),
         "methodology": {
-            "scalar_results_reused": False,
             "resp_client": "same stdlib multiprocess RESP2 client for all targets",
             "resp_reply_validation": "every response against exact per-key bytes",
             "external_payload_source": "PostgreSQL row_to_json output",

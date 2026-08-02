@@ -1,0 +1,28 @@
+title: pg_local_cache
+description: A bounded whole-row primary-key cache inside PostgreSQL with ordinary SQL and transaction-aware invalidation.
+url: https://aicopilot-fr.github.io
+baseurl: /pg_local_cache
+repository: aicopilot-fr/pg_local_cache
+lang: en
+markdown: kramdown
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+permalink: pretty
+exclude:
+  - README.md
+  - benchmarks
+  - docker
+  - monitoring
+  - scripts
+  - sql
+  - src
+  - test
+  - tests
+  - Dockerfile
+  - Makefile
+  - compose.monitoring.yaml
+  - compose.sql-only.yaml
+  - compose.yaml
+  - pg_local_cache.control
+  - vendor

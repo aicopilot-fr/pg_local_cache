@@ -35,6 +35,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -58,23 +59,20 @@
  */
 
 #define PGLC_SQL_CUSTOM_NAME "pg_local_cache_sql"
+#define PGLC_SQL_META_CACHE_SLOTS 32
 
 #define PGLC_PRIVATE_NAMESPACE 0
 #define PGLC_PRIVATE_RELATION 1
 #define PGLC_PRIVATE_GENERATION 2
-#define PGLC_PRIVATE_WHOLE_ROW 3
-#define PGLC_PRIVATE_KEY_COUNT 4
-#define PGLC_PRIVATE_KEY_ATTNOS 5
-#define PGLC_PRIVATE_KEY_TYPES 6
-#define PGLC_PRIVATE_KEY_TYPMODS 7
-#define PGLC_PRIVATE_VALUE_ATTNO 8
-#define PGLC_PRIVATE_VALUE_TYPE 9
-#define PGLC_PRIVATE_VALUE_TYPMOD 10
-#define PGLC_PRIVATE_ROW_TYPE 11
-#define PGLC_PRIVATE_ROW_NATTS 12
-#define PGLC_PRIVATE_ROW_FINGERPRINT 13
-#define PGLC_PRIVATE_KEY_EXPRS 14
-#define PGLC_PRIVATE_PLAN_ITEMS 14
+#define PGLC_PRIVATE_KEY_COUNT 3
+#define PGLC_PRIVATE_KEY_ATTNOS 4
+#define PGLC_PRIVATE_KEY_TYPES 5
+#define PGLC_PRIVATE_KEY_TYPMODS 6
+#define PGLC_PRIVATE_ROW_TYPE 7
+#define PGLC_PRIVATE_ROW_NATTS 8
+#define PGLC_PRIVATE_ROW_FINGERPRINT 9
+#define PGLC_PRIVATE_KEY_EXPRS 10
+#define PGLC_PRIVATE_PLAN_ITEMS 10
 
 typedef struct PgLocalCacheSqlMeta
 {
@@ -86,10 +84,6 @@ typedef struct PgLocalCacheSqlMeta
 	Oid			key_types[PGLC_MAX_KEY_COLUMNS];
 	int32		key_typmods[PGLC_MAX_KEY_COLUMNS];
 	Oid			key_collations[PGLC_MAX_KEY_COLUMNS];
-	bool		whole_row;
-	AttrNumber value_attno;
-	Oid			value_type;
-	int32		value_typmod;
 	Oid			row_type_oid;
 	int32		row_typmod;
 	int			row_natts;
@@ -105,15 +99,10 @@ typedef struct PgLocalCacheSqlScanState
 	TupleTableSlot *latest_slot;
 	PgLocalCacheMapping mapping;
 	FmgrInfo	key_outputs[PGLC_MAX_KEY_COLUMNS];
-	FmgrInfo	value_input;
-	FmgrInfo	value_output;
-	Oid			value_ioparam;
 	int			key_count;
 	AttrNumber key_attnos[PGLC_MAX_KEY_COLUMNS];
 	Oid			key_types[PGLC_MAX_KEY_COLUMNS];
 	int32		key_typmods[PGLC_MAX_KEY_COLUMNS];
-	bool		whole_row;
-	AttrNumber value_attno;
 	Oid			row_type_oid;
 	int32		row_typmod;
 	int			row_natts;
@@ -128,10 +117,29 @@ typedef struct PgLocalCacheSqlScanState
 	uint64		bypasses;
 } PgLocalCacheSqlScanState;
 
+/*
+ * Planning the same primary-key lookup repeatedly must not rescan the private
+ * mapping table and re-walk every trigger and tuple attribute.  This small
+ * backend-local direct-mapped cache is fenced by the shared mapping generation
+ * and PostgreSQL relcache invalidations.  Collisions only discard an entry and
+ * force full validation; they can never make an invalid relation cacheable.
+ */
+typedef struct PgLocalCacheSqlMetaCacheEntry
+{
+	Oid			relation_oid;
+	uint64		config_generation;
+	bool		mapping_known;
+	bool		mapping_found;
+	bool		relation_validated;
+	PgLocalCacheSqlMeta meta;
+} PgLocalCacheSqlMetaCacheEntry;
+
 bool		pglc_sql_cache = true;
 
 static set_rel_pathlist_hook_type previous_set_rel_pathlist_hook = NULL;
 static planner_hook_type previous_planner_hook = NULL;
+static PgLocalCacheSqlMetaCacheEntry
+	pglc_sql_meta_cache[PGLC_SQL_META_CACHE_SLOTS];
 
 static PlannedStmt *pglc_sql_planner(Query *parse, const char *query_string,
 								 int cursor_options,
@@ -148,6 +156,7 @@ static void pglc_sql_end(CustomScanState *node);
 static void pglc_sql_rescan(CustomScanState *node);
 static void pglc_sql_explain(CustomScanState *node, List *ancestors,
 								 ExplainState *es);
+static void pglc_sql_relcache_invalidation(Datum argument, Oid relation_oid);
 
 static const CustomPathMethods pglc_sql_path_methods = {
 	.CustomName = PGLC_SQL_CUSTOM_NAME,
@@ -234,6 +243,66 @@ pglc_sql_private_list_oid(List *private, int index, int member)
 	return DatumGetObjectId(value->constvalue);
 }
 
+static PgLocalCacheSqlMetaCacheEntry *
+pglc_sql_meta_cache_entry(Oid relation_oid)
+{
+	return &pglc_sql_meta_cache[((uint32) relation_oid) &
+		(PGLC_SQL_META_CACHE_SLOTS - 1)];
+}
+
+static void
+pglc_sql_relcache_invalidation(Datum argument, Oid relation_oid)
+{
+	if (!OidIsValid(relation_oid))
+	{
+		int			index;
+
+		for (index = 0; index < PGLC_SQL_META_CACHE_SLOTS; index++)
+			pglc_sql_meta_cache[index].relation_validated = false;
+	}
+	else
+	{
+		PgLocalCacheSqlMetaCacheEntry *entry =
+			pglc_sql_meta_cache_entry(relation_oid);
+
+		if (entry->relation_oid == relation_oid)
+			entry->relation_validated = false;
+	}
+	(void) argument;
+}
+
+static bool
+pglc_sql_cached_mapping(Oid relation_oid, uint64 generation,
+						PgLocalCacheSqlMeta *meta, bool *found)
+{
+	PgLocalCacheSqlMetaCacheEntry *entry =
+		pglc_sql_meta_cache_entry(relation_oid);
+
+	if (entry->relation_oid != relation_oid ||
+		entry->config_generation != generation || !entry->mapping_known)
+		return false;
+	*found = entry->mapping_found;
+	if (*found)
+		*meta = entry->meta;
+	return true;
+}
+
+static void
+pglc_sql_remember_mapping(Oid relation_oid, uint64 generation,
+						  const PgLocalCacheSqlMeta *meta, bool found)
+{
+	PgLocalCacheSqlMetaCacheEntry *entry =
+		pglc_sql_meta_cache_entry(relation_oid);
+
+	MemSet(entry, 0, sizeof(*entry));
+	entry->relation_oid = relation_oid;
+	entry->config_generation = generation;
+	entry->mapping_known = true;
+	entry->mapping_found = found;
+	if (found)
+		entry->meta = *meta;
+}
+
 /*
  * Read the extension's private mapping table below the SQL permission layer.
  * Application roles deliberately have no SELECT privilege on this table; the
@@ -252,7 +321,6 @@ pglc_sql_read_mapping_once(Oid relation_oid, uint64 generation,
 	AttrNumber namespace_attno;
 	AttrNumber relation_attno;
 	AttrNumber key_columns_attno;
-	AttrNumber value_attno;
 	bool		found = false;
 
 	namespace_oid = get_namespace_oid("local_cache", true);
@@ -268,11 +336,9 @@ pglc_sql_read_mapping_once(Oid relation_oid, uint64 generation,
 	namespace_attno = get_attnum(mapping_oid, "namespace");
 	relation_attno = get_attnum(mapping_oid, "relation");
 	key_columns_attno = get_attnum(mapping_oid, "key_columns");
-	value_attno = get_attnum(mapping_oid, "value_column");
 	if (namespace_attno == InvalidAttrNumber ||
 		relation_attno == InvalidAttrNumber ||
-		key_columns_attno == InvalidAttrNumber ||
-		value_attno == InvalidAttrNumber)
+		key_columns_attno == InvalidAttrNumber)
 	{
 		table_close(mapping_relation, AccessShareLock);
 		return false;
@@ -297,7 +363,6 @@ pglc_sql_read_mapping_once(Oid relation_oid, uint64 generation,
 		if (!isnull)
 		{
 			char	   *nspace = TextDatumGetCString(datum);
-			Datum		value_datum;
 			int			key_index;
 
 			if (strlen(nspace) >= sizeof(meta->nspace))
@@ -352,20 +417,6 @@ pglc_sql_read_mapping_once(Oid relation_oid, uint64 generation,
 				if (meta->key_attnos[key_index] == InvalidAttrNumber)
 					found = false;
 			}
-
-			value_datum = slot_getattr(slot, value_attno, &isnull);
-			meta->whole_row = isnull;
-			if (!meta->whole_row)
-			{
-				Name		value_name = DatumGetName(value_datum);
-
-				meta->value_attno = get_attnum(relation_oid,
-										 NameStr(*value_name));
-				if (meta->value_attno == InvalidAttrNumber ||
-					meta->key_count != 1 ||
-					meta->value_attno == meta->key_attnos[0])
-					found = false;
-			}
 		}
 		break;
 	}
@@ -389,10 +440,15 @@ pglc_sql_read_mapping(Oid relation_oid, PgLocalCacheSqlMeta *meta)
 		bool		found;
 
 		before = pglc_config_generation();
+		if (pglc_sql_cached_mapping(relation_oid, before, meta, &found))
+			return found;
 		found = pglc_sql_read_mapping_once(relation_oid, before, meta);
 		after = pglc_config_generation();
 		if (before == after)
+		{
+			pglc_sql_remember_mapping(relation_oid, before, meta, found);
 			return found;
+		}
 	}
 	return false;
 }
@@ -543,16 +599,6 @@ pglc_sql_key_type_supported(Oid type_oid)
 		type_oid == INT8OID || type_oid == TEXTOID ||
 		type_oid == VARCHAROID || type_oid == BPCHAROID ||
 		type_oid == UUIDOID;
-}
-
-static bool
-pglc_sql_value_type_supported(Oid type_oid)
-{
-	return type_oid == INT2OID || type_oid == INT4OID ||
-		type_oid == INT8OID || type_oid == NUMERICOID ||
-		type_oid == BOOLOID || type_oid == TEXTOID ||
-		type_oid == VARCHAROID || type_oid == BPCHAROID ||
-			type_oid == UUIDOID || type_oid == JSONOID || type_oid == JSONBOID;
 }
 
 /*
@@ -714,27 +760,6 @@ pglc_sql_relation_base_meta(Relation relation, PgLocalCacheSqlMeta *meta,
 		meta->key_collations[key_index] = key_attribute->attcollation;
 	}
 
-	if (!meta->whole_row)
-	{
-		Form_pg_attribute value_attribute;
-
-		if (meta->key_count != 1 || meta->value_attno <= 0 ||
-			meta->value_attno > descriptor->natts)
-			return false;
-		value_attribute = TupleDescAttr(descriptor, meta->value_attno - 1);
-		if (value_attribute->attisdropped || !value_attribute->attnotnull ||
-			!pglc_sql_value_type_supported(value_attribute->atttypid))
-			return false;
-		meta->value_type = value_attribute->atttypid;
-		meta->value_typmod = value_attribute->atttypmod;
-	}
-	else
-	{
-		meta->value_attno = InvalidAttrNumber;
-		meta->value_type = InvalidOid;
-		meta->value_typmod = -1;
-	}
-
 	meta->row_type_oid = relation->rd_rel->reltype;
 	meta->row_typmod = -1;
 	meta->row_natts = descriptor->natts;
@@ -753,6 +778,87 @@ pglc_sql_relation_meta(Relation relation, PgLocalCacheSqlMeta *meta,
 									   check_catalog_provenance) &&
 		!pglc_sql_relation_has_children(relation) &&
 		!pglc_sql_relation_has_parent(relation);
+}
+
+static bool
+pglc_sql_same_mapping(const PgLocalCacheSqlMeta *left,
+					  const PgLocalCacheSqlMeta *right)
+{
+	int			key_index;
+
+	if (left->relation_oid != right->relation_oid ||
+		left->config_generation != right->config_generation ||
+		strcmp(left->nspace, right->nspace) != 0 ||
+		left->key_count != right->key_count)
+		return false;
+	for (key_index = 0; key_index < left->key_count; key_index++)
+	{
+		if (left->key_attnos[key_index] != right->key_attnos[key_index] ||
+			strcmp(left->key_columns[key_index],
+				   right->key_columns[key_index]) != 0)
+			return false;
+	}
+	return true;
+}
+
+static bool
+pglc_sql_cached_relation_meta(PgLocalCacheSqlMeta *meta)
+{
+	PgLocalCacheSqlMetaCacheEntry *entry =
+		pglc_sql_meta_cache_entry(meta->relation_oid);
+
+	if (entry->relation_oid != meta->relation_oid ||
+		entry->config_generation != meta->config_generation ||
+		!entry->mapping_known || !entry->mapping_found ||
+		!entry->relation_validated ||
+		!pglc_sql_same_mapping(meta, &entry->meta))
+		return false;
+	*meta = entry->meta;
+	return true;
+}
+
+static void
+pglc_sql_remember_relation_meta(const PgLocalCacheSqlMeta *meta)
+{
+	PgLocalCacheSqlMetaCacheEntry *entry =
+		pglc_sql_meta_cache_entry(meta->relation_oid);
+
+	if (entry->relation_oid != meta->relation_oid ||
+		entry->config_generation != meta->config_generation)
+	{
+		MemSet(entry, 0, sizeof(*entry));
+		entry->relation_oid = meta->relation_oid;
+		entry->config_generation = meta->config_generation;
+		entry->mapping_known = true;
+		entry->mapping_found = true;
+	}
+	entry->meta = *meta;
+	entry->relation_validated = true;
+}
+
+static bool
+pglc_sql_meta_matches_state(const PgLocalCacheSqlMeta *meta,
+							const PgLocalCacheSqlScanState *state)
+{
+	int			key_index;
+
+	if (meta->relation_oid != state->mapping.relation_oid ||
+		strcmp(meta->nspace, state->mapping.nspace) != 0 ||
+		meta->key_count != state->key_count ||
+		meta->row_type_oid != state->row_type_oid ||
+		meta->row_natts != state->row_natts ||
+		meta->row_fingerprint != state->row_fingerprint)
+		return false;
+	for (key_index = 0; key_index < state->key_count; key_index++)
+	{
+		if (meta->key_attnos[key_index] != state->key_attnos[key_index] ||
+			meta->key_types[key_index] != state->key_types[key_index] ||
+			meta->key_typmods[key_index] != state->key_typmods[key_index] ||
+			strcmp(meta->key_columns[key_index],
+				   state->mapping.key_columns[key_index]) != 0)
+			return false;
+	}
+	return true;
 }
 
 static bool
@@ -1088,14 +1194,11 @@ pglc_sql_primary_index_path(PlannerInfo *root, RelOptInfo *rel,
 }
 
 static bool
-pglc_sql_targets_supported(Query *query, Index rti, Relation relation,
-						   const PgLocalCacheSqlMeta *meta)
+pglc_sql_targets_supported(Query *query, Index rti, Relation relation)
 {
 	TupleDesc	descriptor = RelationGetDescr(relation);
 	ListCell   *cell;
 
-	if (!meta->whole_row && list_length(query->targetList) != 1)
-		return false;
 	foreach(cell, query->targetList)
 	{
 		TargetEntry *target = (TargetEntry *) lfirst(cell);
@@ -1110,10 +1213,6 @@ pglc_sql_targets_supported(Query *query, Index rti, Relation relation,
 		if (attribute->attisdropped || var->vartype != attribute->atttypid ||
 			var->vartypmod != attribute->atttypmod ||
 			var->varcollid != attribute->attcollation)
-			return false;
-		if (!meta->whole_row &&
-			(var->varattno != meta->value_attno ||
-			 var->vartype != meta->value_type))
 			return false;
 	}
 	return true;
@@ -1146,8 +1245,16 @@ pglc_sql_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		return;
 
 	relation = table_open(rte->relid, NoLock);
-	if (!pglc_sql_relation_meta(relation, &meta, true) ||
-		!pglc_sql_targets_supported(root->parse, rti, relation, &meta) ||
+	if (!pglc_sql_cached_relation_meta(&meta))
+	{
+		if (!pglc_sql_relation_meta(relation, &meta, true))
+		{
+			table_close(relation, NoLock);
+			return;
+		}
+		pglc_sql_remember_relation_meta(&meta);
+	}
+	if (!pglc_sql_targets_supported(root->parse, rti, relation) ||
 		!pglc_sql_match_clauses(rel, rti, &meta, restrict_infos,
 							   &key_exprs))
 	{
@@ -1172,14 +1279,10 @@ pglc_sql_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	private = lappend(private, makeString(pstrdup(meta.nspace)));
 	private = lappend(private, pglc_sql_oid_const(meta.relation_oid));
 	private = lappend(private, pglc_sql_int8_const(meta.config_generation));
-	private = lappend(private, makeInteger(meta.whole_row));
 	private = lappend(private, makeInteger(meta.key_count));
 	private = lappend(private, key_attnos);
 	private = lappend(private, key_types);
 	private = lappend(private, key_typmods);
-	private = lappend(private, makeInteger(meta.value_attno));
-	private = lappend(private, pglc_sql_oid_const(meta.value_type));
-	private = lappend(private, makeInteger(meta.value_typmod));
 	private = lappend(private, pglc_sql_oid_const(meta.row_type_oid));
 	private = lappend(private, makeInteger(meta.row_natts));
 	private = lappend(private, pglc_sql_int8_const(meta.row_fingerprint));
@@ -1214,10 +1317,6 @@ pglc_sql_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 	Plan	   *child;
 	List	   *private;
 	List	   *key_exprs;
-	bool		whole_row;
-	AttrNumber value_attno;
-	Oid			value_type;
-	int32		value_typmod;
 	Oid			row_type_oid;
 	int			child_payload_resno;
 	int			child_ctid_resno;
@@ -1231,30 +1330,13 @@ pglc_sql_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 							 PGLC_PRIVATE_PLAN_ITEMS);
 	key_exprs = (List *) list_nth(best_path->custom_private,
 								 PGLC_PRIVATE_KEY_EXPRS);
-	whole_row = intVal(list_nth(private, PGLC_PRIVATE_WHOLE_ROW)) != 0;
-	value_attno = intVal(list_nth(private, PGLC_PRIVATE_VALUE_ATTNO));
-	value_type = pglc_sql_private_oid(private, PGLC_PRIVATE_VALUE_TYPE);
-	value_typmod = intVal(list_nth(private, PGLC_PRIVATE_VALUE_TYPMOD));
 	row_type_oid = pglc_sql_private_oid(private, PGLC_PRIVATE_ROW_TYPE);
 
 	child_payload_resno = list_length(child->targetlist) + 1;
-	if (whole_row)
-	{
-		child->targetlist = lappend(child->targetlist,
-			makeTargetEntry((Expr *) makeVar(rel->relid,
-										 InvalidAttrNumber,
-										 row_type_oid, -1,
-										 InvalidOid, 0),
-							child_payload_resno, NULL, true));
-	}
-	else
-	{
-		child->targetlist = lappend(child->targetlist,
-			makeTargetEntry((Expr *) makeVar(rel->relid, value_attno,
-										 value_type, value_typmod,
-										 get_typcollation(value_type), 0),
-							child_payload_resno, NULL, true));
-	}
+	child->targetlist = lappend(child->targetlist,
+		makeTargetEntry((Expr *) makeVar(rel->relid, InvalidAttrNumber,
+									 row_type_oid, -1, InvalidOid, 0),
+						child_payload_resno, NULL, true));
 	child_ctid_resno = list_length(child->targetlist) + 1;
 	child->targetlist = lappend(child->targetlist,
 		makeTargetEntry((Expr *) makeVar(rel->relid,
@@ -1310,7 +1392,6 @@ pglc_sql_validate_runtime(PgLocalCacheSqlScanState *state,
 	PgLocalCacheSqlMeta current_meta;
 	TupleDesc	descriptor;
 	uint64		current_generation;
-	bool		check_catalog_provenance;
 	int			key_index;
 
 	if (relation == NULL ||
@@ -1318,12 +1399,11 @@ pglc_sql_validate_runtime(PgLocalCacheSqlScanState *state,
 		relation->rd_rel->relkind != RELKIND_RELATION ||
 		relation->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT ||
 		relation->rd_rel->relam != HEAP_TABLE_AM_OID ||
+		relation->rd_rel->relispartition ||
 		relation->rd_rel->relrowsecurity || relation->rd_rel->relforcerowsecurity)
 		return false;
 
 	current_generation = pglc_config_generation();
-	check_catalog_provenance =
-		state->mapping.config_generation != current_generation;
 	descriptor = RelationGetDescr(relation);
 	if (state->key_count < 1 ||
 		state->key_count > PGLC_MAX_KEY_COLUMNS)
@@ -1332,8 +1412,8 @@ pglc_sql_validate_runtime(PgLocalCacheSqlScanState *state,
 	strlcpy(planned_meta.nspace, state->mapping.nspace,
 			sizeof(planned_meta.nspace));
 	planned_meta.relation_oid = state->mapping.relation_oid;
+	planned_meta.config_generation = state->mapping.config_generation;
 	planned_meta.key_count = state->key_count;
-	planned_meta.whole_row = state->whole_row;
 	for (key_index = 0; key_index < state->key_count; key_index++)
 	{
 		Form_pg_attribute key_attribute;
@@ -1347,20 +1427,20 @@ pglc_sql_validate_runtime(PgLocalCacheSqlScanState *state,
 				NameStr(key_attribute->attname), NAMEDATALEN);
 		planned_meta.key_attnos[key_index] = state->key_attnos[key_index];
 	}
-	planned_meta.value_attno = state->value_attno;
+	if (state->mapping.config_generation == current_generation)
+	{
+		current_meta = planned_meta;
+		if (pglc_sql_cached_relation_meta(&current_meta) &&
+			pglc_sql_meta_matches_state(&current_meta, state))
+			return true;
+	}
 	/*
-	 * Keep the ordinary execution path free of mapping-table and inheritance
-	 * catalog scans.  Relcache-backed shape, RLS, partition and exact trigger
-	 * checks still run for every execution.  Source/trigger dependency
-	 * provenance is established while planning.  Mapped-relation DDL advances
-	 * the global generation; only that slow path repeats provenance, hierarchy
-	 * and mapping revalidation below.
+	 * A cache miss here means either the relation was invalidated or another
+	 * mapping changed.  Repeat every shape, source, trigger-ownership, and
+	 * dependency check before accepting a new local validation entry.  Relcache
+	 * invalidation alone is sufficient to force this fail-closed slow path.
 	 */
-	if (!pglc_sql_relation_base_meta(relation, &planned_meta,
-									  check_catalog_provenance) ||
-		planned_meta.whole_row != state->whole_row ||
-		planned_meta.value_type != state->mapping.value_type ||
-		planned_meta.value_typmod != state->mapping.value_typmod ||
+	if (!pglc_sql_relation_meta(relation, &planned_meta, true) ||
 		planned_meta.row_type_oid != state->row_type_oid ||
 		planned_meta.row_natts != state->row_natts ||
 		planned_meta.row_fingerprint != state->row_fingerprint)
@@ -1374,6 +1454,7 @@ pglc_sql_validate_runtime(PgLocalCacheSqlScanState *state,
 
 	if (state->mapping.config_generation == current_generation)
 	{
+		pglc_sql_remember_relation_meta(&planned_meta);
 		(void) scan;
 		return true;
 	}
@@ -1391,10 +1472,6 @@ pglc_sql_validate_runtime(PgLocalCacheSqlScanState *state,
 	if (current_meta.relation_oid != state->mapping.relation_oid ||
 		strcmp(current_meta.nspace, state->mapping.nspace) != 0 ||
 		current_meta.key_count != state->key_count ||
-		current_meta.whole_row != state->whole_row ||
-		current_meta.value_attno != state->value_attno ||
-		current_meta.value_type != state->mapping.value_type ||
-		current_meta.value_typmod != state->mapping.value_typmod ||
 		current_meta.row_type_oid != state->row_type_oid ||
 		current_meta.row_natts != state->row_natts ||
 		current_meta.row_fingerprint != state->row_fingerprint)
@@ -1410,6 +1487,7 @@ pglc_sql_validate_runtime(PgLocalCacheSqlScanState *state,
 			return false;
 	}
 
+	pglc_sql_remember_relation_meta(&current_meta);
 	state->mapping.config_generation = current_meta.config_generation;
 	(void) scan;
 	return true;
@@ -1420,8 +1498,6 @@ pglc_sql_begin(CustomScanState *node, EState *estate, int eflags)
 {
 	PgLocalCacheSqlScanState *state = (PgLocalCacheSqlScanState *) node;
 	CustomScan *scan = (CustomScan *) node->ss.ps.plan;
-	Oid			value_input_oid;
-	Oid			value_output_oid;
 	bool		is_varlena;
 	ListCell   *cell;
 	int			key_index;
@@ -1435,10 +1511,6 @@ pglc_sql_begin(CustomScanState *node, EState *estate, int eflags)
 	Assert(state->key_count >= 1 &&
 		   state->key_count <= PGLC_MAX_KEY_COLUMNS);
 	Assert(list_length(scan->custom_exprs) == state->key_count);
-	state->whole_row = intVal(list_nth(scan->custom_private,
-									   PGLC_PRIVATE_WHOLE_ROW)) != 0;
-	state->value_attno = intVal(list_nth(scan->custom_private,
-									  PGLC_PRIVATE_VALUE_ATTNO));
 	state->row_type_oid = pglc_sql_private_oid(scan->custom_private,
 										 PGLC_PRIVATE_ROW_TYPE);
 	state->row_typmod = -1;
@@ -1459,14 +1531,9 @@ pglc_sql_begin(CustomScanState *node, EState *estate, int eflags)
 			sizeof(state->mapping.nspace));
 	state->mapping.relation_oid = pglc_sql_private_oid(scan->custom_private,
 												 PGLC_PRIVATE_RELATION);
-	state->mapping.value_type = pglc_sql_private_oid(scan->custom_private,
-											   PGLC_PRIVATE_VALUE_TYPE);
-	state->mapping.value_typmod = intVal(list_nth(scan->custom_private,
-											   PGLC_PRIVATE_VALUE_TYPMOD));
 	state->mapping.config_generation =
 		pglc_sql_private_generation(scan->custom_private);
 	state->mapping.key_count = state->key_count;
-	state->mapping.whole_row = state->whole_row;
 	state->mapping.row_type_oid = state->row_type_oid;
 	state->mapping.row_typmod = state->row_typmod;
 	state->mapping.row_natts = state->row_natts;
@@ -1488,9 +1555,14 @@ pglc_sql_begin(CustomScanState *node, EState *estate, int eflags)
 		state->key_typmods[key_index] =
 			pglc_sql_private_list_int(scan->custom_private,
 									   PGLC_PRIVATE_KEY_TYPMODS, key_index);
-		getTypeOutputInfo(state->key_types[key_index], &key_output_oid,
-						  &is_varlena);
-		fmgr_info(key_output_oid, &state->key_outputs[key_index]);
+		if (state->key_types[key_index] != INT2OID &&
+			state->key_types[key_index] != INT4OID &&
+			state->key_types[key_index] != INT8OID)
+		{
+			getTypeOutputInfo(state->key_types[key_index], &key_output_oid,
+							  &is_varlena);
+			fmgr_info(key_output_oid, &state->key_outputs[key_index]);
+		}
 
 		state->mapping.key_attnos[key_index] = state->key_attnos[key_index];
 		state->mapping.key_types[key_index] = state->key_types[key_index];
@@ -1505,18 +1577,6 @@ pglc_sql_begin(CustomScanState *node, EState *estate, int eflags)
 					NameStr(key_attribute->attname), NAMEDATALEN);
 		}
 	}
-	if (!state->whole_row)
-	{
-		getTypeInputInfo(state->mapping.value_type, &value_input_oid,
-						 &state->value_ioparam);
-		fmgr_info(value_input_oid, &state->value_input);
-		state->mapping.value_ioparam = state->value_ioparam;
-		state->mapping.value_input = state->value_input;
-		getTypeOutputInfo(state->mapping.value_type, &value_output_oid,
-						  &is_varlena);
-		fmgr_info(value_output_oid, &state->value_output);
-	}
-
 	state->child = ExecInitNode((Plan *) linitial(scan->custom_plans),
 								estate, eflags);
 	state->css.custom_ps = list_make1(state->child);
@@ -1584,25 +1644,6 @@ pglc_sql_source_visibility(TransactionId source_xmin,
 }
 
 static TupleTableSlot *
-pglc_sql_form_scan_tuple(PgLocalCacheSqlScanState *state,
-						 Datum key, Datum value, bool value_isnull)
-{
-	TupleTableSlot *slot = state->css.ss.ss_ScanTupleSlot;
-	int			natts = slot->tts_tupleDescriptor->natts;
-
-	ExecClearTuple(slot);
-	MemSet(slot->tts_values, 0, sizeof(Datum) * natts);
-	MemSet(slot->tts_isnull, true, sizeof(bool) * natts);
-	slot->tts_values[state->key_attnos[0] - 1] = key;
-	slot->tts_isnull[state->key_attnos[0] - 1] = false;
-	slot->tts_values[state->value_attno - 1] = value;
-	slot->tts_isnull[state->value_attno - 1] = value_isnull;
-	slot->tts_tableOid = state->mapping.relation_oid;
-	ExecStoreVirtualTuple(slot);
-	return slot;
-}
-
-static TupleTableSlot *
 pglc_sql_form_row_tuple(PgLocalCacheSqlScanState *state, Datum row)
 {
 	TupleTableSlot *slot = state->css.ss.ss_ScanTupleSlot;
@@ -1617,8 +1658,7 @@ static bool
 pglc_sql_maybe_store(PgLocalCacheSqlScanState *state,
 					 const char *canonical_key,
 					 const PgLocalCacheReadToken *token,
-					 uint64 load_id, TupleTableSlot *child_slot,
-					 Datum value, bool value_isnull)
+					 uint64 load_id, TupleTableSlot *child_slot)
 {
 	Datum		ctid_datum;
 	Datum		xmin_datum;
@@ -1627,13 +1667,10 @@ pglc_sql_maybe_store(PgLocalCacheSqlScanState *state,
 	volatile Snapshot latest_snapshot = NULL;
 	volatile bool validated = false;
 	bool		isnull;
-	char	   *serialized;
 	char		row_payload[PGLC_VALUE_MAX];
 	Size		serialized_len;
-	MemoryContext old_context;
 
-	if (load_id == 0 || (!state->whole_row && value_isnull) ||
-		!pglc_sql_can_use_cache(state))
+	if (load_id == 0 || !pglc_sql_can_use_cache(state))
 		return false;
 	ctid_datum = slot_getattr(child_slot, state->child_ctid_resno, &isnull);
 	if (isnull)
@@ -1681,33 +1718,18 @@ pglc_sql_maybe_store(PgLocalCacheSqlScanState *state,
 	if (!validated)
 		return false;
 
-	if (state->whole_row)
-	{
-		if (!pglc_row_payload_encode(
-				state->latest_slot,
-				RelationGetDescr(state->css.ss.ss_currentRelation), 0,
-				row_payload, sizeof(row_payload), &serialized_len))
-			return false;
-		serialized = row_payload;
-	}
-	else
-	{
-		old_context = MemoryContextSwitchTo(
-			state->css.ss.ps.ps_ExprContext->ecxt_per_tuple_memory);
-		serialized = OutputFunctionCall(&state->value_output, value);
-		MemoryContextSwitchTo(old_context);
-		serialized_len = strlen(serialized);
-		if (serialized_len > PGLC_VALUE_MAX)
-			return false;
-	}
+	if (!pglc_row_payload_encode(
+			state->latest_slot,
+			RelationGetDescr(state->css.ss.ss_currentRelation), 0,
+			row_payload, sizeof(row_payload), &serialized_len))
+		return false;
 	return pglc_cache_store(&state->mapping, canonical_key, token,
-						serialized, serialized_len, false, load_id,
+						row_payload, serialized_len, false, load_id,
 						source_xmin);
 }
 
 static TupleTableSlot *
-pglc_sql_run_child(PgLocalCacheSqlScanState *state, Datum *keys,
-				   const char *canonical_key,
+pglc_sql_run_child(PgLocalCacheSqlScanState *state, const char *canonical_key,
 				   const PgLocalCacheReadToken *token, uint64 load_id)
 {
 	volatile TupleTableSlot *result = NULL;
@@ -1723,18 +1745,12 @@ pglc_sql_run_child(PgLocalCacheSqlScanState *state, Datum *keys,
 		{
 			payload = slot_getattr(child_slot, state->child_payload_resno,
 								   &payload_isnull);
-			if (load_id != 0 &&
+			if (load_id != 0 && !payload_isnull &&
 				pglc_sql_maybe_store(state, canonical_key, token, load_id,
-								 child_slot, payload, payload_isnull))
+								 child_slot))
 				pg_atomic_fetch_add_u64(&pglc_shared->sql_cache_fills, 1);
-			if (state->whole_row)
-			{
-				if (!payload_isnull)
-					result = pglc_sql_form_row_tuple(state, payload);
-			}
-			else
-				result = pglc_sql_form_scan_tuple(state, keys[0], payload,
-										  payload_isnull);
+			if (!payload_isnull)
+				result = pglc_sql_form_row_tuple(state, payload);
 		}
 		if (load_id != 0)
 			pglc_cache_release_load(&state->mapping, canonical_key, token,
@@ -1790,19 +1806,20 @@ pglc_sql_access(ScanState *scan_state)
 	{
 		state->bypasses++;
 		pg_atomic_fetch_add_u64(&pglc_shared->sql_cache_bypasses, 1);
-		return pglc_sql_run_child(state, keys, NULL, NULL, 0);
+		return pglc_sql_run_child(state, NULL, NULL, 0);
 	}
 
 	old_context = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
-	hit = pglc_canonical_key(keys, key_nulls, state->key_count,
-							 state->key_outputs, canonical_key,
-							 sizeof(canonical_key), &canonical_key_len);
+	hit = pglc_canonical_key_typed(keys, key_nulls, state->key_count,
+								   state->key_types, state->key_outputs,
+								   canonical_key, sizeof(canonical_key),
+								   &canonical_key_len);
 	MemoryContextSwitchTo(old_context);
 	if (!hit || canonical_key_len == 0)
 	{
 		state->bypasses++;
 		pg_atomic_fetch_add_u64(&pglc_shared->sql_cache_bypasses, 1);
-		return pglc_sql_run_child(state, keys, NULL, NULL, 0);
+		return pglc_sql_run_child(state, NULL, NULL, 0);
 	}
 
 	for (lookup_attempt = 0; lookup_attempt < 2; lookup_attempt++)
@@ -1818,40 +1835,23 @@ pglc_sql_access(ScanState *scan_state)
 			state->css.ss.ps.state->es_snapshot);
 		if (visibility == PGLC_SOURCE_VISIBLE)
 		{
-			if (state->whole_row)
-			{
-				PgLocalCacheRowPayloadView view;
+			PgLocalCacheRowPayloadView view;
 
-				if (pglc_row_payload_decode(
-						cached, cached_len,
-						RelationGetDescr(state->css.ss.ss_currentRelation),
-						econtext->ecxt_per_tuple_memory, &view))
-				{
-					state->hits++;
-					pg_atomic_fetch_add_u64(&pglc_shared->sql_cache_hits, 1);
-					return pglc_sql_form_row_tuple(state, view.composite);
-				}
-				/* Corruption or stale row shape is never exposed to SQL. */
-			}
-			else
+			if (pglc_row_payload_decode(
+					cached, cached_len,
+					RelationGetDescr(state->css.ss.ss_currentRelation),
+					state->row_fingerprint,
+					econtext->ecxt_per_tuple_memory, &view))
 			{
-				Datum		value;
-
-				cached[cached_len] = '\0';
-				old_context = MemoryContextSwitchTo(
-					econtext->ecxt_per_tuple_memory);
-				value = InputFunctionCall(&state->value_input, cached,
-										  state->value_ioparam,
-										  state->mapping.value_typmod);
-				MemoryContextSwitchTo(old_context);
 				state->hits++;
 				pg_atomic_fetch_add_u64(&pglc_shared->sql_cache_hits, 1);
-				return pglc_sql_form_scan_tuple(state, keys[0], value, false);
+				return pglc_sql_form_row_tuple(state, view.composite);
 			}
+			/* Corruption or stale row shape is never exposed to SQL. */
 		}
 		if (lookup_attempt != 0 ||
 			(visibility != PGLC_SOURCE_AGE_EXPIRED &&
-			 !(state->whole_row && visibility == PGLC_SOURCE_VISIBLE)))
+			 visibility != PGLC_SOURCE_VISIBLE))
 			break;
 
 		/* Retire only the exact over-age or malformed positive just observed. */
@@ -1865,7 +1865,7 @@ pglc_sql_access(ScanState *scan_state)
 	if (!hit && pglc_cache_claim_load(&state->mapping, canonical_key,
 										&token, &load_id) != PGLC_LOAD_OWNER)
 		load_id = 0;
-	return pglc_sql_run_child(state, keys, canonical_key, &token, load_id);
+	return pglc_sql_run_child(state, canonical_key, &token, load_id);
 }
 
 static bool
@@ -1939,6 +1939,7 @@ pglc_sql_init(void)
 	if (!process_shared_preload_libraries_in_progress)
 		return;
 	RegisterCustomScanMethods(&pglc_sql_scan_methods);
+	CacheRegisterRelcacheCallback(pglc_sql_relcache_invalidation, (Datum) 0);
 	previous_planner_hook = planner_hook;
 	planner_hook = pglc_sql_planner;
 	previous_set_rel_pathlist_hook = set_rel_pathlist_hook;

@@ -41,27 +41,11 @@ umask 077
 mkdir -p -- "$output_directory"
 output_directory="$(cd -- "$output_directory" && pwd -P)"
 rm -f -- \
-    "${output_directory}/comparison.json" \
-    "${output_directory}/comparison.md" \
-    "${output_directory}/failure.json" \
-    "${output_directory}/failure.md" \
     "${output_directory}/process-failure.txt" \
-    "${output_directory}/scenarios.json" \
-    "${output_directory}/scenarios.md" \
-    "${output_directory}/scenarios-failure.json" \
-    "${output_directory}/scenarios-failure.md" \
     "${output_directory}/whole-row.json" \
     "${output_directory}/whole-row.md" \
     "${output_directory}/whole-row-failure.json" \
     "${output_directory}/whole-row-failure.md" \
-    "${output_directory}/.comparison.json.tmp" \
-    "${output_directory}/.comparison.md.tmp" \
-    "${output_directory}/.failure.json.tmp" \
-    "${output_directory}/.failure.md.tmp" \
-    "${output_directory}/.scenarios.json.tmp" \
-    "${output_directory}/.scenarios.md.tmp" \
-    "${output_directory}/.scenarios-failure.json.tmp" \
-    "${output_directory}/.scenarios-failure.md.tmp" \
     "${output_directory}/.whole-row.json.tmp" \
     "${output_directory}/.whole-row.md.tmp" \
     "${output_directory}/.whole-row-failure.json.tmp" \
@@ -117,16 +101,12 @@ export PGLC_BENCH_PG_LOCAL_CACHE_IMAGE_IDENTITY="$(
 )"
 export PGLC_BENCH_RUNNER_IMAGE_IDENTITY="$(image_identity "$runner_image")"
 
-read -r PGLC_BENCH_HARNESS_SHA256 _ < <(
-    openssl dgst -sha256 -r "${script_directory}/compare.py"
-)
-export PGLC_BENCH_HARNESS_SHA256
-read -r PGLC_BENCH_SCENARIO_HARNESS_SHA256 _ < <(
-    openssl dgst -sha256 -r "${script_directory}/scenarios.py"
-)
-export PGLC_BENCH_SCENARIO_HARNESS_SHA256
 read -r PGLC_BENCH_WHOLE_ROW_HARNESS_SHA256 _ < <(
-    openssl dgst -sha256 -r "${script_directory}/whole_row.py"
+    {
+        openssl dgst -sha256 -r "${script_directory}/compare.py"
+        openssl dgst -sha256 -r "${script_directory}/scenarios.py"
+        openssl dgst -sha256 -r "${script_directory}/whole_row.py"
+    } | openssl dgst -sha256 -r
 )
 export PGLC_BENCH_WHOLE_ROW_HARNESS_SHA256
 PGLC_BENCH_SOURCE_REVISION="unknown"
@@ -143,36 +123,16 @@ export PGLC_BENCH_SOURCE_REVISION
 
 "${compose[@]}" up --detach --wait \
     pg-local-cache postgres-plain valkey redis
-benchmark_status=0
-"${compose[@]}" run --rm benchmark || benchmark_status="$?"
-if ((benchmark_status != 0)) && \
-    [[ ! -f "${output_directory}/comparison.json" ]] && \
-    [[ ! -f "${output_directory}/failure.json" ]]; then
-    printf 'benchmark process exited with status %s before writing a report\n' \
-        "$benchmark_status" > "${output_directory}/process-failure.txt"
-fi
-
-scenario_status=0
-if [[ "${PGLC_BENCH_RUN_SCENARIOS:-1}" != "0" ]]; then
-    "${compose[@]}" run --rm \
-        --entrypoint python3 \
-        benchmark \
-        /usr/local/lib/pg_local_cache/scenarios.py || scenario_status="$?"
-fi
-
 whole_row_status=0
-if [[ "${PGLC_BENCH_RUN_WHOLE_ROW:-1}" != "0" ]]; then
-    "${compose[@]}" run --rm \
-        --entrypoint python3 \
-        benchmark \
-        /usr/local/lib/pg_local_cache/whole_row.py || whole_row_status="$?"
-fi
-
-if ((benchmark_status != 0)); then
-    exit "$benchmark_status"
-fi
-if ((scenario_status != 0)); then
-    exit "$scenario_status"
+"${compose[@]}" run --rm \
+    --entrypoint python3 \
+    benchmark \
+    /usr/local/lib/pg_local_cache/whole_row.py || whole_row_status="$?"
+if ((whole_row_status != 0)) && \
+    [[ ! -f "${output_directory}/whole-row.json" ]] && \
+    [[ ! -f "${output_directory}/whole-row-failure.json" ]]; then
+    printf 'benchmark process exited with status %s before writing a report\n' \
+        "$whole_row_status" > "${output_directory}/process-failure.txt"
 fi
 if ((whole_row_status != 0)); then
     exit "$whole_row_status"

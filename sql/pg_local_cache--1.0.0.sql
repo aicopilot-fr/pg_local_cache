@@ -8,7 +8,6 @@ CREATE TABLE mapping (
     ),
     relation regclass NOT NULL UNIQUE,
     key_columns name[] NOT NULL,
-    value_column name,
     writable boolean NOT NULL DEFAULT false,
     CONSTRAINT mapping_key_columns_shape CHECK (
         pg_catalog.array_ndims(key_columns) = 1
@@ -76,6 +75,13 @@ SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $function$
 BEGIN
+    /* Collected GRANT/REVOKE commands lack dependable object addresses.
+     * ACL drift can invalidate a worker mapping. */
+    IF TG_TAG IN ('GRANT', 'REVOKE') THEN
+        PERFORM local_cache._reload();
+        RETURN;
+    END IF;
+
     IF EXISTS (
         SELECT 1
           FROM pg_catalog.pg_event_trigger_ddl_commands() AS d
@@ -506,7 +512,6 @@ CREATE FUNCTION _mapping_result(
     p_namespace text,
     p_relation regclass,
     p_key_columns name[],
-    p_value_column name,
     p_writable boolean
 )
 RETURNS jsonb
@@ -545,38 +550,24 @@ BEGIN
     /* KVik wire names are literal components, not SQL identifiers. */
     v_wire_relation := pg_catalog.current_database() || '.' ||
         v_schema_name || '.' || v_relation_name;
-    IF p_value_column IS NULL THEN
-        v_key_template := 'CRUD:' || v_wire_relation || ':' || v_key_object;
-    ELSE
-        /* Scalar mappings use namespace:key, independent of SQL names. */
-        v_key_template := pg_catalog.format(
-            '%s:<%s>', p_namespace, p_key_columns[1]
-        );
-    END IF;
+    v_key_template := 'CRUD:' || v_wire_relation || ':' || v_key_object;
 
     RETURN pg_catalog.jsonb_build_object(
         'relation', v_qualified_relation,
         'namespace', p_namespace,
         'primary_key_columns', pg_catalog.to_jsonb(p_key_columns),
-        'whole_row', p_value_column IS NULL,
-        'value_column', p_value_column,
+        'whole_row', true,
         'writable', p_writable,
         'worker_role', pg_catalog.current_setting('pg_local_cache.role', true),
         'templates', pg_catalog.jsonb_build_object(
             'key', v_key_template,
             'get', 'GET ' || v_key_template,
             'set', CASE WHEN p_writable THEN
-                'SET ' || v_key_template || CASE
-                    WHEN p_value_column IS NULL THEN ' <row-json>'
-                    ELSE ' <value>'
-                END
+                'SET ' || v_key_template || ' <row-json>'
                 ELSE NULL
             END,
             'del', CASE WHEN p_writable THEN 'DEL ' || v_key_template ELSE NULL END,
-            'invalidate', CASE WHEN p_value_column IS NULL THEN
-                'INVALIDATE CRUD:' || v_wire_relation
-                ELSE 'INVALIDATE ' || p_namespace
-            END,
+            'invalidate', 'INVALIDATE CRUD:' || v_wire_relation,
             'invalidate_key', 'INVALIDATE ' || v_key_template,
             'invalidate_database', 'INVALIDATE CRUD:' ||
                 pg_catalog.current_database(),
@@ -737,7 +728,6 @@ CREATE FUNCTION _register_mapping(
     p_namespace text,
     p_relation regclass,
     p_key_columns name[],
-    p_value_column name,
     p_writable boolean
 )
 RETURNS void
@@ -764,10 +754,6 @@ DECLARE
     v_key_type oid;
     v_key_collation oid;
     v_key_not_null boolean;
-    v_value_type oid;
-    v_value_not_null boolean;
-    v_value_generated "char";
-    v_value_identity "char";
     v_worker_role text;
     v_worker_role_oid oid;
     v_configured_database text;
@@ -857,9 +843,8 @@ BEGIN
             USING HINT =
                 'Attach a permanent application table in a dedicated application schema.';
     END IF;
-    IF p_value_column IS NULL AND (
-       pg_catalog.current_database() ~ '[.:]' OR
-       v_schema_name::text ~ '[.:]' OR v_relation_name::text ~ '[.:]') THEN
+    IF pg_catalog.current_database() ~ '[.:]' OR
+       v_schema_name::text ~ '[.:]' OR v_relation_name::text ~ '[.:]' THEN
         RAISE EXCEPTION
             'KVik wire names cannot contain dot or colon: %.%',
             v_schema_name, v_relation_name
@@ -919,11 +904,6 @@ BEGIN
     END IF;
     IF v_primary_key_count NOT BETWEEN 1 AND 16 THEN
         RAISE EXCEPTION 'table % primary key has % columns; maximum is 16',
-            p_relation, v_primary_key_count;
-    END IF;
-    IF p_value_column IS NOT NULL AND v_primary_key_count <> 1 THEN
-        RAISE EXCEPTION
-            'scalar mappings require a single-column primary key; table % has % columns',
             p_relation, v_primary_key_count;
     END IF;
     IF NOT v_primary_key_valid OR
@@ -1041,40 +1021,7 @@ BEGIN
         END IF;
     END LOOP;
 
-    IF p_value_column IS NOT NULL THEN
-        IF p_value_column = ANY (p_key_columns) THEN
-            RAISE EXCEPTION 'value column must differ from primary-key columns';
-        END IF;
-        SELECT a.atttypid, a.attnotnull, a.attgenerated, a.attidentity
-          INTO v_value_type, v_value_not_null,
-               v_value_generated, v_value_identity
-          FROM pg_catalog.pg_attribute AS a
-         WHERE a.attrelid = p_relation
-           AND a.attname = p_value_column
-           AND a.attnum > 0
-           AND NOT a.attisdropped;
-        IF NOT FOUND THEN
-            RAISE EXCEPTION 'value column % does not exist on %',
-                p_value_column, p_relation;
-        END IF;
-        IF NOT v_value_not_null THEN
-            RAISE EXCEPTION 'scalar value column %.% must be NOT NULL',
-                p_relation, p_value_column;
-        END IF;
-        IF v_value_type NOT IN (
-            'int2'::regtype, 'int4'::regtype, 'int8'::regtype,
-            'numeric'::regtype, 'bool'::regtype,
-            'text'::regtype, 'varchar'::regtype, 'bpchar'::regtype,
-            'uuid'::regtype, 'json'::regtype, 'jsonb'::regtype
-        ) THEN
-            RAISE EXCEPTION 'unsupported scalar value type %',
-                v_value_type::regtype
-                USING HINT =
-                    'Use a built-in scalar value type documented by pg_local_cache.';
-        END IF;
-    END IF;
-
-    IF p_writable AND p_value_column IS NULL AND EXISTS (
+    IF p_writable AND EXISTS (
         SELECT 1
           FROM pg_catalog.pg_attribute AS a
          WHERE a.attrelid = p_relation
@@ -1088,37 +1035,6 @@ BEGIN
             USING HINT =
                 'Use a read-only mapping or a non-generated primary key; identity columns are supported.';
     END IF;
-    IF p_writable AND p_value_column IS NOT NULL AND (
-        v_value_generated <> '' OR v_value_identity <> '' OR EXISTS (
-            SELECT 1
-              FROM pg_catalog.pg_attribute AS a
-             WHERE a.attrelid = p_relation
-               AND a.attname = ANY (p_key_columns)
-               AND (a.attgenerated <> '' OR a.attidentity <> '')
-        )
-    ) THEN
-        RAISE EXCEPTION
-            'writable scalar mappings do not support generated or identity key/value columns';
-    END IF;
-    IF p_writable AND p_value_column IS NOT NULL AND EXISTS (
-        SELECT 1
-          FROM pg_catalog.pg_attribute AS a
-         WHERE a.attrelid = p_relation
-           AND a.attnum > 0
-           AND NOT a.attisdropped
-           AND a.attname <> ALL (p_key_columns)
-           AND a.attname <> p_value_column
-           AND a.attnotnull
-           AND NOT a.atthasdef
-           AND a.attgenerated = ''
-           AND a.attidentity = ''
-    ) THEN
-        RAISE EXCEPTION
-            'writable scalar mapping has another NOT NULL column without a default'
-            USING HINT =
-                'SET supplies only the configured primary key and value column.';
-    END IF;
-
     v_worker_role := pg_catalog.current_setting('pg_local_cache.role', true);
     IF v_worker_role IS NULL OR v_worker_role = '' THEN
         RAISE EXCEPTION 'pg_local_cache.role is not configured'
@@ -1172,7 +1088,7 @@ BEGIN
             'configured pg_local_cache worker role % must not own mapped table %',
             v_worker_role, p_relation
             USING HINT =
-                'Use a separate owner/deploy role and grant only the privileges managed by attach_table() or attach_value().';
+                'Use a separate owner/deploy role and grant only the privileges managed by attach_table().';
     END IF;
 
     LOCK TABLE local_cache.mapping IN EXCLUSIVE MODE;
@@ -1291,15 +1207,14 @@ BEGIN
     END IF;
 
     INSERT INTO local_cache.mapping(
-        namespace, relation, key_columns, value_column, writable
+        namespace, relation, key_columns, writable
     )
     VALUES (
-        p_namespace, p_relation, p_key_columns, p_value_column, p_writable
+        p_namespace, p_relation, p_key_columns, p_writable
     )
     ON CONFLICT (namespace) DO UPDATE SET
         relation = EXCLUDED.relation,
         key_columns = EXCLUDED.key_columns,
-        value_column = EXCLUDED.value_column,
         writable = EXCLUDED.writable;
 
     IF NOT EXISTS (
@@ -1502,114 +1417,6 @@ BEGIN
 END;
 $function$;
 
-CREATE FUNCTION unregister_mapping(p_namespace text)
-RETURNS void
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, pg_temp
-AS $function$
-DECLARE
-    v_relation oid;
-    v_relation_locked boolean;
-    v_worker_role text;
-    v_worker_role_oid oid;
-    v_worker_has_direct_acl boolean;
-BEGIN
-    IF p_namespace IS NULL THEN
-        RAISE EXCEPTION 'pg_local_cache namespace must not be NULL';
-    END IF;
-    SELECT m.relation::oid
-      INTO v_relation
-      FROM local_cache.mapping AS m
-     WHERE m.namespace = p_namespace;
-    IF NOT FOUND THEN
-        RETURN;
-    END IF;
-
-    v_relation_locked := local_cache._lock_relation(v_relation);
-    LOCK TABLE local_cache.mapping IN EXCLUSIVE MODE;
-    PERFORM 1
-      FROM local_cache.mapping AS m
-     WHERE m.namespace = p_namespace
-       AND m.relation::oid = v_relation;
-    IF NOT FOUND THEN
-        IF EXISTS (
-            SELECT 1
-              FROM local_cache.mapping AS m
-             WHERE m.namespace = p_namespace
-        ) THEN
-            RAISE EXCEPTION
-                'pg_local_cache mapping % changed concurrently; retry the transaction',
-                p_namespace
-                USING ERRCODE = '40001';
-        END IF;
-        RETURN;
-    END IF;
-    DELETE FROM local_cache.mapping
-     WHERE namespace = p_namespace
-       AND relation::oid = v_relation
-     RETURNING relation::oid INTO v_relation;
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION
-            'pg_local_cache mapping % disappeared while locked', p_namespace
-            USING ERRCODE = '40001';
-    END IF;
-
-    PERFORM local_cache._forget(p_namespace, v_relation);
-    IF v_relation_locked THEN
-        PERFORM local_cache._drop_owned_triggers(v_relation);
-        v_worker_role := pg_catalog.current_setting(
-            'pg_local_cache.role', true
-        );
-        SELECT r.oid
-          INTO v_worker_role_oid
-          FROM pg_catalog.pg_roles AS r
-         WHERE r.rolname = v_worker_role;
-        IF FOUND THEN
-            SELECT EXISTS (
-                SELECT 1
-                  FROM pg_catalog.pg_class AS c
-                  CROSS JOIN LATERAL pg_catalog.aclexplode(
-                      COALESCE(
-                          c.relacl,
-                          ARRAY[]::pg_catalog.aclitem[]
-                      )
-                  ) AS acl
-                 WHERE c.oid = v_relation
-                   AND acl.grantee = v_worker_role_oid
-            ) INTO v_worker_has_direct_acl;
-            IF v_worker_has_direct_acl THEN
-                EXECUTE pg_catalog.format(
-                    'REVOKE ALL PRIVILEGES ON TABLE %s FROM %I',
-                    v_relation::pg_catalog.regclass, v_worker_role
-                );
-                IF EXISTS (
-                    SELECT 1
-                      FROM pg_catalog.pg_class AS c
-                      CROSS JOIN LATERAL pg_catalog.aclexplode(
-                          COALESCE(
-                              c.relacl,
-                              ARRAY[]::pg_catalog.aclitem[]
-                          )
-                      ) AS acl
-                     WHERE c.oid = v_relation
-                       AND acl.grantee = v_worker_role_oid
-                ) THEN
-                    RAISE EXCEPTION
-                        'could not revoke worker privileges from relation OID %',
-                        v_relation
-                        USING ERRCODE = '40001',
-                              HINT =
-                                  'Retry after concurrent schema DDL finishes.';
-                END IF;
-            END IF;
-        END IF;
-    END IF;
-    PERFORM local_cache._reload();
-END;
-$function$;
-
 CREATE FUNCTION detach_table(p_relation regclass)
 RETURNS boolean
 LANGUAGE plpgsql
@@ -1618,6 +1425,9 @@ SET search_path = pg_catalog, pg_temp
 AS $function$
 DECLARE
     v_namespace text;
+    v_worker_role text;
+    v_worker_role_oid oid;
+    v_worker_has_direct_acl boolean;
 BEGIN
     IF p_relation IS NULL THEN
         RAISE EXCEPTION 'pg_local_cache relation must not be NULL';
@@ -1627,17 +1437,54 @@ BEGIN
             p_relation::oid
             USING ERRCODE = '42P01';
     END IF;
-    /* Keep the relation-to-namespace lookup stable until the mapping and its
-     * triggers are removed by unregister_mapping(). */
     LOCK TABLE local_cache.mapping IN EXCLUSIVE MODE;
-    SELECT m.namespace
-      INTO v_namespace
-      FROM local_cache.mapping AS m
-     WHERE m.relation = p_relation;
+    DELETE FROM local_cache.mapping AS m
+     WHERE m.relation = p_relation
+     RETURNING m.namespace INTO v_namespace;
     IF NOT FOUND THEN
         RETURN false;
     END IF;
-    PERFORM local_cache.unregister_mapping(v_namespace);
+
+    PERFORM local_cache._forget(v_namespace, p_relation::oid);
+    PERFORM local_cache._drop_owned_triggers(p_relation::oid);
+    v_worker_role := pg_catalog.current_setting('pg_local_cache.role', true);
+    SELECT r.oid
+      INTO v_worker_role_oid
+      FROM pg_catalog.pg_roles AS r
+     WHERE r.rolname = v_worker_role;
+    IF FOUND THEN
+        SELECT EXISTS (
+            SELECT 1
+              FROM pg_catalog.pg_class AS c
+              CROSS JOIN LATERAL pg_catalog.aclexplode(
+                  COALESCE(c.relacl, ARRAY[]::pg_catalog.aclitem[])
+              ) AS acl
+             WHERE c.oid = p_relation
+               AND acl.grantee = v_worker_role_oid
+        ) INTO v_worker_has_direct_acl;
+        IF v_worker_has_direct_acl THEN
+            EXECUTE pg_catalog.format(
+                'REVOKE ALL PRIVILEGES ON TABLE %s FROM %I',
+                p_relation, v_worker_role
+            );
+            IF EXISTS (
+                SELECT 1
+                  FROM pg_catalog.pg_class AS c
+                  CROSS JOIN LATERAL pg_catalog.aclexplode(
+                      COALESCE(c.relacl, ARRAY[]::pg_catalog.aclitem[])
+                  ) AS acl
+                 WHERE c.oid = p_relation
+                   AND acl.grantee = v_worker_role_oid
+            ) THEN
+                RAISE EXCEPTION
+                    'could not revoke worker privileges from relation OID %',
+                    p_relation::oid
+                    USING ERRCODE = '40001',
+                          HINT = 'Retry after concurrent schema DDL finishes.';
+            END IF;
+        END IF;
+    END IF;
+    PERFORM local_cache._reload();
     RETURN true;
 END;
 $function$;
@@ -1673,60 +1520,10 @@ BEGIN
     END IF;
     v_namespace := COALESCE(p_namespace, local_cache._default_namespace(p_relation));
     PERFORM local_cache._register_mapping(
-        v_namespace, p_relation, v_key_columns, NULL::name, p_writable
+        v_namespace, p_relation, v_key_columns, p_writable
     );
     RETURN local_cache._mapping_result(
-        v_namespace, p_relation, v_key_columns, NULL::name, p_writable
-    );
-END;
-$function$;
-
-CREATE FUNCTION attach_value(
-    p_relation regclass,
-    p_value_column name,
-    p_namespace text DEFAULT NULL,
-    p_writable boolean DEFAULT false
-)
-RETURNS jsonb
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, pg_temp
-AS $function$
-DECLARE
-    v_key_columns name[];
-    v_namespace text;
-BEGIN
-    IF p_relation IS NULL THEN
-        RAISE EXCEPTION 'pg_local_cache relation must not be NULL';
-    END IF;
-    IF p_value_column IS NULL THEN
-        RAISE EXCEPTION 'pg_local_cache scalar value column must not be NULL';
-    END IF;
-    IF NOT local_cache._lock_relation(p_relation::oid) THEN
-        RAISE EXCEPTION 'pg_local_cache relation no longer exists: %',
-            p_relation::oid
-            USING ERRCODE = '42P01';
-    END IF;
-    PERFORM local_cache._validate_attach_relation(p_relation);
-    v_key_columns := local_cache._primary_key_columns(p_relation);
-    IF v_key_columns IS NULL THEN
-        RAISE EXCEPTION 'table % has no primary key', p_relation;
-    END IF;
-    IF pg_catalog.cardinality(v_key_columns) <> 1 THEN
-        RAISE EXCEPTION
-            'scalar mappings require a single-column primary key; table % has % columns',
-            p_relation, pg_catalog.cardinality(v_key_columns)
-            USING HINT =
-                'Use attach_table() to cache a whole row with a composite primary key.';
-    END IF;
-    v_namespace := COALESCE(p_namespace, local_cache._default_namespace(p_relation));
-    PERFORM local_cache._register_mapping(
-        v_namespace, p_relation, ARRAY[v_key_columns[1]]::name[],
-        p_value_column, p_writable
-    );
-    RETURN local_cache._mapping_result(
-        v_namespace, p_relation, v_key_columns,
-        p_value_column, p_writable
+        v_namespace, p_relation, v_key_columns, p_writable
     );
 END;
 $function$;
@@ -1740,7 +1537,6 @@ AS $function$
 DECLARE
     v_namespace text;
     v_key_columns name[];
-    v_value_column name;
     v_writable boolean;
 BEGIN
     IF p_relation IS NULL THEN
@@ -1752,21 +1548,21 @@ BEGIN
             USING ERRCODE = '42P01';
     END IF;
     LOCK TABLE local_cache.mapping IN EXCLUSIVE MODE;
-    SELECT m.namespace, m.key_columns, m.value_column, m.writable
-      INTO v_namespace, v_key_columns, v_value_column, v_writable
+    SELECT m.namespace, m.key_columns, m.writable
+      INTO v_namespace, v_key_columns, v_writable
       FROM local_cache.mapping AS m
      WHERE m.relation = p_relation;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'table % is not attached to pg_local_cache', p_relation
             USING HINT =
-                'Use attach_table() or attach_value() to create a mapping.';
+                'Use attach_table() to create a mapping.';
     END IF;
 
     PERFORM local_cache._register_mapping(
-        v_namespace, p_relation, v_key_columns, v_value_column, v_writable
+        v_namespace, p_relation, v_key_columns, v_writable
     );
     RETURN local_cache._mapping_result(
-        v_namespace, p_relation, v_key_columns, v_value_column, v_writable
+        v_namespace, p_relation, v_key_columns, v_writable
     );
 END;
 $function$;
@@ -1816,8 +1612,7 @@ BEGIN
     END IF;
 
     FOR v_mapping IN
-        SELECT m.namespace, m.relation, m.key_columns,
-               m.value_column, m.writable
+        SELECT m.namespace, m.relation, m.key_columns, m.writable
           FROM local_cache.mapping AS m
          ORDER BY m.relation::oid
     LOOP
@@ -1825,7 +1620,6 @@ BEGIN
             v_mapping.namespace,
             v_mapping.relation,
             v_mapping.key_columns,
-            v_mapping.value_column,
             v_mapping.writable
         );
         v_count := v_count + 1;
@@ -1837,16 +1631,14 @@ $function$;
 REVOKE ALL ON FUNCTION _validate_attach_relation(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION _primary_key_columns(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION _default_namespace(regclass) FROM PUBLIC;
-REVOKE ALL ON FUNCTION _mapping_result(text, regclass, name[], name, boolean)
+REVOKE ALL ON FUNCTION _mapping_result(text, regclass, name[], boolean)
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION _prepare_trigger_slots(oid, text, name[]) FROM PUBLIC;
-REVOKE ALL ON FUNCTION _register_mapping(text, regclass, name[], name, boolean)
+REVOKE ALL ON FUNCTION _register_mapping(text, regclass, name[], boolean)
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION _drop_owned_triggers(oid) FROM PUBLIC;
-REVOKE ALL ON FUNCTION unregister_mapping(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION detach_table(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION attach_table(regclass, boolean, text) FROM PUBLIC;
-REVOKE ALL ON FUNCTION attach_value(regclass, name, text, boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION reconcile_table(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION reconcile_all() FROM PUBLIC;
 REVOKE ALL ON FUNCTION _statement_guard() FROM PUBLIC;

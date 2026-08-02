@@ -7,6 +7,7 @@
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type_d.h"
 #include "commands/trigger.h"
+#include "common/hashfn.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
@@ -114,6 +115,9 @@ static void pglc_collect_forget_relation(Oid database_oid, Oid relation_oid,
 static void pglc_collect_global(bool bump_config);
 static bool pglc_mapping_exists(const char *nspace);
 static uint64 pglc_workers_without_current_mappings(void);
+static uint32 pglc_cache_key_hash(const void *key, Size keysize);
+static int pglc_cache_key_match(const void *left, const void *right,
+								Size keysize);
 
 static void
 pglc_define_gucs(void)
@@ -534,11 +538,13 @@ pglc_shmem_startup(void)
 	memset(&control, 0, sizeof(control));
 	control.keysize = sizeof(PgLocalCacheCacheKey);
 	control.entrysize = sizeof(PgLocalCacheCacheEntry);
+	control.hash = pglc_cache_key_hash;
+	control.match = pglc_cache_key_match;
 	pglc_cache_hash = ShmemInitHash("pg_local_cache cache",
 								   pglc_cache_entries,
 								   pglc_cache_entries,
 								   &control,
-								   HASH_ELEM | HASH_BLOBS);
+								   HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
 
 	memset(&control, 0, sizeof(control));
 	control.keysize = sizeof(PgLocalCacheRelationKey);
@@ -569,11 +575,59 @@ pglc_config_generation(void)
 	return pg_atomic_read_u64(&pglc_shared->config_generation);
 }
 
+/*
+ * Cache keys reserve room for the largest supported namespace and encoded
+ * primary key.  Hashing the entire fixed-size struct would process more than
+ * a kilobyte for every lookup even when the key itself is only a few bytes.
+ * Hash and compare only the initialized fields; dynahash still verifies the
+ * complete logical key, so hash collisions cannot alias entries.
+ */
+static uint32
+pglc_cache_key_hash(const void *key, Size keysize)
+{
+	const PgLocalCacheCacheKey *cache_key =
+		(const PgLocalCacheCacheKey *) key;
+	Size		namespace_len;
+	Size		key_len;
+	uint64		hash;
+
+	namespace_len = strnlen(cache_key->nspace, sizeof(cache_key->nspace));
+	key_len = strnlen(cache_key->key, sizeof(cache_key->key));
+	hash = hash_bytes_extended((const unsigned char *) &cache_key->database_oid,
+								 sizeof(cache_key->database_oid), 0);
+	hash = hash_bytes_extended((const unsigned char *) cache_key->nspace,
+								 namespace_len, hash);
+	hash = hash_bytes_extended((const unsigned char *) cache_key->key,
+								 key_len, hash);
+	(void) keysize;
+	return (uint32) (hash ^ (hash >> 32));
+}
+
+static int
+pglc_cache_key_match(const void *left, const void *right, Size keysize)
+{
+	const PgLocalCacheCacheKey *left_key =
+		(const PgLocalCacheCacheKey *) left;
+	const PgLocalCacheCacheKey *right_key =
+		(const PgLocalCacheCacheKey *) right;
+
+	(void) keysize;
+	if (left_key->database_oid != right_key->database_oid)
+		return 1;
+	if (strncmp(left_key->nspace, right_key->nspace,
+				 sizeof(left_key->nspace)) != 0)
+		return 1;
+	return strncmp(left_key->key, right_key->key,
+				   sizeof(left_key->key));
+}
+
 static void
 make_cache_key(PgLocalCacheCacheKey *result, Oid database_oid,
-			   const char *nspace, const char *key)
+				   const char *nspace, const char *key, bool initialize_padding)
 {
-	memset(result, 0, sizeof(*result));
+	/* New shared entries must never retain uninitialized backend memory. */
+	if (initialize_padding)
+		memset(result, 0, sizeof(*result));
 	result->database_oid = database_oid;
 	strlcpy(result->nspace, nspace, sizeof(result->nspace));
 	strlcpy(result->key, key, sizeof(result->key));
@@ -796,7 +850,7 @@ get_cache_entry(Oid database_oid, Oid relation_oid,
 	PgLocalCacheCacheEntry *entry;
 	bool		found;
 
-	make_cache_key(&cache_key, database_oid, nspace, key);
+	make_cache_key(&cache_key, database_oid, nspace, key, create);
 	entry = hash_search(pglc_cache_hash, &cache_key, HASH_FIND, NULL);
 	found = entry != NULL;
 	if (entry == NULL && create)
@@ -929,9 +983,15 @@ cache_lookup_locked(const PgLocalCacheMapping *mapping,
 			*source_xmin = entry->source_xmin;
 			hit = true;
 		}
-		access_clock =
-			pg_atomic_fetch_add_u64(&pglc_shared->clock, 1) + 1;
-		pg_atomic_write_u64(&entry->last_access, access_clock);
+		/*
+		 * Eviction only runs when admitting a new entry, and admission advances
+		 * the clock.  Marking a hit with the current admission epoch gives the
+		 * entry a second chance without a globally contended fetch-add on every
+		 * lookup.
+		 */
+		access_clock = pg_atomic_read_u64(&pglc_shared->clock);
+		if (pg_atomic_read_u64(&entry->last_access) != access_clock)
+			pg_atomic_write_u64(&entry->last_access, access_clock);
 	}
 	return hit;
 }
@@ -2396,7 +2456,7 @@ pglc_stats_json(void)
 		",\"mapping_reload_attempts\":" UINT64_FORMAT
 		",\"mapping_reload_failures\":" UINT64_FORMAT
 		",\"mapping_reload_incomplete_retries\":" UINT64_FORMAT
-		/* KVik-compatible STAT names, kept alongside native counters. */
+		/* RESP STAT aliases retained for client compatibility. */
 		",\"store_memory\":%zu"
 		",\"client_connect\":" UINT64_FORMAT
 		",\"client_disconnect\":" UINT64_FORMAT

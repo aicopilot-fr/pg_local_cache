@@ -1,5 +1,6 @@
 #include "postgres.h"
 
+#include "catalog/pg_type_d.h"
 #include "utils/fmgroids.h"
 #include "utils/builtins.h"
 
@@ -24,10 +25,10 @@ pglc_key_length_digits(Size value, char *digits)
 }
 
 bool
-pglc_canonical_key(const Datum *values, const bool *nulls, int key_count,
-				   FmgrInfo *output_functions,
-					   char *destination, Size destination_capacity,
-					   Size *key_len)
+pglc_canonical_key_typed(const Datum *values, const bool *nulls, int key_count,
+					 const Oid *key_types, FmgrInfo *output_functions,
+					 char *destination, Size destination_capacity,
+					 Size *key_len)
 {
 	char		encoded[PGLC_KEY_MAX];
 	Size		used = 0;
@@ -44,16 +45,28 @@ pglc_canonical_key(const Datum *values, const bool *nulls, int key_count,
 
 	for (component = 0; component < key_count; component++)
 	{
-		char	   *rendered;
+		char		integer_buffer[64];
+		char	   *rendered = integer_buffer;
 		char		digits[3 * sizeof(Size)];
 		Size		rendered_len;
 		int			digits_len;
 		Size		part_len;
+		bool		free_rendered = false;
 
 		if (nulls[component])
 			return false;
-		rendered = OutputFunctionCall(&output_functions[component],
-									  values[component]);
+		if (key_types != NULL && key_types[component] == INT2OID)
+			pg_ltoa((int32) DatumGetInt16(values[component]), rendered);
+		else if (key_types != NULL && key_types[component] == INT4OID)
+			pg_ltoa(DatumGetInt32(values[component]), rendered);
+		else if (key_types != NULL && key_types[component] == INT8OID)
+			pg_lltoa(DatumGetInt64(values[component]), rendered);
+		else
+		{
+			rendered = OutputFunctionCall(&output_functions[component],
+										  values[component]);
+			free_rendered = true;
+		}
 		rendered_len = strlen(rendered);
 		/*
 		 * bpchar equality ignores trailing ASCII spaces, while bpcharout can
@@ -70,7 +83,8 @@ pglc_canonical_key(const Datum *values, const bool *nulls, int key_count,
 		part_len = (Size) digits_len + 1 + rendered_len + 1;
 		if (part_len >= PGLC_KEY_MAX || used >= PGLC_KEY_MAX - part_len)
 		{
-			pfree(rendered);
+			if (free_rendered)
+				pfree(rendered);
 			return false;
 		}
 
@@ -83,7 +97,8 @@ pglc_canonical_key(const Datum *values, const bool *nulls, int key_count,
 			used += rendered_len;
 		}
 		encoded[used++] = ';';
-		pfree(rendered);
+		if (free_rendered)
+			pfree(rendered);
 	}
 
 	if (used >= destination_capacity)
@@ -92,4 +107,15 @@ pglc_canonical_key(const Datum *values, const bool *nulls, int key_count,
 	destination[used] = '\0';
 	*key_len = used;
 	return true;
+}
+
+bool
+pglc_canonical_key(const Datum *values, const bool *nulls, int key_count,
+				   FmgrInfo *output_functions,
+				   char *destination, Size destination_capacity,
+				   Size *key_len)
+{
+	return pglc_canonical_key_typed(values, nulls, key_count, NULL,
+									output_functions, destination,
+									destination_capacity, key_len);
 }

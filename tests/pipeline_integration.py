@@ -29,6 +29,8 @@ WORKER_ROLE = os.environ.get("PG_LOCAL_CACHE_TEST_ROLE", "")
 WRITER_ROLE = os.environ.get("PG_LOCAL_CACHE_TEST_WRITER_ROLE", "")
 WRITER_PASSWORD = os.environ.get("PG_LOCAL_CACHE_TEST_WRITER_PASSWORD", "")
 WRITER_HOST = os.environ.get("PG_LOCAL_CACHE_TEST_WRITER_HOST", "127.0.0.1")
+BACKPRESSURE_VALUE_BYTES = 3_900
+MAX_PIPELINE_INPUT_BYTES = 65_536
 
 if WORKER_ROLE and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]{0,62}", WORKER_ROLE):
     raise ValueError("PG_LOCAL_CACHE_TEST_ROLE is not a safe SQL identifier")
@@ -175,7 +177,7 @@ def wait_for_mapping(client: RespConnection, key: str) -> bytes:
             assert isinstance(value, bytes)
             return value
         except RespError as error:
-            if "unknown pg_local_cache namespace" not in str(error):
+            if "unknown KVik table mapping" not in str(error):
                 raise
             if time.monotonic() >= deadline:
                 raise
@@ -191,6 +193,19 @@ def assert_eventual_value(client: RespConnection, key: str, expected: bytes) -> 
         if time.monotonic() >= deadline:
             raise AssertionError((value, expected))
         time.sleep(0.01)
+
+
+def row_bytes(row_id: int, value: str) -> bytes:
+    return json.dumps(
+        {"id": row_id, "value": value}, separators=(",", ":")
+    ).encode()
+
+
+def crud_key(table: str, row_id: int | str) -> str:
+    return (
+        f"CRUD:{PGDATABASE}.public.{table}:"
+        + json.dumps({"id": str(row_id)}, separators=(",", ":"))
+    )
 
 
 def start_idle_writer(
@@ -264,11 +279,11 @@ def terminate_writer(process: subprocess.Popen[str] | None) -> None:
         process.communicate(timeout=5)
 
 
-def test_fragmented_suffix_and_order(namespace: str) -> None:
+def test_fragmented_suffix_and_order(table: str) -> None:
     client = RespConnection()
     try:
         ping = client.encode("PING")
-        get = client.encode("GET", f"{namespace}:1")
+        get = client.encode("GET", crud_key(table, 1))
         echo = client.encode("ECHO", "after-fragment")
         split = len(get) - 3
 
@@ -278,20 +293,20 @@ def test_fragmented_suffix_and_order(namespace: str) -> None:
         assert client.read_response() == "PONG"
         for byte in get[split:] + echo:
             client.socket.sendall(bytes((byte,)))
-        assert client.read_response() == b"initial"
+        assert client.read_response() == row_bytes(1, "initial")
         assert client.read_response() == b"after-fragment"
         assert client.command("PING") == "PONG"
     finally:
         client.close()
 
 
-def test_command_error_does_not_poison_batch(namespace: str) -> None:
+def test_command_error_does_not_poison_batch(table: str) -> None:
     client = RespConnection()
     try:
         client.socket.sendall(
             client.encode("PING")
-            + client.encode("GET", f"{namespace}:not-a-bigint")
-            + client.encode("GET", f"{namespace}:1")
+            + client.encode("GET", crud_key(table, "not-a-bigint"))
+            + client.encode("GET", crud_key(table, 1))
             + client.encode("ECHO", "after-error")
         )
         assert client.read_response() == "PONG"
@@ -300,23 +315,24 @@ def test_command_error_does_not_poison_batch(namespace: str) -> None:
             raise AssertionError("invalid key did not return a PostgreSQL error")
         except RespError as error:
             assert "PostgreSQL" in str(error)
-        assert client.read_response() == b"initial"
+        assert client.read_response() == row_bytes(1, "initial")
         assert client.read_response() == b"after-error"
         assert client.command("PING") == "PONG"
     finally:
         client.close()
 
 
-def test_warm_pipeline_has_no_sql_reads(namespace: str) -> None:
+def test_warm_pipeline_has_no_sql_reads(table: str) -> None:
     client = RespConnection()
     try:
-        key = f"{namespace}:1"
-        assert client.command("GET", key) == b"initial"
+        key = crud_key(table, 1)
+        expected = row_bytes(1, "initial")
+        assert client.command("GET", key) == expected
         before = json.loads(client.command("STAT"))
         count = 128
         client.socket.sendall(client.encode("GET", key) * count)
         for _ in range(count):
-            assert client.read_response() == b"initial"
+            assert client.read_response() == expected
         after = json.loads(client.command("STAT"))
         assert after["cache_misses"] - before["cache_misses"] == 0
         assert after["database_reads"] - before["database_reads"] == 0
@@ -346,17 +362,17 @@ def test_pipeline_budget_is_a_fairness_yield() -> None:
         client.close()
 
 
-def test_half_close_drains_final_pipeline(namespace: str) -> None:
+def test_half_close_drains_final_pipeline(table: str) -> None:
     client = RespConnection()
     try:
         client.socket.sendall(
             client.encode("ECHO", "before-half-close")
-            + client.encode("GET", f"{namespace}:1")
+            + client.encode("GET", crud_key(table, 1))
             + client.encode("ECHO", "after-half-close")
         )
         client.socket.shutdown(socket.SHUT_WR)
         assert client.read_response() == b"before-half-close"
-        assert client.read_response() == b"initial"
+        assert client.read_response() == row_bytes(1, "initial")
         assert client.read_response() == b"after-half-close"
         try:
             client.read_response()
@@ -377,28 +393,34 @@ def same_worker_peer(reference: RespConnection) -> RespConnection:
     raise AssertionError(f"could not connect twice to RESP worker {worker_id}")
 
 
-def test_backpressure_preserves_every_response(namespace: str, table: str) -> None:
-    count = 1024
+def test_backpressure_preserves_every_response(table: str) -> None:
     client = RespConnection(receive_buffer=4096)
     peer: RespConnection | None = None
     try:
         client.socket.settimeout(20)
-        key = f"{namespace}:2"
-        expected = b"x" * 8192
+        key = crud_key(table, 2)
+        expected = row_bytes(2, "x" * BACKPRESSURE_VALUE_BYTES)
         assert client.command("GET", key) == expected
         peer = same_worker_peer(client)
         before = json.loads(peer.command("STAT"))
-        batch = (
-            client.encode("GET", key) * count
-            + client.encode("DEL", f"{namespace}:3")
-            + client.encode("GET", f"{namespace}:3")
+        encoded_get = client.encode("GET", key)
+        tail = (
+            client.encode("DEL", crud_key(table, 3))
+            + client.encode("GET", crud_key(table, 3))
         )
-        assert len(batch) < 65536
+        count = min(
+            1024,
+            (MAX_PIPELINE_INPUT_BYTES - len(tail) - 1) // len(encoded_get),
+        )
+        assert count >= 256
+        batch = encoded_get * count + tail
+        assert len(batch) < MAX_PIPELINE_INPUT_BYTES
         client.socket.sendall(batch)
         client.socket.shutdown(socket.SHUT_WR)
 
-        # The response is larger than the autotuned TCP send window.  Require
-        # an observed EAGAIN, then prove the same event loop stays serviceable.
+        # The response is much larger than the deliberately restricted receive
+        # window.  Require an observed EAGAIN, then prove the same event loop
+        # stays serviceable.
         deadline = time.monotonic() + 5
         while True:
             progress = json.loads(peer.command("STAT"))
@@ -440,13 +462,13 @@ def test_backpressure_preserves_every_response(namespace: str, table: str) -> No
         client.close()
 
 
-def test_close_after_flush(namespace: str, table: str) -> None:
+def test_close_after_flush(table: str) -> None:
     malformed = RespConnection()
     try:
         malformed.socket.sendall(
             malformed.encode("PING")
             + b"*x\r\n"
-            + malformed.encode("DEL", f"{namespace}:4")
+            + malformed.encode("DEL", crud_key(table, 4))
         )
         assert malformed.read_response() == "PONG"
         try:
@@ -471,7 +493,7 @@ def test_close_after_flush(namespace: str, table: str) -> None:
         unauthenticated.socket.sendall(
             bad_auth * 5
             + unauthenticated.encode("AUTH", AUTH_TOKEN)
-            + unauthenticated.encode("DEL", f"{namespace}:5")
+            + unauthenticated.encode("DEL", crud_key(table, 5))
         )
         for _ in range(5):
             try:
@@ -489,13 +511,15 @@ def test_close_after_flush(namespace: str, table: str) -> None:
     assert sql(f"SELECT count(*) FROM public.{table} WHERE id = 5") == "1"
 
 
-def test_transactional_commit_and_rollback(namespace: str, table: str) -> None:
+def test_transactional_commit_and_rollback(table: str) -> None:
     client = RespConnection()
-    key = f"{namespace}:1"
+    key = crud_key(table, 1)
     commit_writer: subprocess.Popen[str] | None = None
     rollback_writer: subprocess.Popen[str] | None = None
     try:
-        assert_eventual_value(client, key, b"initial")
+        initial = row_bytes(1, "initial")
+        committed = row_bytes(1, "committed")
+        assert_eventual_value(client, key, initial)
 
         before_commit_writer = json.loads(client.command("STAT"))
         commit_writer = start_idle_writer(
@@ -512,7 +536,7 @@ def test_transactional_commit_and_rollback(namespace: str, table: str) -> None:
             during_commit_writer["invalidations"]
             == before_commit_writer["invalidations"]
         )
-        assert client.command("GET", key) == b"initial"
+        assert client.command("GET", key) == initial
         after_open_commit_get = json.loads(client.command("STAT"))
         assert (
             after_open_commit_get["cache_hits"]
@@ -530,7 +554,7 @@ def test_transactional_commit_and_rollback(namespace: str, table: str) -> None:
         finish_writer(commit_writer, commit=True)
         after_commit = json.loads(client.command("STAT"))
         assert after_commit["invalidations"] - before_commit_writer["invalidations"] == 1
-        assert client.command("GET", key) == b"committed"
+        assert client.command("GET", key) == committed
         after_commit_refill = json.loads(client.command("STAT"))
         assert (
             after_commit_refill["cache_misses"]
@@ -544,7 +568,7 @@ def test_transactional_commit_and_rollback(namespace: str, table: str) -> None:
         )
         assert after_commit_refill["cache_hits"] == after_commit["cache_hits"]
         before_commit_hit = after_commit_refill
-        assert client.command("GET", key) == b"committed"
+        assert client.command("GET", key) == committed
         after_commit_hit = json.loads(client.command("STAT"))
         assert after_commit_hit["cache_hits"] - before_commit_hit["cache_hits"] == 1
         assert after_commit_hit["cache_misses"] == before_commit_hit["cache_misses"]
@@ -564,7 +588,7 @@ def test_transactional_commit_and_rollback(namespace: str, table: str) -> None:
             during_rollback_writer["invalidations"]
             == before_rollback_writer["invalidations"]
         )
-        assert client.command("GET", key) == b"committed"
+        assert client.command("GET", key) == committed
         after_open_rollback_get = json.loads(client.command("STAT"))
         assert (
             after_open_rollback_get["cache_hits"]
@@ -585,7 +609,7 @@ def test_transactional_commit_and_rollback(namespace: str, table: str) -> None:
             before_rollback_hit["invalidations"]
             == before_rollback_writer["invalidations"]
         )
-        assert client.command("GET", key) == b"committed"
+        assert client.command("GET", key) == committed
         after_rollback_hit = json.loads(client.command("STAT"))
         assert (
             after_rollback_hit["cache_hits"]
@@ -609,7 +633,7 @@ def test_transactional_commit_and_rollback(namespace: str, table: str) -> None:
 def main() -> None:
     suffix = str(os.getpid())
     table = f"pglc_pipeline_{suffix}"
-    namespace = f"pipeline{suffix}"
+    mapping_namespace = f"pipeline{suffix}"
     granted_roles = list(dict.fromkeys(filter(None, (WORKER_ROLE, WRITER_ROLE))))
     grant = "".join(
         f"GRANT USAGE ON SCHEMA public TO {sql_identifier(role)};"
@@ -622,28 +646,33 @@ def main() -> None:
         f"CREATE TABLE public.{table} "
         "(id bigint PRIMARY KEY, value text NOT NULL);"
         f"INSERT INTO public.{table} VALUES "
-        "(1, 'initial'), (2, repeat('x', 8192)), (3, 'delete-once'), "
+        f"(1, 'initial'), (2, repeat('x', {BACKPRESSURE_VALUE_BYTES})), "
+        "(3, 'delete-once'), "
         "(4, 'malformed-tail'), (5, 'auth-tail');"
         f"{grant}"
-        f"SELECT local_cache.attach_value("
-        f"'public.{table}'::regclass, 'value', '{namespace}', true)"
+        f"SELECT local_cache.attach_table("
+        f"'public.{table}'::regclass, true, '{mapping_namespace}')"
     )
     try:
         bootstrap = RespConnection()
         try:
-            assert wait_for_mapping(bootstrap, f"{namespace}:1") == b"initial"
-            assert wait_for_mapping(bootstrap, f"{namespace}:2") == b"x" * 8192
+            assert wait_for_mapping(
+                bootstrap, crud_key(table, 1)
+            ) == row_bytes(1, "initial")
+            assert wait_for_mapping(
+                bootstrap, crud_key(table, 2)
+            ) == row_bytes(2, "x" * BACKPRESSURE_VALUE_BYTES)
         finally:
             bootstrap.close()
 
-        test_fragmented_suffix_and_order(namespace)
-        test_command_error_does_not_poison_batch(namespace)
-        test_warm_pipeline_has_no_sql_reads(namespace)
+        test_fragmented_suffix_and_order(table)
+        test_command_error_does_not_poison_batch(table)
+        test_warm_pipeline_has_no_sql_reads(table)
         test_pipeline_budget_is_a_fairness_yield()
-        test_half_close_drains_final_pipeline(namespace)
-        test_backpressure_preserves_every_response(namespace, table)
-        test_close_after_flush(namespace, table)
-        test_transactional_commit_and_rollback(namespace, table)
+        test_half_close_drains_final_pipeline(table)
+        test_backpressure_preserves_every_response(table)
+        test_close_after_flush(table)
+        test_transactional_commit_and_rollback(table)
         print(
             "pipeline integration passed: fragmentation/order, warm-hit stats, "
             "error recovery, fairness resume, half-close drain, backpressure, "
@@ -651,7 +680,7 @@ def main() -> None:
         )
     finally:
         sql(
-            f"SELECT local_cache.unregister_mapping('{namespace}');"
+            f"SELECT local_cache.detach_table('public.{table}'::regclass);"
             f"DROP TABLE IF EXISTS public.{table}"
         )
 

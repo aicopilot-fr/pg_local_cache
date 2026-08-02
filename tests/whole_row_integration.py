@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Black-box KVik-compatible whole-row and transparent-SQL coverage.
+"""Black-box whole-row RESP and transparent-SQL coverage.
 
 The test intentionally uses the public RESP/SQL APIs only.  Administrative
 DDL is executed by the smoke-test connection, while every cacheable SELECT is
@@ -321,7 +321,6 @@ def main() -> None:
     )
     assert attached["whole_row"] is True, attached
     assert attached["primary_key_columns"] == ["tenant_id", "id"], attached
-    assert attached["value_column"] is None, attached
     assert attached["writable"] is True, attached
     assert attached["templates"]["key"].startswith(
         f"CRUD:{PGDATABASE}.public.{table}:"
@@ -658,9 +657,6 @@ def main() -> None:
         if client is not None:
             client.close()
         admin_sql(
-            f"SELECT local_cache.unregister_mapping('{namespace}');"
-            f"SELECT local_cache.unregister_mapping('{identity_namespace}');"
-            f"SELECT local_cache.unregister_mapping('{enum_namespace}');"
             f"DROP TABLE IF EXISTS {relation};"
             f"DROP TABLE IF EXISTS public.{identity_table};"
             f"DROP TABLE IF EXISTS public.{enum_table};"

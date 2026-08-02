@@ -1,0 +1,117 @@
+---
+layout: default
+title: PostgreSQL row cache for ordinary SQL
+description: pg_local_cache is a PostgreSQL 16 extension for bounded shared-memory row caching with ordinary SQL and transaction-aware invalidation.
+home: true
+permalink: /
+---
+<main id="main-content">
+  <section id="sql-api" class="page-section hero" aria-labelledby="hero-title">
+    <div class="hero-copy">
+      <h1 id="hero-title">A local row cache inside PostgreSQL</h1>
+      <p>Keep ordinary SQL. Cache complete rows by primary key. Fence affected entries before commit visibility.</p>
+      <div class="hero-actions">
+        <a class="button primary" href="{{ '/docs/INSTALL_EXISTING.html' | relative_url }}">Install on PostgreSQL 16 <span aria-hidden="true">→</span></a>
+        <a class="button" href="{{ '/docs/BENCHMARKS.html' | relative_url }}">Benchmark methodology <span aria-hidden="true">→</span></a>
+      </div>
+      <div class="mini-code">
+        <button class="copy-button" type="button" data-copy="hero-sql">Copy</button>
+        <pre id="hero-sql"><code>SELECT local_cache.attach_table('public.items'::regclass);
+
+SELECT * FROM public.items WHERE id = $1;</code></pre>
+      </div>
+    </div>
+    <div class="terminal" aria-label="PostgreSQL cache hit example">
+      <div class="terminal-bar"><strong>psql</strong> │ postgres@localhost:5432/app</div>
+      <pre><code>app=&gt; <span class="sql">EXPLAIN (ANALYZE, COSTS OFF, SUMMARY OFF, TIMING OFF)</span>
+      SELECT * FROM public.items WHERE id = 42;
+
+Custom Scan (pg_local_cache_sql) on items (actual rows=1 loops=1)
+  Cache Namespace: public.items
+  Cache Policy: positive MVCC-safe entries
+  On Miss: unique index scan
+  Cache Hits: <span class="hit">1</span>
+  Cache Misses: 0
+  Cache Bypasses: 0
+
+app=&gt; <span class="sql">BEGIN;</span>
+BEGIN
+
+app=*&gt; <span class="sql">UPDATE</span> public.items
+      SET value = 'updated' WHERE id = 42;
+UPDATE 1
+
+app=*&gt; <span class="sql">COMMIT;</span>
+COMMIT
+<span class="comment">-- the cache entry was fenced before commit became visible</span></code></pre>
+    </div>
+  </section>
+
+  <section class="proof-rail" aria-label="Core properties">
+    <div class="proof-item"><strong>Ordinary SQL</strong><p>Supported primary-key reads need no cache-specific driver or query API.</p></div>
+    <div class="proof-item"><strong>Whole rows</strong><p>Complete tuples keyed by the table primary key.</p></div>
+    <div class="proof-item"><strong>Transaction-aware invalidation</strong><p>Source writes fence affected entries before commit visibility.</p></div>
+    <div class="proof-item"><strong>Bounded extension memory</strong><p>Deterministic extension allocations are bounded at startup; host limits remain separate.</p></div>
+  </section>
+
+  <div class="band">
+    <section class="page-section section-grid" aria-labelledby="benchmark-title">
+      <div class="section-intro">
+        <div class="section-rule"></div>
+        <h2 id="benchmark-title">Three SQL paths, one workload</h2>
+        <p>The SQL-only runner keeps the schema, rows, query, role, PostgreSQL version and client settings fixed.</p>
+        <a href="{{ '/docs/BENCHMARKS.html' | relative_url }}">Read the methodology →</a>
+      </div>
+      <div>
+        <div class="table-scroll" role="region" aria-label="Latest SQL-only benchmark comparison" tabindex="0">
+          <table class="benchmark-table">
+            <thead><tr><th>Protocol</th><th>Stock ops/s</th><th>Cache off</th><th>Cache on</th><th>Cache/stock</th><th>p99 stock/on</th></tr></thead>
+            <tbody>
+              <tr><td>Prepared</td><td>37,054</td><td>37,310</td><td>34,662</td><td>0.94x</td><td>3.982 / 3.989 ms</td></tr>
+              <tr><td>Extended</td><td>16,595</td><td>16,704</td><td>14,941</td><td>0.90x</td><td>6.162 / 6.366 ms</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="benchmark-note"><span>c16/p32 throughput; separate c16/p1 latency; three repetitions.</span><span><a href="https://github.com/aicopilot-fr/pg_local_cache/actions/runs/30729192604">CI run 30729192604</a></span></div>
+      </div>
+    </section>
+  </div>
+
+  <section id="quick-start" class="page-section quick-start" aria-labelledby="quick-start-title">
+    <h2 id="quick-start-title">Install on an existing PostgreSQL server</h2>
+    <div class="steps">
+      <div class="step"><span class="step-number">1</span><strong>Preflight</strong><p>Check PostgreSQL, target paths, role and pending settings.</p></div>
+      <div class="step"><span class="step-number">2</span><strong>Stage files</strong><p>Install the extension and stage postmaster configuration online.</p></div>
+      <div class="step"><span class="step-number">3</span><strong>Restart once</strong><p>Load shared memory and hooks with one controlled restart.</p></div>
+      <div class="step"><span class="step-number">4</span><strong>Attach a table</strong><p>Register the primary key and keep querying it normally.</p></div>
+    </div>
+    <div class="install-command">
+      <div class="command-label">Read-only preflight</div>
+      <button class="copy-button" type="button" data-copy="install-command">Copy</button>
+      <pre id="install-command"><code>sudo ./scripts/install-existing.sh preflight --database app --mode sql-only</code></pre>
+    </div>
+  </section>
+
+  <section class="architecture">
+    <div class="page-section architecture-inner">
+      <h2>Architecture</h2>
+      <div class="architecture-flow" aria-label="PostgreSQL backend, shared cache, and pre-commit invalidation fence">
+        <span class="node">PostgreSQL backend</span><span class="arrow">↔</span>
+        <span class="node">bounded shared row cache</span><span class="arrow">←</span>
+        <span class="node">pre-commit invalidation fence</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="page-section docs-index" aria-labelledby="docs-title">
+    <h2 id="docs-title">Documentation</h2>
+    <div class="docs-list">
+      <a class="docs-link" href="{{ '/docs/INSTALL_EXISTING.html' | relative_url }}"><strong>Existing database</strong><span>Preflight, staging, restart, verification and rollback.</span><b>→</b></a>
+      <a class="docs-link" href="{{ '/docs/TECHNICAL.html' | relative_url }}#architecture"><strong>Architecture</strong><span>Shared memory, hooks, workers and invalidation.</span><b>→</b></a>
+      <a class="docs-link" href="{{ '/#sql-api' | relative_url }}"><strong>SQL API</strong><span>Attach a table and use ordinary primary-key queries.</span><b>→</b></a>
+      <a class="docs-link" href="{{ '/docs/BENCHMARKS.html' | relative_url }}"><strong>Benchmark methodology</strong><span>Workloads, limits, latency and downloadable evidence.</span><b>→</b></a>
+      <a class="docs-link" href="{{ '/docs/MONITORING.html' | relative_url }}"><strong>Monitoring &amp; OOM</strong><span>Prometheus metrics, alerts, budgets and health checks.</span><b>→</b></a>
+      <a class="docs-link" href="{{ '/docs/TECHNICAL.html' | relative_url }}#security-boundary"><strong>Security</strong><span>Privileges, token boundary, RLS and fail-closed checks.</span><b>→</b></a>
+    </div>
+  </section>
+</main>

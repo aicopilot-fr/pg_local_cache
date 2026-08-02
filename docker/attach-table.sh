@@ -12,16 +12,14 @@ Usage:
   pg_local_cache_attach --table SCHEMA.TABLE [options]
 
 Options:
-  --namespace NAME       RESP namespace; defaults to schema.table
-  --value-column NAME    Cache one scalar column instead of the whole-row JSON
+  --namespace NAME       Internal mapping name; defaults to schema.table
   --writable             Enable RESP SET and DEL (default: read-only)
   --database NAME        Target database (default: PG_LOCAL_CACHE_DATABASE)
   --replace              Allow replacing a namespace mapped to another table
   --help                 Show this help
 
-Whole-row mode discovers the table PRIMARY KEY in index order and supports
-1-16 columns. Scalar-value mode requires one PK column. The SQL API validates
-the table and worker role, grants least privilege,
+The command discovers the table PRIMARY KEY in index order and supports 1-16
+columns. The SQL API validates the table and worker role, grants least privilege,
 and installs the transaction guard plus row and truncate invalidators.
 USAGE
 }
@@ -38,7 +36,6 @@ database="${PG_LOCAL_CACHE_DATABASE:-${POSTGRES_DB:-${POSTGRES_USER:-postgres}}}
 postgres_user="${POSTGRES_USER:-postgres}"
 namespace=""
 relation=""
-value_column=""
 writable="false"
 replace="false"
 
@@ -57,11 +54,6 @@ while (( $# > 0 )); do
         --table)
             require_value "$1" "${2:-}"
             relation="$2"
-            shift 2
-            ;;
-        --value-column)
-            require_value "$1" "${2:-}"
-            value_column="$2"
             shift 2
             ;;
         --writable)
@@ -91,10 +83,6 @@ if [[ -n "$namespace" ]]; then
     [[ "$namespace" =~ ^[A-Za-z0-9_.-]{1,63}$ ]] \
         || fail "namespace must contain 1-63 ASCII letters, digits, dot, dash, or underscore"
 fi
-if [[ -n "$value_column" ]]; then
-    [[ "$value_column" =~ ^[A-Za-z_][A-Za-z0-9_$]{0,62}$ ]] \
-        || fail "value column must be an unquoted PostgreSQL identifier"
-fi
 
 psql_base=(
     psql
@@ -117,18 +105,10 @@ IFS='|' read -r configured_database worker_role <<<"$configured"
     || fail "database ${database} is not served by pg_local_cache workers (configured: ${configured_database})"
 [[ "$worker_role" =~ ^[A-Za-z_][A-Za-z0-9_$]{0,62}$ ]] \
     || fail "configured worker role is not an unquoted PostgreSQL identifier"
-if [[ -n "$value_column" ]]; then
-    scalar_mode="true"
-else
-    scalar_mode="false"
-fi
-
 result="$("${psql_base[@]}" \
     --set namespace="$namespace" \
     --set relation="$relation" \
-    --set value_column="$value_column" \
     --set writable="$writable" \
-    --set scalar_mode="$scalar_mode" \
     --set replace="$replace" <<'SQL'
 /* The post-lock mapping recheck needs a fresh statement snapshot even when a
  * deployment changes default_transaction_isolation at role/database scope. */
@@ -265,7 +245,8 @@ $pg_local_cache_attach$;
 \if :mapping_conflict
 \if :replace
 SELECT pg_catalog.format(
-           'SELECT local_cache.unregister_mapping(%L);', m.namespace
+           'SELECT local_cache.detach_table(%s::oid::pg_catalog.regclass);',
+           m.relation_oid
        )
   FROM pg_temp.pg_local_cache_attach_conflicts AS m
  ORDER BY m.relation_oid, m.namespace
@@ -286,20 +267,11 @@ SELECT target.relation_oid::text AS target_relation_oid,
   FROM pg_temp.pg_local_cache_attach_target AS target
 \gset
 
-\if :scalar_mode
-SELECT local_cache.attach_value(
-    :'target_relation_oid'::oid::pg_catalog.regclass,
-    :'value_column'::name,
-    :'effective_namespace',
-    :'writable'::boolean
-)::text;
-\else
 SELECT local_cache.attach_table(
     :'target_relation_oid'::oid::pg_catalog.regclass,
     :'writable'::boolean,
     :'effective_namespace'
 )::text;
-\endif
 
 COMMIT;
 SQL

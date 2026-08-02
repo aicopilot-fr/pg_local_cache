@@ -250,8 +250,8 @@ def main() -> None:
             f"CREATE TABLE {relation} ("
             "id bigint PRIMARY KEY, value text NOT NULL);"
             f"INSERT INTO {relation} VALUES (1, 'one'), (-1, 'minus-one');"
-            "SELECT local_cache.attach_value("
-            f"'{relation}'::regclass, 'value', '{namespace}', false);"
+            "SELECT local_cache.attach_table("
+            f"'{relation}'::regclass, false, '{namespace}');"
             f"GRANT SELECT, UPDATE ON TABLE {relation} TO {quoted_app_role}"
         )
 
@@ -414,7 +414,10 @@ def main() -> None:
         if RESP_PORT != 0:
             # RESP negative entries are never authoritative for ordinary SQL.
             client = RespClient()
-            wait_for_negative_entry(client, f"{namespace}:{missing_id}")
+            wait_for_negative_entry(
+                client,
+                f'CRUD:{PGDATABASE}.public.{table}:{{"id":{missing_id}}}',
+            )
 
         # With or without a RESP listener, a missing SQL row must execute
         # PostgreSQL's child plan and remain a cache miss.  In the RESP-enabled
@@ -427,19 +430,17 @@ def main() -> None:
         )
         assert_counter_delta(before, stats(), sql_cache_misses=1)
 
-        # Broader projections and additional predicates deliberately retain
-        # stock PostgreSQL semantics and do not affect SQL-cache counters.
+        # Additional predicates retain stock PostgreSQL semantics and do not
+        # affect SQL-cache counters.
         before = stats()
         unsupported = app_sql(
-            f"SELECT * FROM {relation} WHERE id = 1;"
             f"SELECT value FROM {relation} "
             "WHERE id = 1 AND value = 'committed'"
-        ).splitlines()
-        assert unsupported == ["1|committed", "committed"], unsupported
+        )
+        assert unsupported == "committed", unsupported
         assert_counter_delta(before, stats())
         assert_no_custom_scan(
             app_sql(
-                f"EXPLAIN (COSTS OFF) SELECT * FROM {relation} WHERE id = 1;"
                 f"EXPLAIN (COSTS OFF) SELECT value FROM {relation} "
                 "WHERE id = 1 AND value = 'committed'"
             )
@@ -465,12 +466,11 @@ def main() -> None:
     finally:
         if client is not None:
             client.close()
-        # unregister_mapping() is idempotent.  Revoke the test role's table
-        # grants before dropping the table so cleanup also covers ACL state.
+        # Revoke the test role's table grants before dropping the table so
+        # cleanup also covers ACL state.
         subprocess.run(
             psql_base_args(application=False),
             input=(
-                f"SELECT local_cache.unregister_mapping('{namespace}');\n"
                 "DO $cleanup$\n"
                 "BEGIN\n"
                 f"  IF pg_catalog.to_regclass('{relation}') IS NOT NULL THEN\n"

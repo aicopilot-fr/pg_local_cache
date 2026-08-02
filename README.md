@@ -1,73 +1,51 @@
 # pg_local_cache
 
-**100k+ whole-row reads/s inside PostgreSQL, with ordinary SQL and
-transactional invalidation.**
+`pg_local_cache` is a PostgreSQL 16 extension that caches complete rows for
+supported primary-key lookups in PostgreSQL shared memory. Applications keep
+using parameterized SQL through libpq, JDBC, Npgsql, psycopg, or an ORM. No
+cache-specific driver is required.
 
-`pg_local_cache` is a PostgreSQL 16 extension for primary-key lookups. It
-keeps the whole row in bounded shared memory, serves supported parameterized
-`SELECT` statements through the existing libpq/JDBC/Npgsql/psycopg/ORM driver,
-and invalidates entries only when the source transaction commits.
+Attached tables use transaction-aware invalidation. Source writes fence affected
+entries before commit visibility, and rollback never exposes uncommitted row
+data. PostgreSQL remains authoritative: a missing, unsafe, malformed, or
+oversized entry runs the normal source plan.
 
-There is no separate Redis or Valkey process and no cache-specific SQL client.
-An optional KVik-style RESP2 endpoint provides `GET`, `SET` and `DEL` for
-trusted internal services.
+The current implementation supports PostgreSQL 16 on Linux, one configured
+database, and one writable primary. It is a narrow primary-key fast path, not a
+general query cache.
 
-Status: production candidate for Linux, PostgreSQL 16 and one PostgreSQL
-primary. Run the supplied integration and performance gates on the target
-hardware before production rollout.
+## Capabilities
 
-## Performance at a glance
-
-Recorded long-run reference results from the reproducible benchmark harness:
-
-| Read path | Median ops/s |
-|---|---:|
-| Whole-row RESP `GET`, pg_local_cache | **106,948** |
-| Whole-row RESP `GET`, Valkey | 118,387 |
-| Whole-row RESP `GET`, Redis | 123,790 |
-| Ordinary prepared SQL, cached | **70,275** |
-| Ordinary unnamed extended SQL, cached | **18,985** |
-
-The RESP comparison uses byte-identical full-row JSON, the same client,
-connections, pipeline and Docker network for all three targets. The SQL lanes
-use normal parameterized PostgreSQL queries and independently require at least
-10,000 ops/s with one cache hit per successful lookup and no timed misses,
-fills or bypasses. On this run, whole-row `pg_local_cache` reached about 90% of
-Valkey throughput while PostgreSQL remained the source of truth.
-
-These are regression results from a shared runner, not a capacity promise.
-See [benchmark results and methodology](docs/BENCHMARKS.md), including payload,
-CPU limits, latency semantics, write results and the one-command reproduction.
-Every release workflow keeps machine-readable CI benchmark evidence with its
-downloadable artifacts.
-
-## Choose a mode
-
-| Mode | Use it when |
+| Capability | Behavior |
 |---|---|
-| **SQL-only** | Recommended drop-in path. The application keeps issuing ordinary SQL; no RESP port or token exists. |
-| **SQL + RESP** | You also need KVik-style whole-row `GET`/`SET`/`DEL` from a trusted internal network. |
+| Ordinary SQL | Supported primary-key `SELECT` statements can use the cache without changing the application protocol. |
+| Whole rows | Each entry stores one versioned PostgreSQL composite row. |
+| Transactional invalidation | `INSERT`, `UPDATE`, `DELETE`, and `TRUNCATE` fence affected entries before commit visibility. |
+| Bounded extension memory | Entry capacity, client slots, and deterministic extension allocations are fixed at startup. |
+| Optional RESP2 | Trusted internal clients can use authenticated whole-row `GET`, `SET`, and `DEL`. |
+| Operations | SQL metrics, health checks, Prometheus rules, and a Grafana dashboard are included. |
 
-Both modes use the same shared row cache, transaction-aware invalidation,
-whole-row payload and monitoring API. `pg_local_cache.port=0` removes all RESP
-workers and their client buffers from the SQL-only profile.
+## Docker quick start
 
-## Try SQL-only in five minutes
-
-Requirements: Docker with Compose v2, GitHub CLI access to this private
-repository and an available local TCP port.
+Requirements: Docker with Compose v2 and OpenSSL.
 
 ```bash
-gh repo clone aicopilot-fr/pg_local_cache
+git clone https://github.com/aicopilot-fr/pg_local_cache.git
 cd pg_local_cache
 
-mkdir -p secrets
-umask 077
-openssl rand -base64 36 > secrets/postgres_password
-chmod 600 secrets/postgres_password
+install -d -m 0700 secrets
+openssl rand -base64 36 | tr -d '\n' > secrets/postgres_password
+chmod 0600 secrets/postgres_password
 
-docker compose -f compose.sql-only.yaml up --detach --build --wait
-psql 'postgresql://postgres@127.0.0.1:5432/app'
+docker compose -f compose.sql-only.yaml \
+  up --detach --build --wait postgres
+```
+
+Open `psql`:
+
+```bash
+docker compose -f compose.sql-only.yaml \
+  exec postgres psql --username postgres --dbname app
 ```
 
 Create and attach a table:
@@ -86,7 +64,7 @@ INSERT INTO public.items VALUES
 SELECT local_cache.attach_table('public.items'::regclass);
 ```
 
-The application continues to use ordinary SQL:
+Application code continues to issue an ordinary parameterized query:
 
 ```sql
 SELECT *
@@ -94,12 +72,8 @@ FROM public.items
 WHERE id = $1;
 ```
 
-The first supported lookup reads the table and fills the cache. A warm lookup
-is served by `Custom Scan (pg_local_cache_sql)`. If the entry is absent,
-expired, unsafe for the current snapshot or too large, PostgreSQL executes the
-normal table/index plan; the application still gets the authoritative result.
-
-Check the path and health:
+Warm supported reads can use `Custom Scan (pg_local_cache_sql)`. Verify the
+plan and health with a literal key in `psql`:
 
 ```sql
 EXPLAIN (ANALYZE, COSTS OFF)
@@ -109,145 +83,161 @@ SELECT local_cache.health();
 SELECT * FROM local_cache.metrics();
 ```
 
-Supported SQL fast-path shape:
+## SQL API
 
-- one permanent application table;
-- the full primary key, including composite keys of 1–16 columns;
-- equality predicates with constants or parameters;
-- `SELECT *` or direct table-column projections, aliases and reordering;
-- optional `LIMIT 1`.
-
-Joins, extra filters, expressions, row locks, RLS, recovery,
-`REPEATABLE READ` and `SERIALIZABLE` safely use PostgreSQL's normal plan.
-
-## Enable the RESP endpoint
-
-Create a second secret and start the default Compose profile:
-
-```bash
-openssl rand -base64 48 \
-  | tr '+/' '-_' | tr -d '=[:space:]' \
-  > secrets/pg_local_cache_auth_token
-chmod 600 secrets/pg_local_cache_auth_token
-
-docker compose up --detach --build --wait
-docker compose exec postgres pg_local_cache_attach \
-  --table public.items \
-  --writable
-```
-
-The endpoint is published on `127.0.0.1:6380` by default. `GET` returns the
-entire row as JSON:
-
-```bash
-export PG_LOCAL_CACHE_TOKEN="$(tr -d '\r\n' \
-  < secrets/pg_local_cache_auth_token)"
-
-redis-cli -h 127.0.0.1 -p 6380 \
-  -a "$PG_LOCAL_CACHE_TOKEN" --raw \
-  GET 'CRUD:app.public.items:{"id":1}'
-```
-
-`--writable` only enables RESP `SET`/`DEL`. It does not control ordinary SQL
-writes by application roles. The shared RESP token grants access to every
-registered mapping on this instance; PostgreSQL per-user ACL and RLS are not
-applied to the RESP endpoint.
-
-## Install on an existing PostgreSQL server
-
-Use the downloadable `pg_local_cache-*-source.tar.gz`, or the explicitly
-labelled PostgreSQL 16 / Debian 12 / amd64 binary archive, then follow
-[Installing on an existing database](docs/INSTALL_EXISTING.md).
-
-The included installer is deliberately two-phase:
-
-```bash
-sudo ./install.sh preflight --database app --mode sql-only
-sudo ./install.sh install   --database app --mode sql-only
-```
-
-For the source archive, use `./scripts/install-existing.sh` in place of
-`./install.sh`.
-
-It builds or stages files, creates the isolated worker role, preserves the
-existing `shared_preload_libraries`, backs up `postgresql.auto.conf`, validates
-the resulting configuration and stops before restart by default.
-
-A first installation **requires one PostgreSQL restart** because shared memory
-and planner/background-worker hooks are registered at postmaster start.
-`pg_reload_conf()` or `LOAD` cannot activate them. All preparation is online;
-only the final controlled restart is disruptive. A healthy standalone server
-often restarts within 30 seconds, but recovery, active sessions and storage can
-make it longer, so 30 seconds is an operational target rather than an SLA.
-
-For Patroni or a Kubernetes operator, install the artifact on every member and
-use the platform's rolling restart/switchover workflow. Arbitrary native C
-extensions usually cannot be installed on managed PostgreSQL services without
-explicit provider support.
-
-## Attach, reconcile and detach
-
-Run administrative functions as the extension owner or a trusted deploy role:
+`local_cache.attach_table()` discovers the complete primary key, records a
+whole-row mapping, and installs extension-owned invalidation triggers:
 
 ```sql
--- Whole-row, read-only through RESP; ordinary SQL writes remain unchanged.
+BEGIN;
+SET LOCAL lock_timeout = '2s';
 SELECT local_cache.attach_table('public.items'::regclass);
+COMMIT;
+```
 
--- Whole-row with an explicit namespace and RESP writes.
-SELECT local_cache.attach_table(
-    'public.items'::regclass,
-    p_writable => true,
-    p_namespace => 'items'
-);
+The transparent SQL path accepts:
 
+- one attached permanent table without inheritance, partitioning, or RLS;
+- equality predicates for every primary-key column, including composite keys;
+- constants or external parameters;
+- `SELECT *` or direct column projections, including aliases and reordered
+  projections;
+- no limit, or a constant `LIMIT 1`.
+
+Unsupported query shapes use PostgreSQL's normal plan. So do
+`REPEATABLE READ`, `SERIALIZABLE`, recovery, and reads after the current
+transaction writes an attached table. A nonexistent key returns the normal
+empty SQL result after consulting the source table.
+
+Application roles need only their normal source-table privileges. They do not
+need access to the `local_cache` schema to benefit from a cached `SELECT`.
+Administrative functions are separate:
+
+```sql
 SELECT local_cache.reconcile_table('public.items'::regclass);
 SELECT local_cache.reconcile_all();
 SELECT local_cache.detach_table('public.items'::regclass);
 ```
 
-Attach installs extension-owned `ENABLE ALWAYS` triggers. SQL
-`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE` invalidates only at commit; rollback does
-not publish invalidation. Changing a primary key invalidates both the old and
-new key. Attach takes a short `ShareRowExclusiveLock`, so production deploys
-should use a bounded `lock_timeout` and retry outside peak DDL/DML bursts.
+See the [technical reference](docs/TECHNICAL.md#planner-and-executor-fast-path)
+for the exact planner, snapshot, and type rules.
 
-## Roles
+## Install on an existing server
 
-| Role | Required access |
-|---|---|
-| Application role | Normal privileges on the source table only; no access to `local_cache` is needed. |
-| Extension owner / deploy role | `CREATE EXTENSION` and explicitly granted attach/detach/reconcile functions. |
-| `local_cache_worker` | Isolated `LOGIN`, `NOSUPERUSER`, `NOINHERIT`; table ACLs are maintained by attach/reconcile. |
-| Monitoring role | Explicit `EXECUTE` on stats/health/metrics plus only the PostgreSQL monitoring privileges it needs. |
+Use the source archive on a compatible build host, or the binary archive only
+for its labelled PostgreSQL, distribution, and architecture combination. The
+[existing-database guide](docs/INSTALL_EXISTING.md) covers prerequisites,
+preflight, online staging, restart, HA, verification, and rollback.
 
-## Releases and verification
+The first installation requires one restart because
+`shared_preload_libraries` is evaluated at postmaster startup. File staging and
+configuration validation stay online. The installer's 30-second setting is a
+warning target; actual interruption depends on shutdown, recovery, and client
+reconnection.
 
-After CI succeeds on `main`, GitHub Actions builds:
+## Optional RESP2 endpoint
 
-- a portable source archive;
-- a binary archive explicitly scoped to PostgreSQL 16, Debian 12 and amd64;
-- `SHA256SUMS`;
-- CI benchmark evidence when available.
+SQL-only mode sets `pg_local_cache.port=0` and starts no RESP workers. RESP mode
+uses the same shared cache and invalidation machinery, but has a separate
+security boundary: one worker role and one shared token cover every accepted
+mapping, with no TLS or per-client PostgreSQL ACL context.
 
-Each successful main commit also has a 90-day downloadable Actions artifact
-and an immutable `main-<sha>` prerelease. The first commit for a new
-`default_version` publishes an immutable `vX.Y.Z` GitHub Release; later code
-changes must bump the version rather than overwrite an existing tag or asset.
+Keep the listener on loopback or behind an authenticated TLS proxy. A whole-row
+key has this form:
 
-## Documentation
+```text
+CRUD:database.schema.table:{"pk_column":<json-scalar>,...}
+```
 
-- [Existing database installation, restart and rollback](docs/INSTALL_EXISTING.md)
-- [Benchmarks and reproducibility](docs/BENCHMARKS.md)
-- [Full technical reference](docs/TECHNICAL.md)
-- [Monitoring stack](monitoring/README.md)
-- [Extended benchmark scenarios](benchmarks/SCENARIOS.md)
+`GET` returns the complete row as JSON and reads the source table on a cache
+miss. Writable mappings expose PostgreSQL-backed `SET` and `DEL`. See the
+[wire API and compatibility boundary](docs/TECHNICAL.md#resp2-wire-api) and the
+[existing-server RESP setup](docs/INSTALL_EXISTING.md#optional-resp-mode).
+
+## Benchmarks
+
+The SQL-only suite compares stock PostgreSQL, the mapped server with caching
+disabled, and the cached path under the same schema, rows, query, role,
+PostgreSQL version, and client settings. Prepared and unnamed extended protocols
+are reported separately; latency uses a separate one-operation pass.
+
+### CI regression snapshot
+
+The table below is pinned to [source `9cf12e3`](https://github.com/aicopilot-fr/pg_local_cache/commit/9cf12e34bee512e4d453e117c39ca8eb140afd4d)
+and [CI run 30729192604](https://github.com/aicopilot-fr/pg_local_cache/actions/runs/30729192604):
+three repetitions, 4,096 keys, 128-byte payloads. Throughput uses c16/p32;
+latency is a separate c16/p1 pass.
+
+| Protocol | Path | Median ops/s | Mean | p50 | p95 | p99 |
+|---|---|---:|---:|---:|---:|---:|
+| Prepared | Stock PostgreSQL 16 | 37,054 | 1.200 ms | 1.070 ms | 2.501 ms | 3.982 ms |
+| Prepared | Mapped, cache off | 37,310 | 1.157 ms | 1.038 ms | 2.486 ms | 4.239 ms |
+| Prepared | Cache on | 34,662 | 1.160 ms | 1.040 ms | 2.459 ms | 3.989 ms |
+| Extended | Stock PostgreSQL 16 | 16,595 | 2.183 ms | 1.954 ms | 4.501 ms | 6.162 ms |
+| Extended | Mapped, cache off | 16,704 | 2.193 ms | 1.945 ms | 4.501 ms | 6.145 ms |
+| Extended | Cache on | 14,941 | 2.214 ms | 2.016 ms | 4.585 ms | 6.366 ms |
+
+Prepared cache-on was 0.94x stock and 0.93x mapped cache-off. Extended
+cache-on was 0.90x stock and 0.89x mapped cache-off in this hot-table run.
+The same artifact includes a non-gating c4/p8 snapshot:
+
+| Protocol | Stock ops/s | Cache off ops/s | Cache on ops/s | Cache/stock | Latency profile | Stock p99 | Cache-off p99 | Cache-on p99 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Prepared | 32,716 | 32,834 | 31,071 | 0.95x | c4/p1 | 1.365 ms | 1.669 ms | 1.668 ms |
+| Extended | 15,065 | 14,906 | 14,012 | 0.93x | c4/p1 | 1.767 ms | 1.115 ms | 1.272 ms |
+
+The same run also contains a one-second, one-repetition c4/p8 RESP smoke test
+using byte-identical whole-row JSON. This is a separate interface and workload:
+
+| Target | Median ops/s | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|
+| pg_local_cache 1.0.0 | 165,495 | 0.157 ms | 0.290 ms | 0.507 ms |
+| Valkey 9.1.1 | 214,310 | 0.118 ms | 0.232 ms | 0.329 ms |
+| Redis 8.8.1 | 201,990 | 0.107 ms | 0.265 ms | 0.420 ms |
+
+A separate one-repetition prepared SQL smoke measured the mapped cache path at
+113,799–124,305 ops/s and stock PostgreSQL at 62,254–67,099 ops/s across three
+whole-row projection shapes. Its duration and harness differ from the repeated
+SQL-only result, so the two sets are not pooled.
+
+GitHub-hosted measurements are regression evidence, not capacity claims. A
+published snapshot must link the source SHA and run, record configuration and
+all repetitions, and retain raw JSON. The default 10,000 ops/s floor is only a
+test threshold.
+
+See [benchmark methodology](docs/BENCHMARKS.md) and
+[scenario definitions](benchmarks/SCENARIOS.md).
+
+## Monitoring
+
+`local_cache.metrics()` exposes typed cache, memory, worker, client,
+invalidation, backpressure, and mapping counters. The optional stack adds
+postgres_exporter, Prometheus rules, container memory signals, and a provisioned
+Grafana dashboard. Start with the [monitoring and OOM guide](docs/MONITORING.md).
+
+## Releases
+
+Download source, platform-labelled binaries, checksums, and CI evidence from
+[GitHub Releases](https://github.com/aicopilot-fr/pg_local_cache/releases). Never
+use a binary archive on a different PostgreSQL major, distribution, or
+architecture; build the source archive against the target PGXS instead.
 
 ## Current limits
 
 - PostgreSQL 16 on Linux only.
 - One configured database and one writable primary per extension instance.
-- No TTL, Pub/Sub, Lua, Redis Cluster or standby-serving cache.
-- Cache entries are bounded; an encoded row is limited to 8 KiB.
-- RESP is a shared-token trust boundary, not PostgreSQL user authentication.
-- The project is a production candidate: repeat correctness, restart and load
-  gates in the actual HA, storage and connection-pool environment.
+- Permanent, non-partitioned tables with a supported primary key; no views,
+  inheritance, or RLS.
+- Encoded cache entries are limited to 8 KiB; oversized rows use PostgreSQL.
+- At most 128 mappings and 16 primary-key columns per mapping.
+- No TTL, Redis Cluster, Lua, Pub/Sub, multi-primary, or standby cache serving.
+- RESP authentication is a shared-token boundary, not PostgreSQL user
+  authentication.
+
+## Documentation
+
+- [Install on an existing PostgreSQL server](docs/INSTALL_EXISTING.md)
+- [SQL, consistency, security, and configuration reference](docs/TECHNICAL.md)
+- [Benchmarks and latency methodology](docs/BENCHMARKS.md)
+- [Monitoring and OOM protection](docs/MONITORING.md)
+- [Benchmark scenarios](benchmarks/SCENARIOS.md)

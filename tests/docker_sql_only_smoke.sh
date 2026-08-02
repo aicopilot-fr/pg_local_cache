@@ -45,6 +45,9 @@ services:
     environment:
       POSTGRES_DB: ${database}
       PG_LOCAL_CACHE_DATABASE: ${database}
+  postgres_stock:
+    environment:
+      POSTGRES_DB: ${database}
 secrets:
   postgres_password:
     file: ${postgres_secret}
@@ -74,6 +77,20 @@ sql_only_state="$(
         "SELECT current_setting('pg_local_cache.port'), (SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE backend_type = 'pg_local_cache RESP worker')"
 )"
 [[ "$sql_only_state" == "0|0" ]]
+
+stock_state="$(
+    compose exec -T postgres_stock \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
+        "SELECT current_setting('server_version_num'), NOT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'pg_local_cache'), position('pg_local_cache' in current_setting('shared_preload_libraries')) = 0"
+)"
+mapped_version="$(
+    compose exec -T postgres \
+        psql --username postgres --dbname "$database" --no-psqlrc \
+        --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
+        "SELECT current_setting('server_version_num')"
+)"
+[[ "$stock_state" == "${mapped_version}|t|t" ]]
 
 compose exec -T postgres \
     psql --username postgres --dbname "$database" --no-psqlrc \
@@ -131,27 +148,49 @@ harness_sha256="$(
         awk '{print $1}'
 )"
 
+runner_limits=(--memory "${PGLC_SQL_ONLY_BENCH_CLIENT_MEMORY:-1g}")
+if [[ -n "${PGLC_SQL_ONLY_BENCH_CLIENT_CPUS:-}" ]]; then
+    runner_limits+=(--cpus "$PGLC_SQL_ONLY_BENCH_CLIENT_CPUS")
+fi
+
 docker run --rm \
     --network "${project}_default" \
     --user "$(id -u):$(id -g)" \
-    --cpus "${PGLC_SQL_ONLY_BENCH_CLIENT_CPUS:-2}" \
-    --memory "${PGLC_SQL_ONLY_BENCH_CLIENT_MEMORY:-1g}" \
+    "${runner_limits[@]}" \
     --volume "${benchmark_output_directory}:/results" \
     --env PGHOST=postgres \
     --env PGPORT=5432 \
     --env PGDATABASE="$database" \
     --env PGUSER=postgres \
     --env PGPASSWORD=SqlOnlyPostgresPassword_0123456789 \
+    --env PGLC_SQL_ONLY_BENCH_STOCK_HOST=postgres_stock \
+    --env PGLC_SQL_ONLY_BENCH_STOCK_PORT=5432 \
+    --env PGLC_SQL_ONLY_BENCH_STOCK_DATABASE="$database" \
+    --env PGLC_SQL_ONLY_BENCH_STOCK_USER=postgres \
+    --env PGLC_SQL_ONLY_BENCH_STOCK_PASSWORD=SqlOnlyPostgresPassword_0123456789 \
     --env PGLC_SQL_ONLY_BENCH_DURATION="${PGLC_SQL_ONLY_BENCH_DURATION:-1}" \
     --env PGLC_SQL_ONLY_BENCH_WARMUP_SECONDS="${PGLC_SQL_ONLY_BENCH_WARMUP_SECONDS:-0}" \
+    --env PGLC_SQL_ONLY_BENCH_LATENCY_DURATION="${PGLC_SQL_ONLY_BENCH_LATENCY_DURATION:-}" \
+    --env PGLC_SQL_ONLY_BENCH_LATENCY_SAMPLE_RATE="${PGLC_SQL_ONLY_BENCH_LATENCY_SAMPLE_RATE:-}" \
+    --env PGLC_SQL_ONLY_BENCH_LATENCY_MIN_SAMPLES="${PGLC_SQL_ONLY_BENCH_LATENCY_MIN_SAMPLES:-}" \
+    --env PGLC_SQL_ONLY_BENCH_LATENCY_MAX_P99_MS="${PGLC_SQL_ONLY_BENCH_LATENCY_MAX_P99_MS:-}" \
     --env PGLC_SQL_ONLY_BENCH_REPETITIONS="${PGLC_SQL_ONLY_BENCH_REPETITIONS:-1}" \
     --env PGLC_SQL_ONLY_BENCH_CONCURRENCY="${PGLC_SQL_ONLY_BENCH_CONCURRENCY:-4}" \
-    --env PGLC_SQL_ONLY_BENCH_JOBS="${PGLC_SQL_ONLY_BENCH_JOBS:-2}" \
+    --env PGLC_SQL_ONLY_BENCH_JOBS="${PGLC_SQL_ONLY_BENCH_JOBS:-}" \
     --env PGLC_SQL_ONLY_BENCH_PIPELINE="${PGLC_SQL_ONLY_BENCH_PIPELINE:-8}" \
     --env PGLC_SQL_ONLY_BENCH_KEYS="${PGLC_SQL_ONLY_BENCH_KEYS:-128}" \
     --env PGLC_SQL_ONLY_BENCH_PAYLOAD_BYTES="${PGLC_SQL_ONLY_BENCH_PAYLOAD_BYTES:-64}" \
     --env PGLC_SQL_ONLY_BENCH_PREPARED_MIN_OPS="${PGLC_SQL_ONLY_BENCH_PREPARED_MIN_OPS:-10000}" \
     --env PGLC_SQL_ONLY_BENCH_EXTENDED_MIN_OPS="${PGLC_SQL_ONLY_BENCH_EXTENDED_MIN_OPS:-10000}" \
+    --env PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_DIRECT_RATIO="${PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_DIRECT_RATIO:-}" \
+    --env PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_STOCK_RATIO="${PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_STOCK_RATIO:-}" \
+    --env PGLC_SQL_ONLY_BENCH_SCALING_SNAPSHOT="${PGLC_SQL_ONLY_BENCH_SCALING_SNAPSHOT:-false}" \
+    --env PGLC_SQL_ONLY_BENCH_SCALING_DURATION="${PGLC_SQL_ONLY_BENCH_SCALING_DURATION:-3}" \
+    --env PGLC_SQL_ONLY_BENCH_SCALING_WARMUP_SECONDS="${PGLC_SQL_ONLY_BENCH_SCALING_WARMUP_SECONDS:-1}" \
+    --env PGLC_SQL_ONLY_BENCH_SCALING_LATENCY_DURATION="${PGLC_SQL_ONLY_BENCH_SCALING_LATENCY_DURATION:-3}" \
+    --env PGLC_SQL_ONLY_BENCH_SCALING_LATENCY_SAMPLE_RATE="${PGLC_SQL_ONLY_BENCH_SCALING_LATENCY_SAMPLE_RATE:-0.10}" \
+    --env PGLC_SQL_ONLY_BENCH_SCALING_LATENCY_MIN_SAMPLES="${PGLC_SQL_ONLY_BENCH_SCALING_LATENCY_MIN_SAMPLES:-500}" \
+    --env PGLC_SQL_ONLY_BENCH_SCALING_REPETITIONS="${PGLC_SQL_ONLY_BENCH_SCALING_REPETITIONS:-1}" \
     --env PGLC_SQL_ONLY_BENCH_OUTPUT_DIR=/results \
     --env PGLC_BENCH_SOURCE_REVISION="$source_revision" \
     --env PGLC_BENCH_SQL_ONLY_HARNESS_SHA256="$harness_sha256" \
@@ -162,4 +201,4 @@ docker run --rm \
 test -s "${benchmark_output_directory}/sql-only.json"
 test -s "${benchmark_output_directory}/sql-only.md"
 
-printf 'ok: SQL-only Docker profile, zero RESP workers, ordinary-role transparent cache, prepared/extended benchmark gates\n'
+printf 'ok: stock PostgreSQL comparison, SQL-only cache, throughput and latency gates\n'

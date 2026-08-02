@@ -55,22 +55,18 @@ jobs:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Validate benchmark source
+      - name: Validate whole-row benchmark source
         run: |
           bash -n benchmarks/run.sh
           python3 -m py_compile \
             benchmarks/compare.py \
             benchmarks/scenarios.py \
             benchmarks/whole_row.py \
-            tests/benchmark_test.py \
-            tests/scenario_benchmark_test.py \
             tests/whole_row_benchmark_test.py
           python3 -m unittest -v \
-            tests/benchmark_test.py \
-            tests/scenario_benchmark_test.py \
             tests/whole_row_benchmark_test.py
 
-      - name: Run identical RESP comparison and PostgreSQL reference
+      - name: Run whole-row RESP and PostgreSQL comparisons
         env:
           PGLC_BENCH_DURATION: ${{ inputs.duration || '120' }}
           PGLC_BENCH_WARMUP_SECONDS: ${{ inputs.warmup || '15' }}
@@ -78,11 +74,7 @@ jobs:
           PGLC_BENCH_PIPELINE: ${{ inputs.pipeline || '32' }}
           PGLC_BENCH_PG_LOCAL_CACHE_WORKERS: ${{ inputs.workers || '4' }}
           PGLC_BENCH_KEYS: ${{ inputs.keys || '16384' }}
-          PGLC_BENCH_REQUIRE_SINGLE_FLIGHT: "1"
           PGLC_BENCH_SINGLEFLIGHT_WAIT_MS: "250"
-          PGLC_BENCH_SQL_DIRECT_SETUP: "SET pg_local_cache.sql_cache = off"
-          PGLC_BENCH_SQL_FAST_PATH_SETUP: "SET pg_local_cache.sql_cache = on"
-          PGLC_BENCH_SQL_MIN_OPS: "10000"
           PGLC_BENCH_ROW_RESP_MIN_OPS: "10000"
           PGLC_BENCH_ROW_SQL_MIN_OPS: "10000"
           PGLC_BENCH_SERVER_CPUS: "2"
@@ -93,16 +85,6 @@ jobs:
       - name: Add report to job summary
         if: always()
         run: |
-          if [[ -f benchmark-results/comparison.md ]]; then
-            cat benchmark-results/comparison.md >> "$GITHUB_STEP_SUMMARY"
-          elif [[ -f benchmark-results/failure.md ]]; then
-            cat benchmark-results/failure.md >> "$GITHUB_STEP_SUMMARY"
-          fi
-          if [[ -f benchmark-results/scenarios.md ]]; then
-            cat benchmark-results/scenarios.md >> "$GITHUB_STEP_SUMMARY"
-          elif [[ -f benchmark-results/scenarios-failure.md ]]; then
-            cat benchmark-results/scenarios-failure.md >> "$GITHUB_STEP_SUMMARY"
-          fi
           if [[ -f benchmark-results/whole-row.md ]]; then
             cat benchmark-results/whole-row.md >> "$GITHUB_STEP_SUMMARY"
           elif [[ -f benchmark-results/whole-row-failure.md ]]; then
@@ -138,13 +120,21 @@ jobs:
           PGLC_SQL_ONLY_BENCH_WARMUP_SECONDS: ${{ inputs.warmup || '15' }}
           PGLC_SQL_ONLY_BENCH_REPETITIONS: ${{ inputs.repetitions || '3' }}
           PGLC_SQL_ONLY_BENCH_CONCURRENCY: "16"
-          PGLC_SQL_ONLY_BENCH_JOBS: "2"
-          PGLC_SQL_ONLY_BENCH_PIPELINE: ${{ inputs.pipeline || '32' }}
+          PGLC_SQL_ONLY_BENCH_PIPELINE: "32"
           PGLC_SQL_ONLY_BENCH_KEYS: ${{ inputs.keys || '16384' }}
           PGLC_SQL_ONLY_BENCH_PAYLOAD_BYTES: "128"
           PGLC_SQL_ONLY_BENCH_PREPARED_MIN_OPS: "10000"
           PGLC_SQL_ONLY_BENCH_EXTENDED_MIN_OPS: "10000"
-          PGLC_SQL_ONLY_BENCH_CLIENT_CPUS: "2"
+          PGLC_SQL_ONLY_BENCH_LATENCY_MIN_SAMPLES: "5000"
+          PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_DIRECT_RATIO: "0.80"
+          PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_STOCK_RATIO: "0.80"
+          PGLC_SQL_ONLY_BENCH_SCALING_SNAPSHOT: "true"
+          PGLC_SQL_ONLY_BENCH_SCALING_DURATION: "3"
+          PGLC_SQL_ONLY_BENCH_SCALING_WARMUP_SECONDS: "1"
+          PGLC_SQL_ONLY_BENCH_SCALING_LATENCY_DURATION: "3"
+          PGLC_SQL_ONLY_BENCH_SCALING_LATENCY_SAMPLE_RATE: "0.10"
+          PGLC_SQL_ONLY_BENCH_SCALING_LATENCY_MIN_SAMPLES: "500"
+          PGLC_SQL_ONLY_BENCH_SCALING_REPETITIONS: "1"
           PGLC_SQL_ONLY_BENCH_CLIENT_MEMORY: "1g"
           PGLC_SQL_ONLY_BENCH_OUTPUT_DIR: ${{ github.workspace }}/sql-only-results
         run: bash tests/docker_sql_only_smoke.sh

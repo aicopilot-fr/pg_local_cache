@@ -219,6 +219,7 @@ jobs:
           install -m 0644 \
             docs/INSTALL_EXISTING.md \
             docs/BENCHMARKS.md \
+            docs/MONITORING.md \
             docs/TECHNICAL.md \
             "$root/docs/"
           install -m 0644 benchmarks/SCENARIOS.md "$root/benchmarks/"
@@ -263,35 +264,10 @@ jobs:
             --name sql-only-benchmark-smoke \
             --dir ci-evidence/sql-only
 
-          python3 - "$RELEASE_SHA" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-
-          expected_revision = sys.argv[1]
-          reports = {
-              Path("ci-evidence/comparison/comparison.json"):
-                  ("images", "benchmark_client", "source_revision"),
-              Path("ci-evidence/comparison/whole-row.json"):
-                  ("environment", "source_revision"),
-              Path("ci-evidence/sql-only/sql-only.json"):
-                  ("environment", "source_revision"),
-          }
-          for path, revision_path in reports.items():
-              report = json.loads(path.read_text(encoding="utf-8"))
-              value = report
-              for key in revision_path:
-                  value = value[key]
-              if value != expected_revision:
-                  raise SystemExit(
-                      f"{path}: source revision {value!r} != {expected_revision!r}"
-                  )
-              if report.get("gate", {}).get("status") != "PASS":
-                  raise SystemExit(f"{path}: benchmark gate is not PASS")
-              markdown = path.with_suffix(".md")
-              if not markdown.is_file() or markdown.stat().st_size == 0:
-                  raise SystemExit(f"{markdown}: missing benchmark Markdown")
-          PY
+          python3 scripts/validate_benchmark_evidence.py \
+            --revision "$RELEASE_SHA" \
+            --whole ci-evidence/comparison/whole-row.json \
+            --sql-only ci-evidence/sql-only/sql-only.json
 
           evidence_name="pg_local_cache-${VERSION}-${SHORT_SHA}-ci-benchmarks"
           epoch="$(git show -s --format=%ct "$RELEASE_SHA")"

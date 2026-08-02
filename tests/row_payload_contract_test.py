@@ -144,6 +144,30 @@ class RowPayloadSourceContractTests(unittest.TestCase):
             self.assertIn(field, fingerprint)
         self.assertNotIn("sizeof(FormData_pg_attribute)", fingerprint)
 
+    def test_decode_uses_the_prevalidated_descriptor_fingerprint(self) -> None:
+        decode_at = SOURCE.index("pglc_row_payload_decode(")
+        get_json_at = SOURCE.index("pglc_row_payload_get_json(", decode_at)
+        decode = SOURCE[decode_at:get_json_at]
+
+        self.assertIn("uint64 expected_descriptor_fingerprint", decode)
+        self.assertIn("fingerprint != expected_descriptor_fingerprint", decode)
+        self.assertNotIn(
+            "pglc_row_payload_tupledesc_fingerprint(expected_descriptor)",
+            decode,
+        )
+        self.assertIn(
+            "state->row_fingerprint",
+            (ROOT / "src" / "pg_local_cache_sql.c").read_text(
+                encoding="utf-8"
+            ),
+        )
+        self.assertIn(
+            "mapping->row_descriptor_fingerprint",
+            (ROOT / "src" / "pg_local_cache_worker.c").read_text(
+                encoding="utf-8"
+            ),
+        )
+
     def test_sql_safe_mode_does_not_render_json(self) -> None:
         self.assertIn("PGLC_ROW_PAYLOAD_FLAG_HAS_JSON", SOURCE)
         self.assertIn("fmgr_info(F_ROW_TO_JSON_RECORD", SOURCE)

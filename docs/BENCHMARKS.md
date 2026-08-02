@@ -1,195 +1,339 @@
+---
+layout: doc
+title: PostgreSQL cache benchmarks
+description: Reproducible pg_local_cache throughput, latency and correctness measurements against PostgreSQL, Valkey and Redis.
+section: Benchmarks
+permalink: /docs/BENCHMARKS.html
+---
+
 # pg_local_cache benchmarks
 
-The benchmark suite exists to answer separate questions without hiding their
-different semantics behind one ops/s number:
+The benchmark suite separates ordinary SQL, whole-row RESP reads, and
+payload-width sweeps. Write, rollback, DDL, and invalidation semantics are
+verified by integration tests because they have different durability and
+transaction contracts and do not belong in a cache-read ranking.
 
-- how fast is a warm whole-row `GET` compared with Valkey and Redis when the
-  client, payload and network are identical;
-- how fast is an ordinary SQL primary-key lookup through the transparent
-  cache compared with the normal PostgreSQL plan;
-- does the SQL-only deployment retain the same fast path with no RESP listener,
-  token or workers;
-- what do cold fills, same-key fan-in, transactional writes and invalidation
-  cost;
-- how throughput and latency change as the full row grows.
+## Results
 
-Each read lane has its own integrity checks and gate. Prepared and unnamed
-extended SQL are never averaged together. RESP writes are never presented as
-durability-equivalent to in-memory Valkey/Redis writes.
+The latest pinned result is [CI run 30729192604](https://github.com/aicopilot-fr/pg_local_cache/actions/runs/30729192604)
+for [source `9cf12e3`](https://github.com/aicopilot-fr/pg_local_cache/commit/9cf12e34bee512e4d453e117c39ca8eb140afd4d).
+It used three repetitions, 4,096 keys, 128-byte payloads, c16/p32 throughput,
+and a separate c16/p1 latency pass.
 
-## Headline long-run reference
+| Protocol | Path | Median ops/s | Mean | p50 | p95 | p99 |
+|---|---|---:|---:|---:|---:|---:|
+| Prepared | Stock PostgreSQL 16 | 37,054 | 1.200 ms | 1.070 ms | 2.501 ms | 3.982 ms |
+| Prepared | Mapped, cache off | 37,310 | 1.157 ms | 1.038 ms | 2.486 ms | 4.239 ms |
+| Prepared | Cache on | 34,662 | 1.160 ms | 1.040 ms | 2.459 ms | 3.989 ms |
+| Extended | Stock PostgreSQL 16 | 16,595 | 2.183 ms | 1.954 ms | 4.501 ms | 6.162 ms |
+| Extended | Mapped, cache off | 16,704 | 2.193 ms | 1.945 ms | 4.501 ms | 6.145 ms |
+| Extended | Cache on | 14,941 | 2.214 ms | 2.016 ms | 4.585 ms | 6.366 ms |
 
-The long reference run used three measured repetitions of 120 seconds after a
-15-second warmup, 16 persistent clients, pipeline 32, 16,384 warm keys, four
-`pg_local_cache` workers and separate two-CPU server/client quotas.
+Prepared cache-on was 0.94x stock and 0.93x mapped cache-off. Extended
+cache-on was 0.90x stock and 0.89x mapped cache-off. These short GitHub-hosted
+measurements detect regressions; shared-runner scheduling makes them unsuitable
+for capacity claims.
 
-| Lane | Target | Median ops/s |
-|---|---|---:|
-| Whole-row RESP GET | **pg_local_cache** | **106,948** |
-| Whole-row RESP GET | Valkey | 118,387 |
-| Whole-row RESP GET | Redis | 123,790 |
-| Ordinary SQL prepared | **pg_local_cache cached fast path** | **70,275** |
-| Ordinary SQL unnamed extended | **pg_local_cache cached fast path** | **18,985** |
-| Transactional RESP SET | pg_local_cache | 5,456 |
-| Transactional RESP DEL | pg_local_cache | 5,520 |
+The same artifact contains a non-gating c4/p8 throughput snapshot with a
+separate c4/p1 latency pass:
 
-The whole-row RESP result is about 90% of Valkey in this environment. Unlike
-Valkey/Redis, `pg_local_cache` derives the value from the authoritative table
-and invalidates it with the PostgreSQL transaction. `SET` and `DEL` each
-include a real PostgreSQL transaction, WAL and commit-time invalidation, so
-their numbers belong in a separate write table.
+| Protocol | Path | Median ops/s | Mean | p50 | p95 | p99 |
+|---|---|---:|---:|---:|---:|---:|
+| Prepared | Stock PostgreSQL 16 | 32,716 | 0.320 ms | 0.263 ms | 0.742 ms | 1.365 ms |
+| Prepared | Mapped, cache off | 32,834 | 0.317 ms | 0.239 ms | 0.786 ms | 1.669 ms |
+| Prepared | Cache on | 31,071 | 0.331 ms | 0.240 ms | 0.894 ms | 1.668 ms |
+| Extended | Stock PostgreSQL 16 | 15,065 | 0.548 ms | 0.482 ms | 1.039 ms | 1.767 ms |
+| Extended | Mapped, cache off | 14,906 | 0.499 ms | 0.461 ms | 0.923 ms | 1.115 ms |
+| Extended | Cache on | 14,012 | 0.534 ms | 0.490 ms | 0.999 ms | 1.272 ms |
 
-The suite now packages raw JSON, Markdown and checksums with CI/release
-artifacts. Older headline values are retained as a reference baseline; a new
-publication-quality run should replace them only as a complete, immutable
-report, never by selecting the best repetition.
+The same run recorded a separate one-second, one-repetition c4/p8 RESP smoke
+test. Each target returned byte-identical whole-row JSON:
 
-## Current 1.0.0 CI smoke evidence
+| Target | Median ops/s | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|
+| pg_local_cache 1.0.0 | 165,495 | 0.157 ms | 0.290 ms | 0.507 ms |
+| Valkey 9.1.1 | 214,310 | 0.118 ms | 0.232 ms | 0.329 ms |
+| Redis 8.8.1 | 201,990 | 0.107 ms | 0.265 ms | 0.420 ms |
 
-The clean 1.0.0 baseline was also exercised by
-[CI run 30710976393](https://github.com/aicopilot-fr/pg_local_cache/actions/runs/30710976393)
-at commit `08b788fb6fbcfe295b5ff7f931ab52136c6799fa`.
+The RESP and SQL tables measure different protocols and must not be combined
+into one ranking.
 
-The smoke intentionally ran for only one second with one repetition, four
-clients, pipeline 8, 128 keys, one extension worker and two-CPU quotas. It is a
-correctness/regression gate, not a publishable engine ranking:
+The comparison job also records three prepared SQL shapes. This is a
+one-second, one-repetition smoke test, separate from the primary SQL-only suite:
 
-| Smoke lane | pg_local_cache | Comparison |
-|---|---:|---:|
-| Full-row RESP GET | 117,763 ops/s | Valkey 146,142; Redis 143,288 |
-| Ordinary SQL `SELECT *` | 67,487 ops/s | stock PostgreSQL 51,482 |
-| Reordered SQL projection | 69,221 ops/s | stock PostgreSQL 50,077 |
-| Composite predicate reordered | 76,194 ops/s | stock PostgreSQL 54,415 |
-| Prepared scalar projection | 97,762 ops/s | same server, cache off 56,193 |
-| Unnamed extended projection | 19,801 ops/s | same server, cache off 27,484 |
+| SQL shape | Mapped cache ops/s | Stock PostgreSQL ops/s | Mapped/stock |
+|---|---:|---:|---:|
+| `SELECT *` | 115,344 | 65,062 | 1.77x |
+| Reordered projection | 113,799 | 62,254 | 1.83x |
+| Reordered composite predicates | 124,305 | 67,099 | 1.85x |
 
-All cached SQL operations were accounted as hits with zero timed miss, fill or
-safety bypass. The prepared/extended difference is expected: unnamed extended
-mode performs Parse/Bind/Execute for every lookup, while prepared mode reuses
-server-side parse analysis.
+The short comparison job and repeated SQL-only suite use different table
+shapes, durations, server allocations, and run ordering. Their rates are not
+pooled or used to claim one universal speedup.
+
+A publishable result retains raw JSON and rendered Markdown with the source
+revision, harness checksum, server and client configuration, all repetitions,
+throughput distribution, and latency distribution. It does not select a single
+best repetition.
+
+## Comparison matrix
+
+| Suite | Baseline | Extension control | Cached path | Primary measurements |
+|---|---|---|---|---|
+| SQL-only ordinary `SELECT` | Stock PostgreSQL without `pg_local_cache` | Same mapped server with `pg_local_cache.sql_cache=off` | Same mapped server with `sql_cache=on` | Median ops/s; per-operation mean, p50, p95, p99; cache counters |
+| Whole-row RESP `GET` | Valkey and Redis with persistence disabled | Not applicable | `pg_local_cache` KVik-inspired whole-row key | Median ops/s; client-observed p50, p95, p99; reply validation; database-read deltas |
+| RESP payload width | Same key and client settings at each row width | Not applicable | Complete cached row | Median ops/s; encoded row bytes; cache counters |
+
+The SQL-only table is the primary comparison for applications that keep using
+normal PostgreSQL drivers. The RESP table answers a different question: the
+cost of reading an identical JSON row through the optional cache endpoint.
 
 ## Dedicated SQL-only benchmark
 
-`benchmarks/sql_only.py` runs against `compose.sql-only.yaml`, where:
+`benchmarks/sql_only.py`, launched by `tests/docker_sql_only_smoke.sh`, creates
+two PostgreSQL 16 servers:
 
-- `pg_local_cache.port=0`;
-- no RESP secret is mounted;
-- zero RESP workers exist;
-- an actual `LOGIN NOSUPERUSER` role issues ordinary `SELECT *` by complete PK;
-- a whole-row mapping is installed with `attach_table`;
-- the harness proves one miss, one fill and then one hit;
-- it verifies the full source row count/key range and byte-identical
-  direct-vs-cached whole rows for the first, middle and last keys;
-- prepared and unnamed extended lanes compare cache off/on in the same
-  container, query, keyspace and client configuration;
-- successful timed statements must equal the `sql_cache_hits` delta;
-- miss, fill and bypass deltas must remain zero during the warm measurement;
-- both protocols independently enforce `>=10,000 ops/s` by default.
+- a stock server that neither installs nor preloads the extension;
+- a mapped server with `pg_local_cache.port=0`, so it has no RESP secret,
+  listener, worker, or client buffers.
 
-Run the Docker SQL-only correctness suite and benchmark together:
+The harness creates the same schema and rows on both servers and verifies that
+their relevant PostgreSQL settings match. A `LOGIN NOSUPERUSER` role executes
+the same complete-primary-key `SELECT *` in three modes:
+
+1. stock PostgreSQL;
+2. the mapped server with SQL caching disabled;
+3. the mapped server with SQL caching enabled.
+
+Each mode is measured independently for both `pgbench -M prepared` and
+`pgbench -M extended`. Prepared mode reuses a server-side prepared statement.
+Extended mode sends unnamed Parse/Bind/Execute messages for every batch. Driver
+auto-prepare policies differ, so neither lane is a universal proxy for every
+ORM.
+
+### Correctness contract
+
+Before timing, the harness verifies:
+
+- the stock server does not contain or preload `pg_local_cache`;
+- stock and mapped servers use the same PostgreSQL version and comparison
+  settings;
+- source row counts and key ranges match;
+- stock, mapped-direct, and cached sentinel rows are byte-identical;
+- the mapped plan includes `Custom Scan (pg_local_cache_sql)` when enabled;
+- a cold SQL lookup produces one miss and fill, followed by a hit;
+- the SQL-only server reports zero configured/running RESP workers and zero
+  RESP memory.
+
+During every cached throughput and latency window, successful statements must
+equal the `sql_cache_hits` delta exactly. Timed misses, fills, and safety
+bypasses must remain zero. Direct runs must not change any `sql_cache_*`
+counter. Any mismatch fails the run rather than reporting a misleading rate.
+
+### Throughput and latency
+
+Throughput runs use persistent connections and a configurable number of
+validated lookups per transaction batch. `operations_per_second` is batch TPS
+multiplied by that exact lookup count; failed batches remain visible in the raw
+report.
+
+Latency runs are separate. They use one `SELECT` per transaction, persistent
+connections, and pgbench latency logs with deterministic sampling. The report
+contains mean, p50, p95, p99, maximum, and sample count for each protocol and
+each of the three modes. These are client-observed end-to-end operation
+latencies, including PostgreSQL protocol and transaction overhead after the
+connection is established. They are not inferred by dividing pipelined batch
+latency. This is a closed-loop saturation measurement: each client submits its
+next transaction after the previous one completes. It does not hold the offered
+request rate constant across modes, so it should not be read as a fixed-rate
+service-time comparison.
+
+The default latency gate is `MEASURED`: no p99 limit is assumed across unknown
+hardware. Set `PGLC_SQL_ONLY_BENCH_LATENCY_MAX_P99_MS` to enforce a deployment-
+specific ceiling. `PGLC_SQL_ONLY_BENCH_LATENCY_MIN_SAMPLES` prevents a sparse
+sample from passing.
+
+Relative throughput gates are also optional. Set
+`PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_DIRECT_RATIO` and
+`PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_STOCK_RATIO` to reject a cached result below
+the required fraction of the mapped-direct and stock medians. CI currently
+sets both to `0.80`; an unset gate is reported as `MEASURED` rather than passed.
+
+### c4/p8 and c16/p32 snapshot
+
+CI also records a short scaling snapshot on the same runner and the same two
+PostgreSQL containers. The existing c16/p32 result remains the strict primary
+profile with three repetitions and all configured gates. The harness then runs
+one non-gating c4/p8 repetition for both prepared and unnamed-extended SQL.
+
+The profile pipeline applies only to the throughput pass. Latency is always
+measured with one `SELECT` per transaction, so the corresponding latency
+profiles are c4/p1 and c16/p1. The generated table reports stock PostgreSQL,
+the mapped table with caching off, and caching on with median throughput plus
+latency mean, p50, p95, and p99.
+
+The c4/p8 performance numbers do not decide the build result. Incorrect cache
+counters, failed batches, missing raw latency samples, or a wrong pipeline do
+fail the benchmark. The c16/p32 entry reuses the strict primary result.
+
+This snapshot changes connection count and throughput pipeline together. It
+compares two operating profiles; it is not a causal concurrency curve. Use a
+long, repeated dedicated run before publishing capacity claims.
+
+### Run it
+
+The command below runs integration checks followed by three 30-second
+throughput repetitions and per-mode latency passes:
 
 ```bash
 PGLC_SQL_ONLY_BENCH_DURATION=30 \
 PGLC_SQL_ONLY_BENCH_WARMUP_SECONDS=5 \
+PGLC_SQL_ONLY_BENCH_LATENCY_DURATION=15 \
+PGLC_SQL_ONLY_BENCH_LATENCY_SAMPLE_RATE=0.05 \
+PGLC_SQL_ONLY_BENCH_LATENCY_MIN_SAMPLES=200 \
 PGLC_SQL_ONLY_BENCH_REPETITIONS=3 \
+PGLC_SQL_ONLY_BENCH_CONCURRENCY=16 \
+PGLC_SQL_ONLY_BENCH_PIPELINE=32 \
+PGLC_SQL_ONLY_BENCH_KEYS=16384 \
+PGLC_SQL_ONLY_BENCH_PAYLOAD_BYTES=128 \
 PGLC_SQL_ONLY_BENCH_PREPARED_MIN_OPS=10000 \
 PGLC_SQL_ONLY_BENCH_EXTENDED_MIN_OPS=10000 \
+PGLC_SQL_ONLY_BENCH_SCALING_SNAPSHOT=true \
+PGLC_SQL_ONLY_BENCH_SCALING_DURATION=3 \
+PGLC_SQL_ONLY_BENCH_SCALING_WARMUP_SECONDS=1 \
+PGLC_SQL_ONLY_BENCH_SCALING_LATENCY_DURATION=3 \
+PGLC_SQL_ONLY_BENCH_SCALING_LATENCY_SAMPLE_RATE=0.10 \
+PGLC_SQL_ONLY_BENCH_SCALING_LATENCY_MIN_SAMPLES=500 \
+PGLC_SQL_ONLY_BENCH_SCALING_REPETITIONS=1 \
 PGLC_SQL_ONLY_BENCH_OUTPUT_DIR="$PWD/benchmark-results/sql-only" \
 bash tests/docker_sql_only_smoke.sh
 ```
 
-The command writes `sql-only.json` and `sql-only.md`. GitHub CI uploads the
-same files even on failure.
+The output directory receives:
 
-## Full comparison
+- `sql-only.json`: raw configuration, correctness checks, repetitions,
+  counters, raw latency samples, distributions, and gates;
+- `sql-only.md`: rendered strict and scaling tables for stock, mapped-direct,
+  and cached paths;
+- a failure report if the harness stops before satisfying its contract.
 
-The default full suite starts PostgreSQL with `pg_local_cache`, stock
-PostgreSQL, Valkey, Redis and a separate benchmark client:
+The SQL-only client has no Docker CPU quota by default. `pgbench` uses one job
+per detected CPU, capped by the configured connection count. Set
+`PGLC_SQL_ONLY_BENCH_CLIENT_CPUS` and `PGLC_SQL_ONLY_BENCH_JOBS` when a repeatable
+client allocation is required. The report records the effective job count,
+logical CPUs, and cgroup CPU and memory limits either way.
+
+The 10,000 ops/s defaults are regression floors for the cached prepared and
+extended lanes. They are not published capacity claims. Set them to zero only
+for diagnosis, and set a higher target for a deployment-specific release gate.
+
+## Whole-row RESP comparison
+
+Run the whole-row comparison with:
 
 ```bash
 bash benchmarks/run.sh
 ```
 
-Default workload:
+The whole-row report is written to `whole-row.json` and `whole-row.md`. It
+creates a table with a composite primary key and reads keys in this form:
 
-| Parameter | Value |
-|---|---:|
-| Measured duration | 120 s per target/repetition |
-| Warmup | 15 s |
-| Repetitions | 3 |
-| Persistent clients | 16 |
-| Pipeline depth | 32 |
-| Warm keys | 16,384 |
-| Scalar value | 128 bytes |
-| Whole-row payload sweep | 64, 512, 2,048 text bytes |
-| Read gate | 10,000 ops/s per independent lane |
+```text
+CRUD:database.schema.table:{"pk_a":1,"pk_b":"value"}
+```
 
-Output files:
+For every source row, PostgreSQL's exact row JSON is loaded byte-for-byte into
+Valkey and Redis. The three targets receive the same client implementation,
+key order, connections, pipeline depth, CPU quota, Docker network, and reply
+validation. Target order rotates between repetitions. Valkey and Redis
+persistence is disabled because this lane measures cache reads, not durable
+writes.
 
-- `comparison.json` / `comparison.md`: byte-identical scalar RESP comparison
-  and separate stock PostgreSQL reference;
-- `whole-row.json` / `whole-row.md`: KVik-style full-row RESP, width sweep and
-  ordinary whole-row SQL projections;
-- `scenarios.json` / `scenarios.md`: cold/warm reads, single-flight, writes,
-  prepared/extended SQL and post-commit validation;
-- failure reports when a harness exits before satisfying its contract.
+Before a timed `pg_local_cache` pass, the harness warms and validates the full
+working set. A timed pass fails if it records a cache miss, source-table read,
+protocol error, or wrong value. Payload-width sweeps remain separate because
+row size changes serialization, copying, network, and client-decoding costs.
 
-The JSON includes every repetition, median/min/max/CV, client-observed
-p50/p95/p99, operation counts, errors, cache/database counter deltas, image
-identities, source revision and a SHA-256 of each harness.
+On success, the comparison runner writes `whole-row.json` and `whole-row.md`.
+SQL-only evidence is produced separately by `tests/docker_sql_only_smoke.sh` as
+`sql-only.json` and `sql-only.md`. The exact workloads and controls are listed
+in the
+[benchmark scenarios](https://github.com/aicopilot-fr/pg_local_cache/blob/main/benchmarks/SCENARIOS.md).
 
 ## Fairness rules
 
-### RESP comparison
+### Ordinary SQL
 
-`pg_local_cache`, Valkey and Redis receive:
+- Stock, mapped-direct, and cached runs use the same PostgreSQL major and
+  checked comparison settings.
+- Schema, generated data, query text, key sequence, role capabilities,
+  connection count, client process, protocol, pipeline, and random seed match.
+- The mapped direct/cache pair differs only by
+  `SET pg_local_cache.sql_cache=off|on`.
+- Stock and cached sentinel rows are compared before timing.
+- Prepared and unnamed-extended results are never averaged together.
+- Throughput and single-operation latency are measured in separate passes.
 
-- one byte-identical encoded `GET` stream;
-- the same per-key full-row JSON bytes;
-- one Python/multiprocess client implementation;
-- the same number of connections and pipeline depth;
-- one Docker bridge network and identical client CPU quota;
-- a rotated target order between repetitions.
+The stock server shows end-to-end behavior without the extension. The mapped
+cache-off lane isolates the overhead of the preloaded extension, mapping, and
+invalidation hooks on the same server used for the cache-on lane. Both
+baselines belong in a published table.
 
-Every response is validated. A measured `pg_local_cache` warm run fails if it
-performs a database read or cache miss. Valkey/Redis RDB and AOF are disabled
-because this lane measures cache reads, not durability.
+### RESP
 
-### Ordinary SQL comparison
+- Payload bytes and encoded request streams match across targets.
+- Connection and authentication setup is outside the timed interval.
+- Every response is decoded and checked, not merely counted.
+- Warm-read runs require no timed PostgreSQL source read or cache miss.
+- RESP writes are not presented as durability-equivalent to Valkey or Redis
+  writes with persistence disabled.
 
-SQL is intentionally separate from RESP because libpq extended protocol has
-different framing and transaction semantics. Mapped and direct lanes use the
-same PostgreSQL container, query text, parameters, clients, pipeline and seed;
-only `SET pg_local_cache.sql_cache=on|off` differs. Whole-row lanes also execute
-the same query against a separate stock PostgreSQL reference.
+### Latency semantics
 
-### Latency
+SQL-only latency uses one `SELECT` per transaction. RESP latency starts when a
+pipeline is sent and ends after its replies are decoded, so it includes queueing
+behind earlier commands in that pipeline. Do not compare their percentiles
+directly. Record protocol, pipeline depth, client count, and sampling method
+with every latency table.
 
-RESP latency measures from sending a complete pipeline batch until each reply
-finishes, including queueing behind earlier replies. Deterministic per-client
-Algorithm R reservoirs cover the entire interval. This is client-observed
-pipeline-completion latency, not isolated server service time.
+## Correctness outside timed read lanes
 
-`pgbench` reports average transaction-batch latency. Operations/s is batch TPS
-multiplied by the number of validated lookups in that pipeline batch.
+Cold-fill checks account for the expected source reads and fills, while warm
+read measurements require zero source reads and misses. Rollback, primary-key
+changes, `TRUNCATE`, DDL, RESP writes, and reconciliation are covered by Docker
+integration tests rather than inferred from throughput counters.
 
-## Publication-quality run
+See
+[SCENARIOS.md](https://github.com/aicopilot-fr/pg_local_cache/blob/main/benchmarks/SCENARIOS.md)
+for every timed operation and its required counter evidence.
 
-GitHub hosted runners are useful for regression detection but provide CPU
-quotas, not affinity. For a result intended for a public comparison:
+## Publishing results
 
-1. pin server and client to separate physical CPU sets;
-2. disable swap and unrelated workloads;
-3. record CPU model/governor, memory, kernel, Docker and storage;
-4. use digest-pinned PostgreSQL, Valkey and Redis images;
-5. keep the default long warmup and at least three 120-second repetitions;
-6. inspect CV and CPU-quota saturation instead of reporting only median;
-7. retain the complete JSON and Markdown, harness checksums and commit SHA;
-8. publish every run, not only the fastest one.
+For results intended for a public comparison:
 
-The benchmark workflow can also be triggered manually and runs monthly to
-catch regressions. Release artifacts preserve the CI evidence that would
-otherwise expire from Actions storage.
+1. Use a clean commit and record its full SHA; do not publish a dirty-tree run.
+2. Pin PostgreSQL, Valkey, Redis, and benchmark-client images by digest.
+3. Pin server and client to separate physical CPU sets rather than relying only
+   on Docker quotas.
+4. Disable swap and unrelated workloads; record CPU model, frequency governor,
+   memory, kernel, container runtime, and storage.
+5. Keep schemas, payload bytes, key distribution, connection counts, and
+   protocols identical within each comparison.
+6. Use a meaningful warmup and at least three long repetitions. Inspect
+   min/median/max and coefficient of variation.
+7. Report throughput and latency together. Include p50, p95, p99, sample count,
+   and the latency semantics above.
+8. Retain all raw repetitions, failures, counter deltas, rendered tables,
+   harness checksums, and image identities.
+9. Commit the complete report and link it from the README by immutable source
+   revision. Do not copy a number from an expiring CI artifact without its
+   evidence bundle.
+10. Repeat the run on the intended HA, storage, connection-pool, row-width, and
+    CPU profile before setting a service objective.
 
-See [extended scenario definitions](../benchmarks/SCENARIOS.md) and the
-[technical reference](TECHNICAL.md) for cache semantics and limits.
+GitHub-hosted runners remain useful for correctness and regression detection,
+but variable CPU scheduling makes them unsuitable as the sole source of a
+capacity comparison.
+
+For implementation limits that affect interpretation, see the
+[technical reference]({{ '/docs/TECHNICAL.html' | relative_url }}).

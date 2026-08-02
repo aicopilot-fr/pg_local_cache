@@ -155,12 +155,8 @@ typedef struct PgLocalCacheMapping
 	char		nspace[PGLC_NAMESPACE_MAX];
 	char		schema_name[NAMEDATALEN];
 	char		relation_name[NAMEDATALEN];
-	char		value_column[NAMEDATALEN];
 	char		key_columns[PGLC_MAX_KEY_COLUMNS][NAMEDATALEN];
 	Oid			relation_oid;
-	Oid			value_type;
-	Oid			value_ioparam;
-	int32		value_typmod;
 	int			key_count;
 	AttrNumber	key_attnos[PGLC_MAX_KEY_COLUMNS];
 	Oid			key_types[PGLC_MAX_KEY_COLUMNS];
@@ -172,10 +168,8 @@ typedef struct PgLocalCacheMapping
 	uint64		row_descriptor_fingerprint;
 	uint64		config_generation;
 	bool		writable;
-	bool		whole_row;
 	FmgrInfo	key_inputs[PGLC_MAX_KEY_COLUMNS];
 	FmgrInfo	key_outputs[PGLC_MAX_KEY_COLUMNS];
-	FmgrInfo	value_input;
 	TupleDesc	row_desc;
 	SPIPlanPtr	get_plan;
 	SPIPlanPtr	set_plan;

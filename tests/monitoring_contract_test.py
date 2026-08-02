@@ -349,6 +349,15 @@ class RespConnectionBudgetSourceTests(unittest.TestCase):
 
 
 class MonitoringInterfaceSourceTests(unittest.TestCase):
+    def test_runtime_monitoring_uses_the_active_integration_support(self) -> None:
+        integration = (
+            ROOT / "tests" / "oom_monitoring_integration.py"
+        ).read_text()
+        self.assertIn("from pipeline_integration import", integration)
+        self.assertNotIn("from integration import", integration)
+        self.assertIn("wait_for_mapping_ready()", integration)
+        self.assertIn("transactional ACL reload", integration)
+
     def test_mapping_reload_uses_a_resettable_context_and_two_hard_limits(self) -> None:
         reload_mappings = c_function(WORKER, "reload_mappings")
         self.assertGreaterEqual(

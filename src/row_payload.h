@@ -47,9 +47,11 @@ extern bool pglc_row_payload_encode(TupleTableSlot *slot,
 									char *destination,
 									Size destination_capacity,
 									Size *payload_len);
+/* expected_descriptor_fingerprint must describe expected_descriptor. */
 extern bool pglc_row_payload_decode(const char *payload,
 									Size payload_len,
 									TupleDesc expected_descriptor,
+									uint64 expected_descriptor_fingerprint,
 									MemoryContext result_context,
 									PgLocalCacheRowPayloadView *view);
 extern bool pglc_row_payload_get_json(const PgLocalCacheRowPayloadView *view,

@@ -8,6 +8,9 @@ WORKER = (ROOT / "src" / "pg_local_cache_worker.c").read_text()
 WHOLE_ROW_INTEGRATION = (
     ROOT / "tests" / "whole_row_integration.py"
 ).read_text()
+PIPELINE_INTEGRATION = (
+    ROOT / "tests" / "pipeline_integration.py"
+).read_text()
 
 
 def c_function(source: str, name: str) -> str:
@@ -37,12 +40,19 @@ class KvikWireContractTests(unittest.TestCase):
     def test_crud_keys_are_scoped_to_the_current_database_and_exact_table(self):
         resolver = c_function(WORKER, "resolve_wire_key")
         self.assertIn('"CRUD:%s.%s.%s:"', resolver)
-        self.assertIn("!candidate->whole_row", resolver)
         self.assertIn("pglc_database", resolver)
         self.assertNotIn("get_database_name", resolver)
         self.assertNotIn("SearchSysCache", resolver)
         self.assertIn("ERR KVik key targets a different database", resolver)
         self.assertIn("ERR unknown KVik table mapping", resolver)
+
+    def test_pipeline_black_box_uses_only_active_crud_wire_keys(self):
+        self.assertIn(
+            'f"CRUD:{PGDATABASE}.public.{table}:"', PIPELINE_INTEGRATION
+        )
+        self.assertIn('{"id": str(row_id)}', PIPELINE_INTEGRATION)
+        self.assertNotIn('f"{namespace}:', PIPELINE_INTEGRATION)
+        self.assertNotIn("namespace: str", PIPELINE_INTEGRATION)
 
     def test_composite_json_keys_are_complete_and_canonical(self):
         canonical = c_function(WORKER, "canonicalize_key")
@@ -59,7 +69,6 @@ class KvikWireContractTests(unittest.TestCase):
         self.assertIn("pglc_cache_invalidate_database(MyDatabaseId)", dispatch)
         self.assertIn("pglc_cache_invalidate_namespace", dispatch)
         self.assertIn("pglc_cache_invalidate_key", dispatch)
-        self.assertIn("!worker_mappings[i].whole_row", dispatch)
         self.assertIn("pglc_database", dispatch)
         self.assertNotIn("get_database_name", dispatch)
 
@@ -165,12 +174,10 @@ class WholeRowWorkerContractTests(unittest.TestCase):
                 f"NOT pg_catalog.has_table_privilege(c.oid, '{privilege}')",
                 reload,
             )
-        self.assertIn("m.value_column <> ALL (m.key_columns)", reload)
         self.assertIn(
-            "wa.attgenerated <> '' OR wa.attidentity <> ''", reload
+            "wa.attgenerated <> ''", reload
         )
-        self.assertIn("wa.attname <> ALL (m.key_columns)", reload)
-        self.assertIn("wa.attnotnull AND NOT wa.atthasdef", reload)
+        self.assertIn("wa.attname = ANY (m.key_columns)", reload)
 
 
 if __name__ == "__main__":

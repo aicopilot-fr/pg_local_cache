@@ -107,13 +107,11 @@ static void maybe_reload_mappings(void);
 static bool reload_mappings(uint64 target_generation);
 static void set_worker_mappings_incomplete(bool incomplete);
 static void set_worker_mapping_generation(uint64 generation);
-static PgLocalCacheMapping *find_mapping(const char *nspace);
 static bool resolve_wire_key(const PgLocalCacheRespArg *wire_key,
-							 PgLocalCacheMapping **mapping, char **raw_key,
-							 bool *json_key, char **error);
+								 PgLocalCacheMapping **mapping, char **raw_key,
+								 char **error);
 static bool canonicalize_key(PgLocalCacheMapping *mapping, const char *raw_key,
-							 bool json_key, Datum *key_values,
-							 char **canonical, char **error);
+								 Datum *key_values, char **canonical, char **error);
 static bool row_json_validate(PgLocalCacheMapping *mapping, Jsonb *row,
 							  Datum *key_values, char **error);
 static bool cached_row_json(PgLocalCacheMapping *mapping,
@@ -122,13 +120,12 @@ static bool cached_row_json(PgLocalCacheMapping *mapping,
 							char **json, Size *json_length);
 static void ensure_mapping_current(const PgLocalCacheMapping *mapping);
 static char *command_get(PgLocalCacheMapping *mapping, const char *raw_key,
-						 bool json_key, Size *response_length);
+							 Size *response_length);
 static char *command_set(PgLocalCacheMapping *mapping, const char *raw_key,
-						 bool json_key,
-						 const PgLocalCacheRespArg *value_arg,
-						 Size *response_length);
+							 const PgLocalCacheRespArg *value_arg,
+							 Size *response_length);
 static char *command_delete(PgLocalCacheMapping *mapping, const char *raw_key,
-							bool json_key, Size *response_length);
+								Size *response_length);
 
 PGDLLEXPORT void
 pg_local_cache_worker_main(Datum main_arg)
@@ -1012,7 +1009,6 @@ execute_command_inner(PgLocalCacheClient *client, PgLocalCacheRespArg *args, int
 	char	   *raw_key;
 	char	   *key_error;
 	PgLocalCacheMapping *mapping;
-	bool		json_key;
 	bool		is_delete;
 	bool		is_get;
 	bool		is_set;
@@ -1070,22 +1066,20 @@ execute_command_inner(PgLocalCacheClient *client, PgLocalCacheRespArg *args, int
 			(is_delete && argc != 2))
 			return pglc_resp_error("ERR wrong number of arguments",
 								  response_length);
-		if (!resolve_wire_key(&args[1], &mapping, &raw_key, &json_key,
-							  &key_error))
+		if (!resolve_wire_key(&args[1], &mapping, &raw_key, &key_error))
 			return pglc_resp_error(key_error, response_length);
 		if (is_get)
 		{
 			pg_atomic_fetch_add_u64(&pglc_shared->client_gets, 1);
-			return command_get(mapping, raw_key, json_key, response_length);
+			return command_get(mapping, raw_key, response_length);
 		}
 		if (is_set)
 		{
 			pg_atomic_fetch_add_u64(&pglc_shared->client_sets, 1);
-			return command_set(mapping, raw_key, json_key, &args[2],
-							   response_length);
+			return command_set(mapping, raw_key, &args[2], response_length);
 		}
 		pg_atomic_fetch_add_u64(&pglc_shared->client_dels, 1);
-		return command_delete(mapping, raw_key, json_key, response_length);
+		return command_delete(mapping, raw_key, response_length);
 	}
 
 	if (pglc_resp_arg_equals(&args[0], "PING"))
@@ -1187,7 +1181,6 @@ execute_command_inner(PgLocalCacheClient *client, PgLocalCacheRespArg *args, int
 		char	   *invalidate_error = NULL;
 		char	   *canonical = NULL;
 		Datum		key_values[PGLC_MAX_KEY_COLUMNS];
-		bool		json_invalidate_key = false;
 		PgLocalCacheMapping *invalidate_mapping = NULL;
 		uint64		count;
 
@@ -1205,13 +1198,11 @@ execute_command_inner(PgLocalCacheClient *client, PgLocalCacheRespArg *args, int
 		else if (strncmp(scope, "CRUD:", 5) == 0)
 		{
 			if (resolve_wire_key(&args[1], &invalidate_mapping,
-								 &raw_invalidate_key,
-								 &json_invalidate_key,
-								 &invalidate_error))
+								 &raw_invalidate_key, &invalidate_error))
 			{
 				if (!canonicalize_key(invalidate_mapping, raw_invalidate_key,
-									  json_invalidate_key, key_values,
-									  &canonical, &invalidate_error))
+									  key_values, &canonical,
+									  &invalidate_error))
 					return pglc_resp_error(invalidate_error, response_length);
 				count = pglc_cache_invalidate_key(invalidate_mapping, canonical);
 			}
@@ -1224,8 +1215,6 @@ execute_command_inner(PgLocalCacheClient *client, PgLocalCacheRespArg *args, int
 				{
 					char	   *table_scope;
 
-					if (!worker_mappings[i].whole_row)
-						continue;
 					table_scope = psprintf("CRUD:%s.%s.%s",
 							database_name, worker_mappings[i].schema_name,
 							worker_mappings[i].relation_name);
@@ -1245,14 +1234,8 @@ execute_command_inner(PgLocalCacheClient *client, PgLocalCacheRespArg *args, int
 			}
 		}
 		else
-		{
-			invalidate_mapping = find_mapping(scope);
-			if (invalidate_mapping == NULL)
-				return pglc_resp_error("ERR unknown pg_local_cache namespace",
-									  response_length);
-			count = pglc_cache_invalidate_namespace(MyDatabaseId,
-											   invalidate_mapping->nspace);
-		}
+			return pglc_resp_error("ERR invalid CRUD cache scope",
+								  response_length);
 		return pglc_resp_integer((int64) count, response_length);
 	}
 
@@ -1262,17 +1245,14 @@ execute_command_inner(PgLocalCacheClient *client, PgLocalCacheRespArg *args, int
 static bool
 resolve_wire_key(const PgLocalCacheRespArg *wire_key,
 				 PgLocalCacheMapping **mapping, char **raw_key,
-				 bool *json_key, char **error)
+				 char **error)
 {
-	const char *separator;
-	Size		namespace_length;
 	Size		key_length;
 	const char *database_name = pglc_database;
 	int			i;
 
 	*mapping = NULL;
 	*raw_key = NULL;
-	*json_key = false;
 	if (wire_key->len == 0 || wire_key->len >= PGLC_REQUEST_MAX)
 	{
 		*error = "ERR invalid key";
@@ -1295,7 +1275,7 @@ resolve_wire_key(const PgLocalCacheRespArg *wire_key,
 									  candidate->relation_name);
 			Size		prefix_length = strlen(prefix);
 
-			if (!candidate->whole_row || wire_key->len <= prefix_length ||
+			if (wire_key->len <= prefix_length ||
 				memcmp(wire_key->data, prefix, prefix_length) != 0)
 				continue;
 			key_length = wire_key->len - prefix_length;
@@ -1307,7 +1287,6 @@ resolve_wire_key(const PgLocalCacheRespArg *wire_key,
 			}
 			*mapping = candidate;
 			*raw_key = pnstrdup(wire_key->data + prefix_length, key_length);
-			*json_key = true;
 			return true;
 		}
 		{
@@ -1324,55 +1303,8 @@ resolve_wire_key(const PgLocalCacheRespArg *wire_key,
 		return false;
 	}
 
-	separator = memchr(wire_key->data, ':', wire_key->len);
-	if (separator == NULL)
-	{
-		*error = "ERR key must use namespace:key format";
-		return false;
-	}
-	namespace_length = (Size) (separator - wire_key->data);
-	key_length = wire_key->len - namespace_length - 1;
-	if (namespace_length == 0 || namespace_length >= PGLC_NAMESPACE_MAX ||
-		key_length == 0)
-	{
-		*error = "ERR namespace or key is too long";
-		return false;
-	}
-
-	{
-		char	   *nspace = pnstrdup(wire_key->data, namespace_length);
-
-		*mapping = find_mapping(nspace);
-	}
-	if (*mapping == NULL)
-	{
-		*error = "ERR unknown pg_local_cache namespace";
-		return false;
-	}
-	*raw_key = pnstrdup(separator + 1, key_length);
-	if ((*mapping)->key_count > 1)
-	{
-		if ((*raw_key)[0] != '{' || (*raw_key)[key_length - 1] != '}')
-		{
-			*error = "ERR composite primary keys require a JSON object";
-			return false;
-		}
-		*json_key = true;
-	}
-	return true;
-}
-
-static PgLocalCacheMapping *
-find_mapping(const char *nspace)
-{
-	int			i;
-
-	for (i = 0; i < worker_mapping_count; i++)
-	{
-		if (strcmp(worker_mappings[i].nspace, nspace) == 0)
-			return &worker_mappings[i];
-	}
-	return NULL;
+	*error = "ERR key must use CRUD:database.schema.table:{primary-key-json}";
+	return false;
 }
 
 static char *
@@ -1402,7 +1334,7 @@ jsonb_key_value_as_cstring(const JsonbValue *value, const char *column_name,
 
 static bool
 canonicalize_key(PgLocalCacheMapping *mapping, const char *raw_key,
-				 bool json_key, Datum *key_values, char **canonical, char **error)
+				 Datum *key_values, char **canonical, char **error)
 {
 	Jsonb	   *key_object = NULL;
 	bool		nulls[PGLC_MAX_KEY_COLUMNS] = {false};
@@ -1410,53 +1342,39 @@ canonicalize_key(PgLocalCacheMapping *mapping, const char *raw_key,
 	Size		result_length;
 	int			i;
 
-	if (json_key)
+	key_object = DatumGetJsonbP(DirectFunctionCall1(
+		jsonb_in, CStringGetDatum(raw_key)));
+	if (!JB_ROOT_IS_OBJECT(key_object))
 	{
-		key_object = DatumGetJsonbP(DirectFunctionCall1(
-			jsonb_in, CStringGetDatum(raw_key)));
-		if (!JB_ROOT_IS_OBJECT(key_object))
-		{
-			*error = "ERR primary key must be a JSON object";
-			return false;
-		}
-		if (JB_ROOT_COUNT(key_object) != mapping->key_count)
-		{
-			*error = psprintf(
-				"ERR primary-key JSON must contain exactly %d field%s",
-				mapping->key_count, mapping->key_count == 1 ? "" : "s");
-			return false;
-		}
+		*error = "ERR primary key must be a JSON object";
+		return false;
 	}
-	else if (mapping->key_count != 1)
+	if (JB_ROOT_COUNT(key_object) != mapping->key_count)
 	{
-		*error = "ERR composite primary keys require a JSON object";
+		*error = psprintf(
+			"ERR primary-key JSON must contain exactly %d field%s",
+			mapping->key_count, mapping->key_count == 1 ? "" : "s");
 		return false;
 	}
 
 	for (i = 0; i < mapping->key_count; i++)
 	{
 		char	   *input;
+		JsonbValue found;
+		JsonbValue *value = getKeyJsonValueFromContainer(
+			&key_object->root, mapping->key_columns[i],
+			strlen(mapping->key_columns[i]), &found);
 
-		if (key_object != NULL)
+		if (value == NULL)
 		{
-			JsonbValue found;
-			JsonbValue *value = getKeyJsonValueFromContainer(
-				&key_object->root, mapping->key_columns[i],
-				strlen(mapping->key_columns[i]), &found);
-
-			if (value == NULL)
-			{
-				*error = psprintf("ERR missing primary-key field \"%s\"",
-								  mapping->key_columns[i]);
-				return false;
-			}
-			input = jsonb_key_value_as_cstring(
-				value, mapping->key_columns[i], error);
-			if (input == NULL)
-				return false;
+			*error = psprintf("ERR missing primary-key field \"%s\"",
+							  mapping->key_columns[i]);
+			return false;
 		}
-		else
-			input = (char *) raw_key;
+		input = jsonb_key_value_as_cstring(
+			value, mapping->key_columns[i], error);
+		if (input == NULL)
+			return false;
 
 		key_values[i] = InputFunctionCall(&mapping->key_inputs[i], input,
 										 mapping->key_ioparams[i],
@@ -1559,6 +1477,7 @@ cached_row_json(PgLocalCacheMapping *mapping,
 	const char *cached_json;
 
 	if (!pglc_row_payload_decode(payload, payload_length, mapping->row_desc,
+								 mapping->row_descriptor_fingerprint,
 								 result_context, &view))
 		return false;
 	if (!pglc_row_payload_get_json(&view, &cached_json, json_length))
@@ -1710,7 +1629,7 @@ note_resp_cache_lookup(bool hit, bool negative)
 
 static char *
 command_get(PgLocalCacheMapping *mapping, const char *raw_key,
-			bool json_key, Size *response_length)
+			Size *response_length)
 {
 	Datum		key_values[PGLC_MAX_KEY_COLUMNS];
 	char	   *canonical;
@@ -1734,7 +1653,7 @@ command_get(PgLocalCacheMapping *mapping, const char *raw_key,
 	MemoryContext result_context = CurrentMemoryContext;
 	int			i;
 
-	if (!canonicalize_key(mapping, raw_key, json_key, key_values,
+	if (!canonicalize_key(mapping, raw_key, key_values,
 						  &canonical, &key_error))
 		return pglc_resp_error(key_error, response_length);
 	(void) canonical;
@@ -1752,7 +1671,6 @@ command_get(PgLocalCacheMapping *mapping, const char *raw_key,
 			note_resp_cache_lookup(true, true);
 			return pglc_resp_null(response_length);
 		}
-		if (mapping->whole_row)
 		{
 			char	   *json;
 			Size		json_length;
@@ -1770,11 +1688,6 @@ command_get(PgLocalCacheMapping *mapping, const char *raw_key,
 									  cached_value, sizeof(cached_value),
 									  &cached_length, &negative, &source_xmin,
 									  &token);
-		}
-		else
-		{
-			note_resp_cache_lookup(true, false);
-			return pglc_resp_bulk(cached_value, cached_length, response_length);
 		}
 	}
 	note_resp_cache_lookup(false, false);
@@ -1809,7 +1722,6 @@ command_get(PgLocalCacheMapping *mapping, const char *raw_key,
 				pglc_note_singleflight_reuse();
 				return pglc_resp_null(response_length);
 			}
-			if (mapping->whole_row)
 			{
 				char	   *json;
 				Size		json_length;
@@ -1828,9 +1740,6 @@ command_get(PgLocalCacheMapping *mapping, const char *raw_key,
 										  &source_xmin, &token);
 				continue;
 			}
-			pglc_note_singleflight_reuse();
-			return pglc_resp_bulk(cached_value, cached_length,
-								  response_length);
 		}
 		if (claim == PGLC_LOAD_RETRY)
 			continue;
@@ -1862,7 +1771,6 @@ command_get(PgLocalCacheMapping *mapping, const char *raw_key,
 			Datum		xmin_value;
 			int			xmin_column = 2;
 
-			if (mapping->whole_row)
 			{
 				bool		row_is_null;
 				Datum		row_value = SPI_getbinval(SPI_tuptable->vals[0],
@@ -1910,24 +1818,6 @@ command_get(PgLocalCacheMapping *mapping, const char *raw_key,
 				memcpy(database_value, rendered_json, database_value_length);
 				database_value[database_value_length] = '\0';
 			}
-			else
-			{
-				database_value = SPI_getvalue(SPI_tuptable->vals[0],
-										  SPI_tuptable->tupdesc, 1);
-				if (database_value == NULL)
-					elog(ERROR, "pg_local_cache mapped value unexpectedly became NULL");
-				database_value_length = strlen(database_value);
-				if (database_value_length > PGLC_VALUE_MAX)
-					ereport(ERROR,
-							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-							 errmsg("mapped value exceeds pg_local_cache limit of %d bytes",
-									PGLC_VALUE_MAX)));
-				database_value = MemoryContextStrdup(result_context,
-												 database_value);
-				database_payload_cacheable = true;
-				database_payload_length = database_value_length;
-				memcpy(cached_value, database_value, database_value_length);
-			}
 			xmin_value = SPI_getbinval(SPI_tuptable->vals[0],
 									   SPI_tuptable->tupdesc, xmin_column,
 									   &xmin_is_null);
@@ -1970,7 +1860,7 @@ command_get(PgLocalCacheMapping *mapping, const char *raw_key,
 
 static char *
 command_set(PgLocalCacheMapping *mapping, const char *raw_key,
-			bool json_key, const PgLocalCacheRespArg *value_arg,
+			const PgLocalCacheRespArg *value_arg,
 			Size *response_length)
 {
 	Datum		key_values[PGLC_MAX_KEY_COLUMNS];
@@ -1983,39 +1873,29 @@ command_set(PgLocalCacheMapping *mapping, const char *raw_key,
 
 	if (!mapping->writable)
 		return pglc_resp_error("ERR namespace is read-only", response_length);
-	if ((!mapping->whole_row && value_arg->len > PGLC_VALUE_MAX) ||
-		value_arg->len >= PGLC_REQUEST_MAX ||
+	if (value_arg->len >= PGLC_REQUEST_MAX ||
 		memchr(value_arg->data, '\0', value_arg->len) != NULL)
 		return pglc_resp_error("ERR value is too large or contains NUL",
 							  response_length);
 	pg_verifymbstr(value_arg->data, value_arg->len, false);
 
-	if (!canonicalize_key(mapping, raw_key, json_key, key_values,
+	if (!canonicalize_key(mapping, raw_key, key_values,
 						  &canonical, &key_error))
 		return pglc_resp_error(key_error, response_length);
 	value_text = pnstrdup(value_arg->data, value_arg->len);
 	for (i = 0; i < mapping->key_count; i++)
 		values[i] = key_values[i];
-	if (mapping->whole_row)
-		row = DatumGetJsonbP(DirectFunctionCall1(jsonb_in,
-											 CStringGetDatum(value_text)));
+	row = DatumGetJsonbP(DirectFunctionCall1(jsonb_in,
+										 CStringGetDatum(value_text)));
 	begin_spi_transaction();
 	ensure_mapping_current(mapping);
-	if (mapping->whole_row)
-	{
-		if (!row_json_validate(mapping, row, key_values, &key_error))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg_internal("%s",
-								 key_error != NULL && strncmp(key_error, "ERR ", 4) == 0 ?
-								 key_error + 4 : key_error)));
-		values[mapping->key_count] = JsonbPGetDatum(row);
-	}
-	else
-		values[1] = InputFunctionCall(&mapping->value_input,
-									  value_text,
-									  mapping->value_ioparam,
-									  mapping->value_typmod);
+	if (!row_json_validate(mapping, row, key_values, &key_error))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg_internal("%s",
+							 key_error != NULL && strncmp(key_error, "ERR ", 4) == 0 ?
+							 key_error + 4 : key_error)));
+	values[mapping->key_count] = JsonbPGetDatum(row);
 
 	pg_atomic_fetch_add_u64(&pglc_shared->pass_to_main, 1);
 	pg_atomic_fetch_add_u64(&pglc_shared->sql_sets, 1);
@@ -2030,7 +1910,7 @@ command_set(PgLocalCacheMapping *mapping, const char *raw_key,
 
 static char *
 command_delete(PgLocalCacheMapping *mapping, const char *raw_key,
-			   bool json_key, Size *response_length)
+			   Size *response_length)
 {
 	Datum		values[PGLC_MAX_KEY_COLUMNS];
 	char	   *canonical;
@@ -2039,7 +1919,7 @@ command_delete(PgLocalCacheMapping *mapping, const char *raw_key,
 
 	if (!mapping->writable)
 		return pglc_resp_error("ERR namespace is read-only", response_length);
-	if (!canonicalize_key(mapping, raw_key, json_key, values,
+	if (!canonicalize_key(mapping, raw_key, values,
 						  &canonical, &key_error))
 		return pglc_resp_error(key_error, response_length);
 	(void) canonical;
@@ -2160,11 +2040,10 @@ reload_mappings(uint64 target_generation)
 		mapping_query =
 			"WITH pglc_mapping AS ("
 			"SELECT source_mapping.namespace, source_mapping.relation, "
-			"       source_mapping.key_columns, source_mapping.value_column, "
-			"       source_mapping.writable "
+			"       source_mapping.key_columns, source_mapping.writable "
 			"  FROM local_cache.mapping AS source_mapping) "
 			"SELECT m.namespace, c.oid, n.nspname, c.relname, "
-			"       m.key_columns, m.value_column::text, m.writable "
+			"       m.key_columns, m.writable "
 			"  FROM pglc_mapping AS m "
 			"  JOIN pg_catalog.pg_class AS c ON c.oid = m.relation "
 			"  JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
@@ -2268,12 +2147,9 @@ reload_mappings(uint64 target_generation)
 			"          AND source_dep.refobjsubid = 0 "
 			"          AND source_dep.deptype = 'e') "
 			"   AND m.namespace <> 'CRUD' "
-			"   AND (m.value_column IS NOT NULL OR ("
-			"        current_database() !~ '[.:]' "
-			"        AND n.nspname !~ '[.:]' AND c.relname !~ '[.:]')) "
+			"   AND current_database() !~ '[.:]' "
+			"   AND n.nspname !~ '[.:]' AND c.relname !~ '[.:]' "
 			"   AND pg_catalog.cardinality(m.key_columns) BETWEEN 1 AND 16 "
-			"   AND (m.value_column IS NULL OR "
-			"        pg_catalog.cardinality(m.key_columns) = 1) "
 			"   AND NOT c.relispartition "
 			"   AND NOT EXISTS ("
 			"       SELECT 1 FROM pg_catalog.pg_inherits AS inh "
@@ -2341,37 +2217,12 @@ reload_mappings(uint64 target_generation)
 			"                       WHERE pc.castsource = ka.atttypid "
 			"                         AND pc.casttarget = opc.opcintype "
 			"                         AND pc.castmethod = 'b')))) "
-			"   AND (m.value_column IS NULL OR ("
-			"       m.value_column <> ALL (m.key_columns) AND EXISTS ("
-			"       SELECT 1 FROM pg_catalog.pg_attribute AS va "
-			"        WHERE va.attrelid = c.oid AND va.attname = m.value_column "
-			"          AND va.attnum > 0 AND NOT va.attisdropped AND va.attnotnull "
-			"          AND va.atttypid IN "
-			"              ('int2'::regtype, 'int4'::regtype, 'int8'::regtype, "
-			"               'numeric'::regtype, 'bool'::regtype, "
-			"               'text'::regtype, 'varchar'::regtype, 'bpchar'::regtype, "
-			"               'uuid'::regtype, 'json'::regtype, 'jsonb'::regtype)))) "
-			"   AND NOT (m.writable AND m.value_column IS NULL AND EXISTS ("
+			"   AND NOT (m.writable AND EXISTS ("
 			"       SELECT 1 FROM pg_catalog.pg_attribute AS wa "
 			"        WHERE wa.attrelid = c.oid AND wa.attnum > 0 "
 			"          AND NOT wa.attisdropped "
 			"          AND wa.attname = ANY (m.key_columns) "
 			"          AND wa.attgenerated <> '')) "
-			"   AND NOT (m.writable AND m.value_column IS NOT NULL AND EXISTS ("
-			"       SELECT 1 FROM pg_catalog.pg_attribute AS wa "
-			"        WHERE wa.attrelid = c.oid AND wa.attnum > 0 "
-			"          AND NOT wa.attisdropped "
-			"          AND (wa.attname = ANY (m.key_columns) "
-			"               OR wa.attname = m.value_column) "
-			"          AND (wa.attgenerated <> '' OR wa.attidentity <> ''))) "
-			"   AND NOT (m.writable AND m.value_column IS NOT NULL AND EXISTS ("
-			"       SELECT 1 FROM pg_catalog.pg_attribute AS wa "
-			"        WHERE wa.attrelid = c.oid AND wa.attnum > 0 "
-			"          AND NOT wa.attisdropped "
-			"          AND wa.attname <> ALL (m.key_columns) "
-			"          AND wa.attname <> m.value_column "
-			"          AND wa.attnotnull AND NOT wa.atthasdef "
-			"          AND wa.attgenerated = '' AND wa.attidentity = '')) "
 			" ORDER BY m.namespace LIMIT 129";
 		result = SPI_execute(mapping_query, true, PGLC_MAX_MAPPINGS + 1);
 		if (result != SPI_OK_SELECT)
@@ -2451,16 +2302,8 @@ reload_mappings(uint64 target_generation)
 				fmgr_info_cxt(output_function, &mapping->key_outputs[key_index],
 							  mapping_context);
 			}
-			{
-				char	   *value_column = SPI_getvalue(tuple, desc, 6);
-
-				mapping->whole_row = value_column == NULL;
-				if (!mapping->whole_row)
-					strlcpy(mapping->value_column, value_column,
-							sizeof(mapping->value_column));
-			}
 			mapping->writable =
-				DatumGetBool(SPI_getbinval(tuple, desc, 7, &is_null));
+				DatumGetBool(SPI_getbinval(tuple, desc, 6, &is_null));
 			Assert(!is_null);
 			mapping->config_generation = target_generation;
 
@@ -2493,27 +2336,6 @@ reload_mappings(uint64 target_generation)
 				pglc_row_payload_tupledesc_fingerprint(mapping->row_desc);
 			table_close(relation, NoLock);
 			MemoryContextSwitchTo(mapping_old_context);
-
-			if (!mapping->whole_row)
-			{
-				HeapTuple	attribute_tuple;
-				Form_pg_attribute attribute;
-				Oid			input_function;
-
-				attribute_tuple = SearchSysCache2(ATTNAME,
-					ObjectIdGetDatum(mapping->relation_oid),
-					CStringGetDatum(mapping->value_column));
-				if (!HeapTupleIsValid(attribute_tuple))
-					elog(ERROR, "could not load pg_local_cache value column");
-				attribute = (Form_pg_attribute) GETSTRUCT(attribute_tuple);
-				mapping->value_type = attribute->atttypid;
-				mapping->value_typmod = attribute->atttypmod;
-				ReleaseSysCache(attribute_tuple);
-				getTypeInputInfo(mapping->value_type, &input_function,
-								 &mapping->value_ioparam);
-				fmgr_info_cxt(input_function, &mapping->value_input,
-							  mapping_context);
-			}
 		}
 
 		worker_mappings = new_mappings;
@@ -2558,98 +2380,74 @@ reload_mappings(uint64 target_generation)
 				delete_types[key_index] = mapping->key_types[key_index];
 			}
 
-			if (mapping->whole_row)
-				get_query = psprintf(
-					"SELECT pglc_source, pglc_source.xmin "
-					"FROM ONLY %s AS pglc_source "
-					"WHERE %s LIMIT 1", qualified_relation, where_clause.data);
-			else
-				get_query = psprintf(
-					"SELECT pglc_source.%s::text, pglc_source.xmin "
-					"FROM ONLY %s AS pglc_source WHERE %s LIMIT 1",
-					quote_identifier(mapping->value_column), qualified_relation,
-					where_clause.data);
+			get_query = psprintf(
+				"SELECT pglc_source, pglc_source.xmin "
+				"FROM ONLY %s AS pglc_source "
+				"WHERE %s LIMIT 1", qualified_relation, where_clause.data);
 			mapping->get_plan = prepare_kept_plan(
 				get_query, mapping->key_count, get_types);
 
 			if (mapping->writable)
 			{
-				if (mapping->whole_row)
+				StringInfoData insert_columns;
+				StringInfoData insert_values;
+				StringInfoData updates;
+				int			attribute_index;
+
+				initStringInfo(&insert_columns);
+				initStringInfo(&insert_values);
+				initStringInfo(&updates);
+				for (attribute_index = 0;
+					 attribute_index < mapping->row_desc->natts;
+					 attribute_index++)
 				{
-					StringInfoData insert_columns;
-					StringInfoData insert_values;
-					StringInfoData updates;
-					int			attribute_index;
+					Form_pg_attribute attribute =
+						TupleDescAttr(mapping->row_desc, attribute_index);
+					const char *quoted_column;
+					int			component = -1;
 
-					initStringInfo(&insert_columns);
-					initStringInfo(&insert_values);
-					initStringInfo(&updates);
-					for (attribute_index = 0;
-						 attribute_index < mapping->row_desc->natts;
-						 attribute_index++)
+					if (attribute->attisdropped || attribute->attgenerated != '\0')
+						continue;
+					quoted_column = quote_identifier(NameStr(attribute->attname));
+					if (insert_columns.len > 0)
 					{
-						Form_pg_attribute attribute =
-							TupleDescAttr(mapping->row_desc, attribute_index);
-						const char *quoted_column;
-						int			component = -1;
-
-						if (attribute->attisdropped || attribute->attgenerated != '\0')
-							continue;
-						quoted_column = quote_identifier(NameStr(attribute->attname));
-						if (insert_columns.len > 0)
+						appendStringInfoString(&insert_columns, ", ");
+						appendStringInfoString(&insert_values, ", ");
+					}
+					appendStringInfoString(&insert_columns, quoted_column);
+					for (key_index = 0; key_index < mapping->key_count;
+						 key_index++)
+					{
+						if (mapping->key_attnos[key_index] == attribute->attnum)
 						{
-							appendStringInfoString(&insert_columns, ", ");
-							appendStringInfoString(&insert_values, ", ");
-						}
-						appendStringInfoString(&insert_columns, quoted_column);
-						for (key_index = 0; key_index < mapping->key_count;
-							 key_index++)
-						{
-							if (mapping->key_attnos[key_index] == attribute->attnum)
-							{
-								component = key_index;
-								break;
-							}
-						}
-						if (component >= 0)
-							appendStringInfo(&insert_values, "$%d", component + 1);
-						else
-						{
-							appendStringInfo(&insert_values, "pglc_input.%s",
-											 quoted_column);
-							if (updates.len > 0)
-								appendStringInfoString(&updates, ", ");
-							appendStringInfo(&updates, "%s = EXCLUDED.%s",
-											 quoted_column, quoted_column);
+							component = key_index;
+							break;
 						}
 					}
-					set_types[mapping->key_count] = JSONBOID;
-					set_query = psprintf(
-							"INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM "
-						"pg_catalog.jsonb_populate_record(NULL::%s, $%d) "
-						"AS pglc_input ON CONFLICT (%s) %s",
-						qualified_relation, insert_columns.data,
-						insert_values.data, qualified_relation,
-						mapping->key_count + 1, conflict_columns.data,
-						updates.len > 0 ? psprintf("DO UPDATE SET %s", updates.data) :
-						"DO NOTHING");
-					mapping->set_plan = prepare_kept_plan(
-						set_query, mapping->key_count + 1, set_types);
+					if (component >= 0)
+						appendStringInfo(&insert_values, "$%d", component + 1);
+					else
+					{
+						appendStringInfo(&insert_values, "pglc_input.%s",
+										 quoted_column);
+						if (updates.len > 0)
+							appendStringInfoString(&updates, ", ");
+						appendStringInfo(&updates, "%s = EXCLUDED.%s",
+									 quoted_column, quoted_column);
+					}
 				}
-				else
-				{
-					const char *quoted_key = quote_identifier(mapping->key_columns[0]);
-					const char *quoted_value = quote_identifier(mapping->value_column);
-
-					set_query = psprintf(
-						"INSERT INTO %s (%s, %s) VALUES ($1, $2) "
-						"ON CONFLICT (%s) DO UPDATE SET %s = EXCLUDED.%s",
-						qualified_relation, quoted_key, quoted_value,
-						quoted_key, quoted_value, quoted_value);
-					set_types[1] = mapping->value_type;
-					mapping->set_plan = prepare_kept_plan(set_query, 2, set_types);
-				}
-
+				set_types[mapping->key_count] = JSONBOID;
+				set_query = psprintf(
+					"INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM "
+					"pg_catalog.jsonb_populate_record(NULL::%s, $%d) "
+					"AS pglc_input ON CONFLICT (%s) %s",
+					qualified_relation, insert_columns.data,
+					insert_values.data, qualified_relation,
+					mapping->key_count + 1, conflict_columns.data,
+					updates.len > 0 ? psprintf("DO UPDATE SET %s", updates.data) :
+					"DO NOTHING");
+				mapping->set_plan = prepare_kept_plan(
+					set_query, mapping->key_count + 1, set_types);
 				delete_query = psprintf(
 					"DELETE FROM ONLY %s AS pglc_source WHERE %s",
 					qualified_relation, where_clause.data);

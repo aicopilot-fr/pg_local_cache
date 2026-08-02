@@ -13,7 +13,7 @@
 #include "pg_local_cache.h"
 #include "row_payload.h"
 
-/* Version 1 wire offsets.  All header integers use big-endian byte order. */
+/* Version 1 binary header offsets. All integers use big-endian byte order. */
 #define PGLC_ROW_OFF_MAGIC 0
 #define PGLC_ROW_OFF_VERSION 4
 #define PGLC_ROW_OFF_FLAGS 6
@@ -374,9 +374,10 @@ pglc_row_payload_encode(TupleTableSlot *slot, TupleDesc relation_descriptor,
 
 bool
 pglc_row_payload_decode(const char *payload, Size payload_len,
-						TupleDesc expected_descriptor,
-						MemoryContext result_context,
-						PgLocalCacheRowPayloadView *view)
+							TupleDesc expected_descriptor,
+							uint64 expected_descriptor_fingerprint,
+							MemoryContext result_context,
+							PgLocalCacheRowPayloadView *view)
 {
 	uint16		version;
 	uint16		flags;
@@ -396,6 +397,7 @@ pglc_row_payload_decode(const char *payload, Size payload_len,
 		MemSet(view, 0, sizeof(*view));
 	if (payload == NULL || view == NULL || result_context == NULL ||
 		!pglc_row_descriptor_supported(expected_descriptor) ||
+		expected_descriptor_fingerprint == 0 ||
 		payload_len < PGLC_ROW_PAYLOAD_HEADER_SIZE ||
 		payload_len > PGLC_VALUE_MAX)
 		return false;
@@ -431,8 +433,7 @@ pglc_row_payload_decode(const char *payload, Size payload_len,
 	if (row_type_oid != expected_descriptor->tdtypeid ||
 		row_typmod != expected_descriptor->tdtypmod ||
 		natts != (uint32) expected_descriptor->natts ||
-		fingerprint !=
-		pglc_row_payload_tupledesc_fingerprint(expected_descriptor))
+		fingerprint != expected_descriptor_fingerprint)
 		return false;
 	if (json_len > 0 &&
 		(payload[expected_total] != '{' || payload[payload_len - 1] != '}'))

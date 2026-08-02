@@ -221,7 +221,7 @@
   "time": {"from": "now-6h", "to": "now"},
   "timepicker": {},
   "timezone": "browser",
-  "title": "pg_local_cache production overview",
+  "title": "pg_local_cache operations overview",
   "uid": "pg-local-cache-overview",
   "version": 1,
   "weekStart": ""

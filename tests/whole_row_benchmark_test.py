@@ -35,7 +35,6 @@ def config(**overrides: object) -> object:
         "keys": 8,
         "value_size": 64,
         "max_latency_samples": 1000,
-        "min_ops": 0.0,
         "client_cpus": 2.0,
         "server_cpus": 2.0,
         "client_memory": "1g",
@@ -78,6 +77,9 @@ class WholeRowDefinitionTests(unittest.TestCase):
         self.assertEqual(parsed.sql_min_ops, 10_000.0)
         self.assertEqual(parsed.width_min_ops, 0.0)
         self.assertEqual(parsed.payload_sizes, (64, 512, 2048))
+        self.assertEqual(parsed.base.duration, 120.0)
+        self.assertEqual(parsed.base.warmup_seconds, 15.0)
+        self.assertEqual(parsed.base.repetitions, 3)
 
     def test_gates_and_widths_are_parsed_independently(self) -> None:
         with mock.patch.dict(
@@ -217,16 +219,60 @@ class WholeRowDefinitionTests(unittest.TestCase):
         self.assertIn("\\startpipeline", script)
         self.assertIn("\\endpipeline", script)
 
-    def test_whole_row_report_runs_before_prior_harness_failures_propagate(self) -> None:
+    def test_runner_executes_only_the_whole_row_suite(self) -> None:
         runner = (ROOT / "benchmarks" / "run.sh").read_text()
-        invocation = runner.index("/usr/local/lib/pg_local_cache/whole_row.py")
-        prior_exit = runner.index(
-            'if ((benchmark_status != 0)); then\n    exit "$benchmark_status"'
+        self.assertEqual(
+            runner.count("/usr/local/lib/pg_local_cache/whole_row.py"), 1
         )
-        self.assertLess(invocation, prior_exit)
+        self.assertNotIn("/usr/local/lib/pg_local_cache/compare.py", runner)
+        self.assertNotIn("/usr/local/lib/pg_local_cache/scenarios.py", runner)
+        self.assertIn('if ((whole_row_status != 0)); then', runner)
 
 
 class WholeRowReportingTests(unittest.TestCase):
+    def test_report_metadata_records_runtime_images_and_resource_limits(self) -> None:
+        cfg = config()
+        whole = whole_row.WholeRowConfig(
+            base=cfg,
+            value_size=64,
+            payload_sizes=(64, 512),
+            resp_min_ops=10_000.0,
+            sql_min_ops=10_000.0,
+            width_min_ops=0.0,
+        )
+        environment = {
+            "PGLC_BENCH_SOURCE_REVISION": "a" * 40,
+            "PGLC_BENCH_WHOLE_ROW_HARNESS_SHA256": "b" * 64,
+            "PGLC_BENCH_DOCKER_VERSION": "28.0.0",
+            "PGLC_BENCH_COMPOSE_VERSION": "2.35.0",
+        }
+        for prefix in (
+            "POSTGRES",
+            "VALKEY",
+            "REDIS",
+            "PG_LOCAL_CACHE",
+            "RUNNER",
+        ):
+            identity_prefix = "PGLC_BENCH_PG_LOCAL_CACHE" if prefix == "PG_LOCAL_CACHE" else f"PGLC_BENCH_{prefix}"
+            reference_prefix = "PGLC_BENCH_PGLC" if prefix == "PG_LOCAL_CACHE" else f"PGLC_BENCH_{prefix}"
+            environment[f"{reference_prefix}_IMAGE"] = f"{prefix.lower()}:test"
+            environment[f"{identity_prefix}_IMAGE_IDENTITY"] = f"sha256:{prefix.lower()}"
+        with mock.patch.dict(whole_row.os.environ, environment, clear=True), mock.patch.object(
+            compare,
+            "discover_runtime_resources",
+            return_value={"logical_cpu_count": 2, "cpu_model": "test"},
+        ):
+            metadata = whole_row.report_environment()
+        self.assertEqual(metadata["source_revision"], "a" * 40)
+        self.assertEqual(metadata["images"]["postgres"]["identity"], "sha256:postgres")
+        self.assertEqual(metadata["benchmark_client"]["logical_cpu_count"], 2)
+
+        workload = whole_row.report_workload(whole, cfg, 65_536)
+        self.assertEqual(workload["duration_seconds"], 1.0)
+        self.assertEqual(workload["client_cpus"], 2.0)
+        self.assertEqual(workload["server_cpus_per_target"], 2.0)
+        self.assertEqual(workload["payload_widths_bytes"], [64, 512])
+
     def test_report_is_atomic_and_names_separate_lanes(self) -> None:
         run = {
             "operations_per_second": 10_000.0,
