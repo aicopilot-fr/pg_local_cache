@@ -1,15 +1,15 @@
 ---
 layout: default
 title: Transactional SQL key-value cache for PostgreSQL
-description: pg_local_cache adds SQL GET and MGET over bounded shared-memory rows with transaction-aware PostgreSQL invalidation.
+description: pg_local_cache accelerates ordinary exact-primary-key SELECT and provides SQL GET/MGET over bounded shared-memory rows with transaction-aware invalidation.
 home: true
 permalink: /
 ---
 <main id="main-content">
   <section id="sql-api" class="page-section hero" aria-labelledby="hero-title">
     <div class="hero-copy">
-      <h1 id="hero-title">A transactional SQL KV cache inside PostgreSQL</h1>
-      <p>Use GET and MGET through your PostgreSQL driver. Keep ordinary DML and fence affected entries before commit visibility.</p>
+      <h1 id="hero-title">A transactional SQL cache inside PostgreSQL</h1>
+      <p>Keep using ordinary primary-key SELECT, or call SQL GET/MGET through the same PostgreSQL driver. Ordinary DML fences affected entries before commit visibility.</p>
       <div class="hero-actions">
         <a class="button primary" href="{{ '/docs/INSTALL_EXISTING.html' | relative_url }}">Install on PostgreSQL 16 <span aria-hidden="true">→</span></a>
         <a class="button" href="{{ '/docs/BENCHMARKS.html' | relative_url }}">Benchmark methodology <span aria-hidden="true">→</span></a>
@@ -18,8 +18,11 @@ permalink: /
         <button class="copy-button" type="button" data-copy="hero-sql">Copy</button>
         <pre id="hero-sql"><code>SELECT local_cache.attach_table('public.items'::regclass);
 
-SELECT * FROM public.items WHERE id = $1::bigint;
-SELECT value FROM public.items WHERE id = $1::bigint;</code></pre>
+SELECT local_cache.get('public.items'::regclass, $1::bigint);
+SELECT local_cache.mget(
+    'public.items'::regclass,
+    $1::bigint[]
+);</code></pre>
       </div>
     </div>
     <div class="terminal" aria-label="PostgreSQL cache hit example">
@@ -49,7 +52,7 @@ COMMIT
   </section>
 
   <section class="proof-rail" aria-label="Core properties">
-    <div class="proof-item"><strong>SQL only</strong><p>Primary-key SELECT uses the existing PostgreSQL connection and permissions.</p></div>
+    <div class="proof-item"><strong>SQL only</strong><p>Primary-key SELECT and SQL GET/MGET use the existing PostgreSQL connection and permissions.</p></div>
     <div class="proof-item"><strong>Whole rows</strong><p>Complete tuples keyed by the table primary key.</p></div>
     <div class="proof-item"><strong>Transaction-aware invalidation</strong><p>Source writes fence affected entries before commit visibility.</p></div>
     <div class="proof-item"><strong>Bounded extension memory</strong><p>Deterministic extension allocations are bounded at startup; host limits remain separate.</p></div>
@@ -59,26 +62,24 @@ COMMIT
     <section class="page-section section-grid" aria-labelledby="benchmark-title">
       <div class="section-intro">
         <div class="section-rule"></div>
-        <h2 id="benchmark-title">Reference SQL KV snapshot</h2>
-        <p>PostgreSQL 16.14, 4,096 incompressible 3,000-byte values, 16 connections, batches of 32 key positions, and three rotated five-second repetitions.</p>
-        <a href="{{ '/docs/BENCHMARKS.html' | relative_url }}">Read the methodology →</a>
+        <h2 id="benchmark-title">Current SQL MGET benchmark</h2>
+        <p>PostgreSQL 16.14, 4,096 incompressible 3,000-byte rows, 16 connections, 32 keys per MGET, two seconds of warmup, and three rotated five-second repetitions.</p>
+        <a href="{{ '/docs/BENCHMARKS.html' | relative_url }}">See ordinary SQL, GET/MGET and RESP results →</a>
       </div>
       <div>
-        <div class="table-scroll" role="region" aria-label="Reference SQL-only benchmark comparison" tabindex="0">
+        <div class="table-scroll" role="region" aria-label="Current SQL MGET benchmark comparison" tabindex="0">
           <table class="benchmark-table">
-            <thead><tr><th>Protocol</th><th>Path</th><th>c16/k32 key ops/s</th><th>vs stock</th><th>c16/k1 p50</th><th>p95</th><th>p99</th></tr></thead>
+            <thead><tr><th>Protocol</th><th>Exact throughput command</th><th>Key ops/s</th><th>vs stock</th><th>Exact scalar latency command</th><th>p99</th></tr></thead>
             <tbody>
-              <tr><td>Prepared</td><td>Stock PostgreSQL</td><td>7,992</td><td>1.00x</td><td>0.323 ms</td><td>0.991 ms</td><td>2.019 ms</td></tr>
-              <tr><td>Prepared</td><td>Mapped, cache off</td><td>8,049</td><td>1.01x</td><td>0.328 ms</td><td>0.919 ms</td><td>1.857 ms</td></tr>
-              <tr><td>Prepared</td><td><code>local_cache.mget</code></td><td>111,103</td><td>13.90x</td><td>0.516 ms</td><td>1.196 ms</td><td>3.150 ms</td></tr>
-              <tr><td>Unnamed extended</td><td>Stock PostgreSQL</td><td>7,992</td><td>1.00x</td><td>0.568 ms</td><td>1.150 ms</td><td>1.649 ms</td></tr>
-              <tr><td>Unnamed extended</td><td>Mapped, cache off</td><td>7,976</td><td>1.00x</td><td>0.561 ms</td><td>1.132 ms</td><td>1.717 ms</td></tr>
-              <tr><td>Unnamed extended</td><td><code>local_cache.mget</code></td><td>104,956</td><td>13.13x</td><td>0.601 ms</td><td>1.356 ms</td><td>2.787 ms</td></tr>
+              <tr><td>Prepared · stock</td><td><code>SELECT pg_catalog.array_agg(pg_catalog.row_to_json(pglc_source)::text ORDER BY pglc_input.ordinality) FROM pg_catalog.unnest(ARRAY[:key_0, :key_1, :key_2, :key_3, :key_4, :key_5, :key_6, :key_7, :key_8, :key_9, :key_10, :key_11, :key_12, :key_13, :key_14, :key_15, :key_16, :key_17, :key_18, :key_19, :key_20, :key_21, :key_22, :key_23, :key_24, :key_25, :key_26, :key_27, :key_28, :key_29, :key_30, :key_31]::bigint[]) WITH ORDINALITY AS pglc_input(id, ordinality) LEFT JOIN "pglc_sql_bench_e407c3350a"."rows" AS pglc_source USING (id);</code></td><td>6,306</td><td>1.00x</td><td><code>SELECT pg_catalog.row_to_json(pglc_source)::text FROM "pglc_sql_bench_e407c3350a"."rows" AS pglc_source WHERE id = :key;</code></td><td>3.338 ms</td></tr>
+              <tr><td>Prepared · cache on</td><td><code>SELECT local_cache.mget('pglc_sql_bench_e407c3350a.rows'::regclass, ARRAY[:key_0, :key_1, :key_2, :key_3, :key_4, :key_5, :key_6, :key_7, :key_8, :key_9, :key_10, :key_11, :key_12, :key_13, :key_14, :key_15, :key_16, :key_17, :key_18, :key_19, :key_20, :key_21, :key_22, :key_23, :key_24, :key_25, :key_26, :key_27, :key_28, :key_29, :key_30, :key_31]::bigint[]);</code></td><td>64,954</td><td>10.30x</td><td><code>SELECT local_cache.get('pglc_sql_bench_e407c3350a.rows'::regclass, (:key)::bigint);</code></td><td>3.505 ms</td></tr>
+              <tr><td>Unnamed extended · stock</td><td><code>SELECT pg_catalog.array_agg(pg_catalog.row_to_json(pglc_source)::text ORDER BY pglc_input.ordinality) FROM pg_catalog.unnest(ARRAY[:key_0, :key_1, :key_2, :key_3, :key_4, :key_5, :key_6, :key_7, :key_8, :key_9, :key_10, :key_11, :key_12, :key_13, :key_14, :key_15, :key_16, :key_17, :key_18, :key_19, :key_20, :key_21, :key_22, :key_23, :key_24, :key_25, :key_26, :key_27, :key_28, :key_29, :key_30, :key_31]::bigint[]) WITH ORDINALITY AS pglc_input(id, ordinality) LEFT JOIN "pglc_sql_bench_e407c3350a"."rows" AS pglc_source USING (id);</code></td><td>6,365</td><td>1.00x</td><td><code>SELECT pg_catalog.row_to_json(pglc_source)::text FROM "pglc_sql_bench_e407c3350a"."rows" AS pglc_source WHERE id = :key;</code></td><td>4.093 ms</td></tr>
+              <tr><td>Unnamed extended · cache on</td><td><code>SELECT local_cache.mget('pglc_sql_bench_e407c3350a.rows'::regclass, ARRAY[:key_0, :key_1, :key_2, :key_3, :key_4, :key_5, :key_6, :key_7, :key_8, :key_9, :key_10, :key_11, :key_12, :key_13, :key_14, :key_15, :key_16, :key_17, :key_18, :key_19, :key_20, :key_21, :key_22, :key_23, :key_24, :key_25, :key_26, :key_27, :key_28, :key_29, :key_30, :key_31]::bigint[]);</code></td><td>66,156</td><td>10.39x</td><td><code>SELECT local_cache.get('pglc_sql_bench_e407c3350a.rows'::regclass, (:key)::bigint);</code></td><td>3.847 ms</td></tr>
             </tbody>
           </table>
         </div>
-        <div class="benchmark-note"><span>Key ops/s = batch TPS × 32, not SQL statements. Latency is a separate scalar closed-loop pass; cache p99 was not lower here.</span><span>Cached lanes gate at ≥1.50x. A non-gating c4/k8 snapshot measured 1.15x prepared and 1.61x extended, so 13x is profile-specific.</span></div>
-        <p class="benchmark-evidence"><a href="https://github.com/profundium/pg_local_cache/actions/runs/30796269395">Run 30796269395</a> · <a href="https://github.com/profundium/pg_local_cache/commit/ee221410da59a8d5a3adb2068160d441b75e05f2">source ee221410</a> · <a href="{{ '/assets/benchmark-evidence/ee221410/sql-only-benchmark-smoke.zip' | relative_url }}">raw evidence ZIP</a> · digest <code>da4d7cad…e1220</code>. Shared-runner regression evidence, not a capacity claim.</p>
+        <div class="benchmark-note"><span>Throughput counts resolved keys (<code>batch TPS × 32</code>). Latency is a separate scalar GET/SELECT pass, which is why both commands are shown.</span><span>Both cached lanes passed the 10,000 key ops/s and 1.50x relative gates. No p99 limit was configured; this shared-runner result is not a capacity claim.</span></div>
+        <p class="benchmark-evidence"><a href="https://github.com/profundium/pg_local_cache/actions/runs/30803546805">Run 30803546805</a> · <a href="https://github.com/profundium/pg_local_cache/commit/fe2d23c87ddc7e523ada2951376ebcb7d8570fb1">source fe2d23c</a> · <a href="{{ '/assets/benchmark-evidence/fe2d23c/sql-only-benchmark-smoke.zip' | relative_url }}">raw evidence ZIP</a> · digest <code>22be445d…e929d02</code>.</p>
       </div>
     </section>
   </div>
@@ -89,7 +90,7 @@ COMMIT
       <div class="step"><span class="step-number">1</span><strong>Preflight</strong><p>Check PostgreSQL, target paths, role and pending settings.</p></div>
       <div class="step"><span class="step-number">2</span><strong>Stage files</strong><p>Install the extension and stage postmaster configuration online.</p></div>
       <div class="step"><span class="step-number">3</span><strong>Restart once</strong><p>Load shared memory and hooks with one controlled restart.</p></div>
-      <div class="step"><span class="step-number">4</span><strong>Attach a table</strong><p>Register the primary key and use typed SQL GET/MGET.</p></div>
+      <div class="step"><span class="step-number">4</span><strong>Attach a table</strong><p>Register the primary key, then use ordinary exact-key SELECT or SQL GET/MGET.</p></div>
     </div>
     <div class="install-command">
       <div class="command-label">Read-only preflight</div>
@@ -114,7 +115,7 @@ COMMIT
     <div class="docs-list">
       <a class="docs-link" href="{{ '/docs/INSTALL_EXISTING.html' | relative_url }}"><strong>Existing database</strong><span>Preflight, staging, restart, verification and rollback.</span><b>→</b></a>
       <a class="docs-link" href="{{ '/docs/TECHNICAL.html' | relative_url }}#architecture"><strong>Architecture</strong><span>Shared memory, hooks, workers and invalidation.</span><b>→</b></a>
-      <a class="docs-link" href="{{ '/#sql-api' | relative_url }}"><strong>SQL API</strong><span>Attach a table and use typed primary-key GET/MGET.</span><b>→</b></a>
+      <a class="docs-link" href="{{ '/#sql-api' | relative_url }}"><strong>SQL API</strong><span>Attach a table and use ordinary exact-primary-key SELECT or SQL GET/MGET.</span><b>→</b></a>
       <a class="docs-link" href="{{ '/docs/BENCHMARKS.html' | relative_url }}"><strong>Benchmark methodology</strong><span>Workloads, limits, latency and downloadable evidence.</span><b>→</b></a>
       <a class="docs-link" href="{{ '/docs/MONITORING.html' | relative_url }}"><strong>Monitoring &amp; OOM</strong><span>Prometheus metrics, alerts, budgets and health checks.</span><b>→</b></a>
       <a class="docs-link" href="{{ '/docs/TECHNICAL.html' | relative_url }}#security-boundary"><strong>Security</strong><span>Privileges, token boundary, RLS and fail-closed checks.</span><b>→</b></a>

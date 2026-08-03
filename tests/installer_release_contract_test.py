@@ -599,6 +599,16 @@ class ReleaseContracts(unittest.TestCase):
         self.assertGreaterEqual(source.count("gzip -n -9"), 3)
         self.assertIn('--mtime="@${epoch}"', source)
 
+    def test_missing_release_tags_are_not_treated_as_existing_shas(self) -> None:
+        source = RELEASE.read_text(encoding="utf-8")
+        self.assertNotIn("--jq .sha 2>/dev/null || true", source)
+        self.assertIn('stable_sha=""', source)
+        self.assertIn('if resolved_stable_sha="$(\n', source)
+        self.assertIn('stable_sha="$resolved_stable_sha"', source)
+        self.assertIn('local existing resolved_existing', source)
+        self.assertIn('if resolved_existing="$(\n', source)
+        self.assertIn('existing="$resolved_existing"', source)
+
     def test_binary_asset_scope_and_installer_are_explicit(self) -> None:
         workflow = RELEASE.read_text(encoding="utf-8")
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")

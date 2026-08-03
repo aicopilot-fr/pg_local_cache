@@ -72,58 +72,173 @@ class PagesSourceContracts(unittest.TestCase):
         self.assertIn("sql-api", parser.ids)
         self.assertEqual(parser.image_sources, [])
         self.assertNotIn("lorem ipsum", source.lower())
-        self.assertNotIn("10x", source.lower())
-        self.assertIn("local_cache.mget", source)
-        self.assertIn("SELECT * FROM public.items WHERE id = $1::bigint", source)
-        self.assertIn("≥1.50x", source)
-        self.assertIn("c16/k32 key ops/s", source)
-        self.assertIn("111,103", source)
-        self.assertIn("3.150 ms", source)
-        self.assertIn("Key ops/s = batch TPS × 32", source)
-        self.assertIn("cache p99 was not lower", source)
+        hero_start = source.index('<pre id="hero-sql">')
+        hero_end = source.index("</pre>", hero_start)
+        hero = source[hero_start:hero_end]
+        self.assertIn(
+            "SELECT local_cache.get('public.items'::regclass, $1::bigint);",
+            hero,
+        )
+        self.assertIn("SELECT local_cache.mget(", hero)
+        self.assertIn("$1::bigint[]", hero)
+        self.assertNotIn("SELECT * FROM public.items", hero)
+        key_array = "ARRAY[" + ", ".join(
+            f":key_{index}" for index in range(32)
+        ) + "]::bigint[]"
+        stock_batch_command = (
+            "SELECT pg_catalog.array_agg("
+            "pg_catalog.row_to_json(pglc_source)::text ORDER BY "
+            "pglc_input.ordinality) FROM pg_catalog.unnest("
+            f"{key_array}) WITH ORDINALITY AS pglc_input(id, ordinality) "
+            'LEFT JOIN "pglc_sql_bench_e407c3350a"."rows" AS '
+            "pglc_source USING (id);"
+        )
+        self.assertIn(stock_batch_command, source)
+        self.assertIn(
+            "SELECT local_cache.mget("
+            "'pglc_sql_bench_e407c3350a.rows'::regclass, "
+            f"{key_array});",
+            source,
+        )
+        self.assertIn("64,954", source)
+        self.assertIn("66,156", source)
+        self.assertIn("10.30x", source)
+        self.assertIn("10.39x", source)
         self.assertIn("raw evidence ZIP", source)
-        self.assertIn("Reference SQL KV snapshot", source)
+        self.assertIn("Current SQL MGET benchmark", source)
+        self.assertIn("30803546805", source)
+        self.assertNotIn("Reference SQL KV snapshot", source)
+        self.assertNotIn("ee221410", source)
+        self.assertNotIn("30796269395", source)
+        self.assertNotIn("111,103", source)
+        self.assertNotIn("104,956", source)
 
-    def test_benchmark_pages_publish_the_sql_kv_release_contract(self) -> None:
+    def test_benchmark_pages_publish_only_current_api_results(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         benchmarks = (ROOT / "docs" / "BENCHMARKS.md").read_text(
             encoding="utf-8"
         )
-        for source in (readme, benchmarks):
-            self.assertIn("local_cache.mget", source)
-            self.assertIn("1.50", source)
-            self.assertIn("3,000-byte", source)
+        readme_benchmarks = readme.split("## Benchmarks", 1)[1].split(
+            "## Monitoring", 1
+        )[0]
+        commands = (
+            "SELECT * FROM public.pg_local_cache_whole_row_comparison "
+            "WHERE tenant_id = 7 AND id = :key;",
+            "SELECT metadata, payload, enabled, amount, note, id, tenant_id "
+            "FROM public.pg_local_cache_whole_row_comparison WHERE "
+            "tenant_id = 7 AND id = :key;",
+            "SELECT payload, metadata, id, tenant_id FROM public."
+            "pg_local_cache_whole_row_comparison WHERE id = :key AND "
+            "tenant_id = 7;",
+        )
+        key_array = "ARRAY[" + ", ".join(
+            f":key_{index}" for index in range(32)
+        ) + "]::bigint[]"
+        mget_command = (
+            "SELECT local_cache.mget("
+            "'pglc_sql_bench_e407c3350a.rows'::regclass, "
+            f"{key_array});"
+        )
+        stock_batch_command = (
+            "SELECT pg_catalog.array_agg("
+            "pg_catalog.row_to_json(pglc_source)::text ORDER BY "
+            "pglc_input.ordinality) FROM pg_catalog.unnest("
+            f"{key_array}) WITH ORDINALITY AS pglc_input(id, ordinality) "
+            'LEFT JOIN "pglc_sql_bench_e407c3350a"."rows" AS '
+            "pglc_source USING (id);"
+        )
+        scalar_get_command = (
+            "SELECT local_cache.get("
+            "'pglc_sql_bench_e407c3350a.rows'::regclass, (:key)::bigint);"
+        )
+        scalar_stock_command = (
+            "SELECT pg_catalog.row_to_json(pglc_source)::text FROM "
+            '"pglc_sql_bench_e407c3350a"."rows" AS pglc_source '
+            "WHERE id = :key;"
+        )
+        for source in (readme_benchmarks, benchmarks):
+            for command in commands:
+                self.assertIn(command, source)
+            for command in (
+                mget_command,
+                stock_batch_command,
+                scalar_get_command,
+                scalar_stock_command,
+            ):
+                self.assertIn(command, source)
             self.assertIn("stock PostgreSQL", source)
-        self.assertIn("Reference SQL-only CI snapshot", benchmarks)
-        self.assertIn("Transparent SELECT and RESP smoke", benchmarks)
-        self.assertIn("30796269395", readme)
-        self.assertIn("30796269395", benchmarks)
-        self.assertIn("13.90x", readme)
-        self.assertIn("3.150 ms", readme)
-        self.assertIn("1.15x", readme)
-        self.assertNotIn("30729192604", readme)
+            self.assertIn("30803546805", source)
+            self.assertIn("fe2d23c", source)
+            self.assertIn("local_cache.mget", source)
+            self.assertIn("64,954", source)
+            self.assertIn("66,156", source)
+            self.assertNotIn("Reference SQL", source)
+            self.assertNotIn("ee221410", source)
+            self.assertNotIn("30796269395", source)
+            self.assertNotIn("13.90x", source)
+            self.assertNotIn("111,103", source)
+            self.assertNotIn("104,956", source)
+        self.assertIn(
+            'GET CRUD:benchmark.public.pg_local_cache_whole_row_comparison:'
+            '{"id":1,"tenant_id":7}',
+            benchmarks,
+        )
 
-    def test_reference_benchmark_evidence_is_complete_and_pinned(self) -> None:
-        evidence = ROOT / "assets" / "benchmark-evidence" / "ee221410"
-        bundles = {
-            "sql-only-benchmark-smoke.zip": (
-                "da4d7cad085e21ed636ee8ea54ab6bc30ec24a482282b15378a037f6ad3e1220",
-                {"sql-only.json", "sql-only.md"},
-            ),
-            "comparison-smoke.zip": (
-                "9facd988ca29b671fc51f3df471bdd013458e29e691cf81d9917979d1781e458",
-                {"whole-row.json", "whole-row.md"},
-            ),
-        }
-        for filename, (expected_digest, expected_members) in bundles.items():
-            with self.subTest(filename=filename):
-                bundle = evidence / filename
-                self.assertEqual(
-                    hashlib.sha256(bundle.read_bytes()).hexdigest(),
-                    expected_digest,
-                )
-                with zipfile.ZipFile(bundle) as archive:
-                    self.assertEqual(set(archive.namelist()), expected_members)
+    def test_current_benchmark_evidence_is_complete_and_pinned(self) -> None:
+        evidence = ROOT / "assets" / "benchmark-evidence" / "fe2d23c"
+        comparison = evidence / "comparison-smoke.zip"
+        sql_only = evidence / "sql-only-benchmark-smoke.zip"
+        self.assertEqual(
+            hashlib.sha256(comparison.read_bytes()).hexdigest(),
+            "fc624e7ebed11b10c8470d11e7d2a91855813e04f9fb809e62e4f0852f7c8a76",
+        )
+        self.assertEqual(
+            hashlib.sha256(sql_only.read_bytes()).hexdigest(),
+            "22be445d210138be086da186bdbe4c7fb1e3543b4a26b3f98b90c8099e929d02",
+        )
+        with zipfile.ZipFile(comparison) as archive:
+            self.assertEqual(
+                set(archive.namelist()), {"whole-row.json", "whole-row.md"}
+            )
+            report = json.loads(archive.read("whole-row.json"))
+        with zipfile.ZipFile(sql_only) as archive:
+            self.assertEqual(
+                set(archive.namelist()), {"sql-only.json", "sql-only.md"}
+            )
+            sql_only_report = json.loads(archive.read("sql-only.json"))
+        self.assertEqual(
+            report["environment"]["source_revision"],
+            "fe2d23c87ddc7e523ada2951376ebcb7d8570fb1",
+        )
+        self.assertEqual(report["gate"]["status"], "PASS")
+        self.assertEqual(
+            sql_only_report["environment"]["source_revision"],
+            "fe2d23c87ddc7e523ada2951376ebcb7d8570fb1",
+        )
+        self.assertEqual(sql_only_report["gate"]["status"], "PASS")
+        self.assertAlmostEqual(
+            sql_only_report["protocols"]["prepared"]["cached_mode"]
+            ["summary"]["median_operations_per_second"],
+            64954.164064,
+        )
+        self.assertAlmostEqual(
+            sql_only_report["protocols"]["extended"]["cached_mode"]
+            ["summary"]["median_operations_per_second"],
+            66155.7912,
+        )
+        self.assertEqual(
+            {lane["query"] for lane in report["ordinary_sql"].values()},
+            {
+                "SELECT * FROM public.pg_local_cache_whole_row_comparison "
+                "WHERE tenant_id = 7 AND id = :key;",
+                "SELECT metadata, payload, enabled, amount, note, id, "
+                "tenant_id FROM public.pg_local_cache_whole_row_comparison "
+                "WHERE tenant_id = 7 AND id = :key;",
+                "SELECT payload, metadata, id, tenant_id FROM public."
+                "pg_local_cache_whole_row_comparison WHERE id = :key AND "
+                "tenant_id = 7;",
+            },
+        )
 
     def test_public_docs_use_the_current_repository_and_default_branch(self) -> None:
         sources = [

@@ -95,10 +95,13 @@ jobs:
           grep -Fq "pg_local_cache_version:${version}" \
             src/pg_local_cache_worker.c
 
-          stable_sha="$(
+          stable_sha=""
+          if resolved_stable_sha="$(
             gh api "repos/${GITHUB_REPOSITORY}/commits/${stable_tag}" \
-              --jq .sha 2>/dev/null || true
-          )"
+              --jq .sha 2>/dev/null
+          )"; then
+            stable_sha="$resolved_stable_sha"
+          fi
           stable_publishable=true
           if [[ -n "$stable_sha" && "$stable_sha" != "$sha" ]]; then
             stable_publishable=false
@@ -339,11 +342,14 @@ jobs:
 
           create_ref() {
             local tag="$1"
-            local existing
-            existing="$(
+            local existing resolved_existing
+            existing=""
+            if resolved_existing="$(
               gh api "repos/${GH_REPO}/commits/${tag}" \
-                --jq .sha 2>/dev/null || true
-            )"
+                --jq .sha 2>/dev/null
+            )"; then
+              existing="$resolved_existing"
+            fi
             if [[ -n "$existing" ]]; then
               [[ "$existing" == "$RELEASE_SHA" ]] || {
                 echo "::error::Refusing to move immutable tag ${tag}"
