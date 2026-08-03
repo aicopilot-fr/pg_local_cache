@@ -212,8 +212,53 @@ fills, or bypasses. The absolute 10,000 ops/s floor, result integrity, and
 counter accounting gate CI; the displayed ratios do not. This is a regression
 smoke, not a capacity claim.
 
-The [evidence manifest](assets/benchmark-evidence/fe2d23c/README.md) records the
-artifact identity and digest.
+### Current SQL GET/MGET result (`fe2d23c`)
+
+The same successful CI run produced the preserved
+[`sql-only-benchmark-smoke` bundle](assets/benchmark-evidence/fe2d23c/sql-only-benchmark-smoke.zip)
+(Actions artifact ID `8851940541`; ZIP digest
+`sha256:22be445d210138be086da186bdbe4c7fb1e3543b4a26b3f98b90c8099e929d02`).
+The measured array contained 32 keys. These are the complete throughput
+commands used after pgbench created the key variables:
+
+| Lane | Exact throughput command |
+|---|---|
+| Stock PostgreSQL and mapped cache-off | `SELECT pg_catalog.array_agg(pg_catalog.row_to_json(pglc_source)::text ORDER BY pglc_input.ordinality) FROM pg_catalog.unnest(ARRAY[:key_0, :key_1, :key_2, :key_3, :key_4, :key_5, :key_6, :key_7, :key_8, :key_9, :key_10, :key_11, :key_12, :key_13, :key_14, :key_15, :key_16, :key_17, :key_18, :key_19, :key_20, :key_21, :key_22, :key_23, :key_24, :key_25, :key_26, :key_27, :key_28, :key_29, :key_30, :key_31]::bigint[]) WITH ORDINALITY AS pglc_input(id, ordinality) LEFT JOIN "pglc_sql_bench_e407c3350a"."rows" AS pglc_source USING (id);` |
+| Mapped cache-on | `SELECT local_cache.mget('pglc_sql_bench_e407c3350a.rows'::regclass, ARRAY[:key_0, :key_1, :key_2, :key_3, :key_4, :key_5, :key_6, :key_7, :key_8, :key_9, :key_10, :key_11, :key_12, :key_13, :key_14, :key_15, :key_16, :key_17, :key_18, :key_19, :key_20, :key_21, :key_22, :key_23, :key_24, :key_25, :key_26, :key_27, :key_28, :key_29, :key_30, :key_31]::bigint[]);` |
+
+| Protocol | Mode | c16/k32 key ops/s | vs stock |
+|---|---|---:|---:|
+| Prepared | Stock PostgreSQL | 6,306 | 1.00x |
+| Prepared | Mapped, cache off | 6,280 | 1.00x |
+| Prepared | `local_cache.mget`, cache on | 64,954 | 10.30x |
+| Unnamed extended | Stock PostgreSQL | 6,365 | 1.00x |
+| Unnamed extended | Mapped, cache off | 6,257 | 0.98x |
+| Unnamed extended | `local_cache.mget`, cache on | 66,156 | 10.39x |
+
+Latency was measured separately with one scalar key per transaction:
+
+| Lane | Exact scalar latency command |
+|---|---|
+| Stock PostgreSQL and mapped cache-off | `SELECT pg_catalog.row_to_json(pglc_source)::text FROM "pglc_sql_bench_e407c3350a"."rows" AS pglc_source WHERE id = :key;` |
+| Mapped cache-on | `SELECT local_cache.get('pglc_sql_bench_e407c3350a.rows'::regclass, (:key)::bigint);` |
+
+| Protocol | Mode | c16/k1 p50 | p95 | p99 |
+|---|---|---:|---:|---:|
+| Prepared | Stock PostgreSQL | 0.583 ms | 1.969 ms | 3.338 ms |
+| Prepared | Mapped, cache off | 0.591 ms | 1.973 ms | 3.299 ms |
+| Prepared | `local_cache.get`, cache on | 0.815 ms | 1.940 ms | 3.505 ms |
+| Unnamed extended | Stock PostgreSQL | 1.032 ms | 2.506 ms | 4.093 ms |
+| Unnamed extended | Mapped, cache off | 1.043 ms | 2.411 ms | 3.620 ms |
+| Unnamed extended | `local_cache.get`, cache on | 1.110 ms | 2.452 ms | 3.847 ms |
+
+This profile used 16 connections, 32 keys per MGET, 4,096 incompressible
+3,000-byte rows, two seconds of warmup, and three rotated five-second
+repetitions. Rates count resolved key positions (`batch TPS × 32`), not SQL
+statements. The scalar latency pass had no configured p99 limit and is not
+claimed as an improvement.
+
+The [evidence manifest](assets/benchmark-evidence/fe2d23c/README.md) records both
+artifact identities and digests.
 
 See [benchmark methodology](docs/BENCHMARKS.md) and
 [scenario definitions](benchmarks/SCENARIOS.md).

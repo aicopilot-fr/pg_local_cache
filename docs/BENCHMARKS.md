@@ -1,20 +1,21 @@
 ---
 layout: doc
 title: PostgreSQL cache benchmarks
-description: Reproducible measurements of ordinary exact-key SELECT and RESP GET against stock PostgreSQL, Valkey and Redis.
+description: Reproducible measurements of SQL GET/MGET, ordinary exact-key SELECT and RESP GET against stock PostgreSQL, Valkey and Redis.
 section: Benchmarks
 permalink: /docs/BENCHMARKS.html
 ---
 
 # pg_local_cache benchmarks
 
-The published tables cover the read interfaces exercised by the current
-comparison runner:
+The published tables cover all read interfaces exercised by the current CI:
 
+- SQL `local_cache.get()` and `local_cache.mget()` through the PostgreSQL
+  protocol;
 - ordinary exact-primary-key `SELECT` through the PostgreSQL protocol;
 - whole-row RESP2 `GET` against the same PostgreSQL-backed rows.
 
-The two suites measure different operations and are reported separately.
+The three suites measure different operations and are reported separately.
 Write, rollback, DDL, and invalidation semantics are verified by integration
 tests instead of being inferred from read throughput.
 
@@ -22,11 +23,52 @@ tests instead of being inferred from read throughput.
 
 [CI run 30803546805](https://github.com/profundium/pg_local_cache/actions/runs/30803546805)
 measured [source `fe2d23c`](https://github.com/profundium/pg_local_cache/commit/fe2d23c87ddc7e523ada2951376ebcb7d8570fb1)
-and passed every independent gate. The exact
-[`comparison-smoke.zip`](../assets/benchmark-evidence/fe2d23c/comparison-smoke.zip)
-is preserved with raw JSON and rendered Markdown. It is Actions artifact
-`8851825673` and has ZIP digest
-`sha256:fc624e7ebed11b10c8470d11e7d2a91855813e04f9fb809e62e4f0852f7c8a76`.
+and passed every independent gate. Both exact artifacts are preserved with raw
+JSON and rendered Markdown:
+
+| Current API suites | Evidence | Actions artifact | SHA-256 |
+|---|---|---:|---|
+| SQL GET/MGET | [`sql-only-benchmark-smoke.zip`](../assets/benchmark-evidence/fe2d23c/sql-only-benchmark-smoke.zip) | `8851940541` | `22be445d210138be086da186bdbe4c7fb1e3543b4a26b3f98b90c8099e929d02` |
+| Ordinary SELECT and RESP2 GET | [`comparison-smoke.zip`](../assets/benchmark-evidence/fe2d23c/comparison-smoke.zip) | `8851825673` | `fc624e7ebed11b10c8470d11e7d2a91855813e04f9fb809e62e4f0852f7c8a76` |
+
+### SQL GET/MGET
+
+The strict throughput profile used 16 connections and a 32-key array. These
+are the complete SQL commands after pgbench created the 32 key variables; both
+protocol lanes used the same SQL text:
+
+| Lane | Exact throughput command |
+|---|---|
+| Stock PostgreSQL and mapped cache-off | `SELECT pg_catalog.array_agg(pg_catalog.row_to_json(pglc_source)::text ORDER BY pglc_input.ordinality) FROM pg_catalog.unnest(ARRAY[:key_0, :key_1, :key_2, :key_3, :key_4, :key_5, :key_6, :key_7, :key_8, :key_9, :key_10, :key_11, :key_12, :key_13, :key_14, :key_15, :key_16, :key_17, :key_18, :key_19, :key_20, :key_21, :key_22, :key_23, :key_24, :key_25, :key_26, :key_27, :key_28, :key_29, :key_30, :key_31]::bigint[]) WITH ORDINALITY AS pglc_input(id, ordinality) LEFT JOIN "pglc_sql_bench_e407c3350a"."rows" AS pglc_source USING (id);` |
+| Mapped cache-on | `SELECT local_cache.mget('pglc_sql_bench_e407c3350a.rows'::regclass, ARRAY[:key_0, :key_1, :key_2, :key_3, :key_4, :key_5, :key_6, :key_7, :key_8, :key_9, :key_10, :key_11, :key_12, :key_13, :key_14, :key_15, :key_16, :key_17, :key_18, :key_19, :key_20, :key_21, :key_22, :key_23, :key_24, :key_25, :key_26, :key_27, :key_28, :key_29, :key_30, :key_31]::bigint[]);` |
+
+Latency was measured in a different scalar-key pass. These are its complete
+commands; the p99 values below must not be attributed to the 32-key MGET call:
+
+| Lane | Exact scalar latency command |
+|---|---|
+| Stock PostgreSQL and mapped cache-off | `SELECT pg_catalog.row_to_json(pglc_source)::text FROM "pglc_sql_bench_e407c3350a"."rows" AS pglc_source WHERE id = :key;` |
+| Mapped cache-on | `SELECT local_cache.get('pglc_sql_bench_e407c3350a.rows'::regclass, (:key)::bigint);` |
+
+| Protocol | Mode | c16/k32 key ops/s | vs stock | c16/k1 p50 | p95 | p99 |
+|---|---|---:|---:|---:|---:|---:|
+| Prepared | Stock PostgreSQL | 6,306 | 1.00x | 0.583 ms | 1.969 ms | 3.338 ms |
+| Prepared | Mapped, cache off | 6,280 | 1.00x | 0.591 ms | 1.973 ms | 3.299 ms |
+| Prepared | `local_cache.mget`, cache on | 64,954 | 10.30x | 0.815 ms | 1.940 ms | 3.505 ms |
+| Unnamed extended | Stock PostgreSQL | 6,365 | 1.00x | 1.032 ms | 2.506 ms | 4.093 ms |
+| Unnamed extended | Mapped, cache off | 6,257 | 0.98x | 1.043 ms | 2.411 ms | 3.620 ms |
+| Unnamed extended | `local_cache.mget`, cache on | 66,156 | 10.39x | 1.110 ms | 2.452 ms | 3.847 ms |
+
+Throughput is resolved key positions per second (`batch TPS × 32`), not SQL
+statements per second. Both cached lanes passed the 10,000 key ops/s floor and
+the `1.50x` cache/stock and cache/mapped-off gates. The scalar latency pass was
+closed-loop, retained its raw samples, and had no configured p99 limit; its
+status is `MEASURED`, not a latency pass/fail claim.
+
+The runner exposed four logical AMD EPYC 9V74 CPUs and a 1 GiB client memory
+limit. PostgreSQL 16.14 used 4,096 incompressible 3,000-byte rows, two seconds
+of warmup, four pgbench jobs, and three rotated five-second repetitions. Every
+timed cached key produced exactly one hit with zero misses, fills, or bypasses.
 
 ### Ordinary SQL
 
@@ -64,7 +106,7 @@ reads, not durable writes. Every response was decoded and compared byte-for-byte
 with PostgreSQL's row JSON. Timed pg_local_cache operations produced zero cache
 misses and zero source-table reads.
 
-## Recorded workload
+## Ordinary SQL and RESP workload
 
 The raw report records the runner and container identities in addition to these
 effective settings:
@@ -85,6 +127,32 @@ effective settings:
 This short shared-runner run is useful as a correctness and regression smoke.
 One repetition is not a capacity study, and the displayed relative ratios must
 not be generalized to different rows, concurrency, hardware, or storage.
+
+## SQL GET/MGET methodology
+
+`benchmarks/sql_only.py`, launched by `tests/docker_sql_only_smoke.sh`, creates
+two PostgreSQL 16 servers:
+
+- a stock server without the extension or preload;
+- a mapped server with `pg_local_cache.port=0`, so no RESP listener, worker,
+  client buffers, or token exists.
+
+The mapped server is measured twice: once with `sql_cache=off` using the stock
+batch command, and once with `sql_cache=on` using `local_cache.mget()`. All
+three modes use the same schema, deterministic rows, LOGIN NOSUPERUSER role,
+key stream, connections, jobs, duration, and PostgreSQL protocol. The SQL text
+differs only because stock PostgreSQL has no `mget()` function.
+
+Before timing, the harness byte-compares the first, middle, and last scalar
+rows across stock, mapped cache-off, and cache-on. It proves one cold miss and
+fill followed by a hit, then fills the complete 4,096-key working set. During
+every cached timing window, successful key reads must equal the hit-counter
+delta exactly while misses, fills, and bypasses remain zero. Direct runs must
+leave all SQL-cache counters unchanged.
+
+Prepared mode reuses a server-side prepared statement. Unnamed extended mode
+sends Parse/Bind/Execute for every batch. The two protocols have independent
+gates and are never averaged together.
 
 ## Ordinary SQL methodology
 
@@ -119,9 +187,33 @@ been decoded, so the percentiles include queueing behind earlier commands in
 the pipeline. They are client-observed end-to-end values, not server execution
 times.
 
-## Run the current comparison
+## Run the current benchmarks
 
-Run both current interfaces with:
+Run the SQL GET/MGET profile used for the published table with:
+
+```bash
+PGLC_SQL_ONLY_BENCH_DURATION=5 \
+PGLC_SQL_ONLY_BENCH_WARMUP_SECONDS=2 \
+PGLC_SQL_ONLY_BENCH_LATENCY_DURATION=5 \
+PGLC_SQL_ONLY_BENCH_LATENCY_SAMPLE_RATE=0.10 \
+PGLC_SQL_ONLY_BENCH_LATENCY_MIN_SAMPLES=2000 \
+PGLC_SQL_ONLY_BENCH_REPETITIONS=3 \
+PGLC_SQL_ONLY_BENCH_CONCURRENCY=16 \
+PGLC_SQL_ONLY_BENCH_PIPELINE=32 \
+PGLC_SQL_ONLY_BENCH_KEYS=4096 \
+PGLC_SQL_ONLY_BENCH_PAYLOAD_BYTES=3000 \
+PGLC_SQL_ONLY_BENCH_PREPARED_MIN_OPS=10000 \
+PGLC_SQL_ONLY_BENCH_EXTENDED_MIN_OPS=10000 \
+PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_DIRECT_RATIO=1.50 \
+PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_STOCK_RATIO=1.50 \
+PGLC_SQL_ONLY_BENCH_OUTPUT_DIR="$PWD/benchmark-results/sql-only" \
+bash tests/docker_sql_only_smoke.sh
+```
+
+It writes `sql-only.json` with every repetition, gate, counter delta, and raw
+latency sample plus the rendered `sql-only.md`.
+
+Run ordinary SQL and RESP2 GET with:
 
 ```bash
 bash benchmarks/run.sh
@@ -148,7 +240,7 @@ PGLC_BENCH_OUTPUT_DIR="$PWD/benchmark-results/comparison" \
 bash benchmarks/run.sh
 ```
 
-The output directory receives:
+The comparison output directory receives:
 
 - `whole-row.json`: source revision, exact commands, environment, image
   identities, configuration, every repetition, counter deltas, and gates;
