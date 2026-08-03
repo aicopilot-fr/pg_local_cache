@@ -3,7 +3,7 @@ name: Release PostgreSQL 16 artifacts
 on:
   workflow_run:
     workflows: ["CI"]
-    branches: ["main"]
+    branches: ["master"]
     types: [completed]
   workflow_dispatch:
 

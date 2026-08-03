@@ -2,7 +2,7 @@ name: Documentation site
 
 on:
   push:
-    branches: ["main"]
+    branches: ["master"]
     paths:
       - "_config.yml"
       - "_layouts/**"
