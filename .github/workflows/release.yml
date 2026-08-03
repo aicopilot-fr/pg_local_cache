@@ -392,7 +392,7 @@ jobs:
           create_ref "$COMMIT_TAG"
           if ! gh release view "$COMMIT_TAG" >/dev/null 2>&1; then
             gh release create "$COMMIT_TAG" \
-              --verify-tag \
+              --target "$RELEASE_SHA" \
               --draft \
               --prerelease \
               --title "pg_local_cache ${VERSION} — master ${RELEASE_SHA:0:12}" \
@@ -405,7 +405,7 @@ jobs:
             create_ref "$STABLE_TAG"
             if ! gh release view "$STABLE_TAG" >/dev/null 2>&1; then
               gh release create "$STABLE_TAG" \
-                --verify-tag \
+                --target "$RELEASE_SHA" \
                 --draft \
                 --title "pg_local_cache ${VERSION} — PostgreSQL 16" \
                 --notes "Immutable pg_local_cache ${VERSION} release for PostgreSQL 16. Read docs/INSTALL_EXISTING.md before installing on an existing cluster."
