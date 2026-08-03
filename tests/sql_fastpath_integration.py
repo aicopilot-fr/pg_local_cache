@@ -754,11 +754,23 @@ def main() -> None:
     finally:
         if client is not None:
             client.close()
-        # Revoke the test role's table grants before dropping the table so
-        # cleanup also covers ACL state.
+        # Restore every privilege granted by this test.  docker_smoke reuses
+        # the application role in later least-privilege checks, so leaking
+        # schema or function ACLs makes their result depend on test order.
         subprocess.run(
             psql_base_args(application=False),
             input=(
+                "REVOKE EXECUTE ON FUNCTION "
+                "local_cache.get(regclass, text[]) "
+                f"FROM {quoted_app_role};\n"
+                "REVOKE EXECUTE ON FUNCTION "
+                "local_cache.get(regclass, anyelement) "
+                f"FROM {quoted_app_role};\n"
+                "REVOKE EXECUTE ON FUNCTION "
+                "local_cache.mget(regclass, anyarray) "
+                f"FROM {quoted_app_role};\n"
+                "REVOKE USAGE ON SCHEMA local_cache "
+                f"FROM {quoted_app_role};\n"
                 "DO $cleanup$\n"
                 "BEGIN\n"
                 f"  IF pg_catalog.to_regclass('{relation}') IS NOT NULL THEN\n"

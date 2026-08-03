@@ -8,83 +8,102 @@ permalink: /docs/BENCHMARKS.html
 
 # pg_local_cache benchmarks
 
-The release gate is SQL-only: `local_cache.mget()` is compared with a
-byte-identical stock PostgreSQL primary-key batch lookup. Transparent SQL and
-RESP measurements are separate compatibility profiles. Write, rollback, DDL,
-and invalidation semantics are verified by integration tests because they have
-different durability and transaction contracts and do not belong in a
+The release gate is SQL-only: `local_cache.mget()` is compared with a stock
+PostgreSQL primary-key batch query intended to return the same ordered whole-row
+JSON. Transparent SQL and RESP measurements are separate compatibility
+profiles. Write, rollback, DDL, and invalidation semantics are verified by
+integration tests because they have different contracts and do not belong in a
 cache-read ranking.
 
-## Historical transparent-SQL results
+## Reference SQL-only CI snapshot (`ee221410`)
 
-The previous transparent-`SELECT` result is [CI run 30729192604](https://github.com/aicopilot-fr/pg_local_cache/actions/runs/30729192604)
-for [source `9cf12e3`](https://github.com/aicopilot-fr/pg_local_cache/commit/9cf12e34bee512e4d453e117c39ca8eb140afd4d).
-It used three repetitions, 4,096 keys, 128-byte payloads, c16/p32 throughput,
-and a separate c16/p1 latency pass.
+[CI run 30796269395](https://github.com/profundium/pg_local_cache/actions/runs/30796269395)
+measured [source `ee221410`](https://github.com/profundium/pg_local_cache/commit/ee221410da59a8d5a3adb2068160d441b75e05f2).
+The `sql-only-benchmark-smoke` job and its internal gate passed. Its exact
+[`sql-only-benchmark-smoke.zip`](../assets/benchmark-evidence/ee221410/sql-only-benchmark-smoke.zip)
+is preserved with the raw JSON, retained latency samples, and rendered
+Markdown. It is Actions artifact `8849113380` (expiry 2026-09-02) and has ZIP
+digest
+`sha256:da4d7cad085e21ed636ee8ea54ab6bc30ec24a482282b15378a037f6ad3e1220`.
+Each cached c16/k32 lane had to sustain at least 10,000 key ops/s and at least
+`1.50x` both the stock and mapped-cache-off medians.
 
-| Protocol | Path | Median ops/s | Mean | p50 | p95 | p99 |
-|---|---|---:|---:|---:|---:|---:|
-| Prepared | Stock PostgreSQL 16 | 37,054 | 1.200 ms | 1.070 ms | 2.501 ms | 3.982 ms |
-| Prepared | Mapped, cache off | 37,310 | 1.157 ms | 1.038 ms | 2.486 ms | 4.239 ms |
-| Prepared | Cache on | 34,662 | 1.160 ms | 1.040 ms | 2.459 ms | 3.989 ms |
-| Extended | Stock PostgreSQL 16 | 16,595 | 2.183 ms | 1.954 ms | 4.501 ms | 6.162 ms |
-| Extended | Mapped, cache off | 16,704 | 2.193 ms | 1.945 ms | 4.501 ms | 6.145 ms |
-| Extended | Cache on | 14,941 | 2.214 ms | 2.016 ms | 4.585 ms | 6.366 ms |
+| Protocol | Path | c16/k32 key ops/s | vs stock | c16/k1 mean | p50 | p95 | p99 | Samples |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Prepared | Stock PostgreSQL 16.14 | 7,992 | 1.00x | 0.409 ms | 0.323 ms | 0.991 ms | 2.019 ms | 48,091 |
+| Prepared | Mapped, cache off | 8,049 | 1.01x | 0.402 ms | 0.328 ms | 0.919 ms | 1.857 ms | 48,495 |
+| Prepared | `local_cache.mget`, cache on | 111,103 | 13.90x | 0.778 ms | 0.516 ms | 1.196 ms | 3.150 ms | 30,091 |
+| Unnamed extended | Stock PostgreSQL 16.14 | 7,992 | 1.00x | 0.601 ms | 0.568 ms | 1.150 ms | 1.649 ms | 38,201 |
+| Unnamed extended | Mapped, cache off | 7,976 | 1.00x | 0.599 ms | 0.561 ms | 1.132 ms | 1.717 ms | 38,274 |
+| Unnamed extended | `local_cache.mget`, cache on | 104,956 | 13.13x | 0.846 ms | 0.601 ms | 1.356 ms | 2.787 ms | 28,689 |
 
-Prepared cache-on was 0.94x stock and 0.93x mapped cache-off. Extended
-cache-on was 0.90x stock and 0.89x mapped cache-off. These results do not
-satisfy the current SQL KV release gate and remain only as compatibility
-history; shared-runner scheduling also makes them unsuitable for capacity
-claims.
+The c16/k32 pass uses 16 connections and batches of 32 key positions; the
+cached batch calls MGET. Its unit is resolved key positions per second
+(`batch TPS × 32`), not SQL statements per second. Latency comes from separate
+scalar-key c16/k1 passes. It is a
+closed-loop saturation measurement with no configured p99 objective. Cache-on
+scalar p99 was higher than stock in both protocols in this run; the throughput
+ratio must not be presented as a latency improvement.
 
-The same artifact contains a non-gating c4/p8 throughput snapshot with a
-separate c4/p1 latency pass:
+The runner exposed four logical Intel Xeon Platinum 8573C CPUs and a 1 GiB
+client cgroup without physical CPU pinning. PostgreSQL 16.14 used 4,096
+deterministic, incompressible 3,000-byte values, two seconds of warmup, three
+rotated five-second repetitions, four pgbench jobs, and a LOGIN NOSUPERUSER
+role. The harness validates source count and key range, compares the first,
+middle, and last scalar stock/mapped/cache row byte-for-byte, and requires every timed
+cached key to produce one hit with zero misses, fills, or bypasses. It does not
+byte-compare every timed batch or all 4,096 rows.
 
-| Protocol | Path | Median ops/s | Mean | p50 | p95 | p99 |
-|---|---|---:|---:|---:|---:|---:|
-| Prepared | Stock PostgreSQL 16 | 32,716 | 0.320 ms | 0.263 ms | 0.742 ms | 1.365 ms |
-| Prepared | Mapped, cache off | 32,834 | 0.317 ms | 0.239 ms | 0.786 ms | 1.669 ms |
-| Prepared | Cache on | 31,071 | 0.331 ms | 0.240 ms | 0.894 ms | 1.668 ms |
-| Extended | Stock PostgreSQL 16 | 15,065 | 0.548 ms | 0.482 ms | 1.039 ms | 1.767 ms |
-| Extended | Mapped, cache off | 14,906 | 0.499 ms | 0.461 ms | 0.923 ms | 1.115 ms |
-| Extended | Cache on | 14,012 | 0.534 ms | 0.490 ms | 0.999 ms | 1.272 ms |
+The archived report's human-readable `methodology` labels mistakenly say
+"composite primary key" and "identical query". Its recorded schema and query
+evidence is authoritative: the key is `id`, and stock PostgreSQL necessarily
+uses different SQL because it has no `local_cache.mget`. The generator labels
+are corrected after `ee221410`; the original evidence bytes remain unchanged.
 
-The same run recorded a separate one-second, one-repetition c4/p8 RESP smoke
-test. Each target returned byte-identical whole-row JSON:
+The same servers produced a one-repetition c4/k8 scaling snapshot. Prepared
+cache/stock was 1.15x (73,302 vs 63,568 key ops/s); unnamed extended was 1.61x
+(68,439 vs 42,491). That sensitivity is why the c16/k32 13x result is a
+workload-profile regression signal, not a general PostgreSQL speedup or a
+capacity claim.
 
-| Target | Median ops/s | p50 | p95 | p99 |
-|---|---:|---:|---:|---:|
-| pg_local_cache 1.0.0 | 165,495 | 0.157 ms | 0.290 ms | 0.507 ms |
-| Valkey 9.1.1 | 214,310 | 0.118 ms | 0.232 ms | 0.329 ms |
-| Redis 8.8.1 | 201,990 | 0.107 ms | 0.265 ms | 0.420 ms |
+## Transparent SELECT and RESP smoke
 
-The RESP and SQL tables measure different protocols and must not be combined
-into one ranking.
+The same workflow's
+[`comparison-smoke.zip`](../assets/benchmark-evidence/ee221410/comparison-smoke.zip)
+is Actions artifact `8848997316` (expiry 2026-08-10; ZIP digest
+`sha256:9facd988ca29b671fc51f3df471bdd013458e29e691cf81d9917979d1781e458`).
+It ran in a separate GitHub Actions job on an AMD EPYC 7763 runner, with a
+2-CPU client quota and a 2-CPU quota per server target. It used four clients at
+pipeline depth 8 (up to 32 in-flight operations), 128 keys, and 128-byte text
+values. The configured timed warmup was zero, but the working set was prefilled
+and stabilized before measurement; timed cache lanes required zero misses and
+fills. Absolute 10,000 ops/s floors plus integrity and counter checks gate the
+job; the displayed relative ratios are non-gating.
 
-The comparison job also records three prepared SQL shapes. This is a
-one-second, one-repetition smoke test, separate from the primary SQL-only suite:
-
-| SQL shape | Mapped cache ops/s | Stock PostgreSQL ops/s | Mapped/stock |
+| Prepared SQL shape | Mapped cache ops/s | Stock PostgreSQL ops/s | Mapped/stock |
 |---|---:|---:|---:|
-| `SELECT *` | 115,344 | 65,062 | 1.77x |
-| Reordered projection | 113,799 | 62,254 | 1.83x |
-| Reordered composite predicates | 124,305 | 67,099 | 1.85x |
+| `SELECT *` | 126,169 | 67,017 | 1.88x |
+| Reordered projection | 120,354 | 62,733 | 1.92x |
+| Reordered composite predicates | 130,133 | 71,284 | 1.83x |
 
-The short comparison job and repeated SQL-only suite use different table
-shapes, durations, server allocations, and run ordering. Their rates are not
-pooled or used to claim one universal speedup.
+| RESP target | Median ops/s | p99 | Errors |
+|---|---:|---:|---:|
+| pg_local_cache | 149,703 | 0.374 ms | 0 |
+| Valkey | 199,345 | 0.265 ms | 0 |
+| Redis | 200,137 | 0.269 ms | 0 |
 
-A publishable result retains raw JSON and rendered Markdown with the source
-revision, harness checksum, server and client configuration, all repetitions,
-throughput distribution, and latency distribution. It does not select a single
-best repetition.
+The SQL, SQL KV, and RESP tables measure different operations and must not be
+combined into one ranking. A publishable result retains raw JSON and rendered
+Markdown with the source revision, harness checksum, server and client
+configuration, every repetition, and the latency distribution; it never
+selects only the best repetition.
 
 ## Comparison matrix
 
 | Suite | Baseline | Extension control | Cached path | Primary measurements |
 |---|---|---|---|---|
-| SQL-only KV batch | Stock PostgreSQL without `pg_local_cache`, using a PK batch query | Same mapped server using the stock batch query | `local_cache.mget()` on the mapped server | Median SQL operations/s; per-operation mean, p50, p95, p99; exact cache counters |
-| Transparent exact-PK `SELECT` | Stock PostgreSQL without `pg_local_cache` | Same mapped server with `pg_local_cache.sql_cache=off` | Same mapped server with `sql_cache=on` | Compatibility regression only |
+| SQL-only KV batch | Stock PostgreSQL without `pg_local_cache`, using a PK batch query | Same mapped server using the stock batch query | `local_cache.mget()` on the mapped server | Median resolved key positions/s; per-operation mean, p50, p95, p99; exact cache counters |
+| Transparent exact-PK `SELECT` | Stock PostgreSQL without `pg_local_cache` | Not recorded by the current comparison smoke | Mapped server with `sql_cache=on` | One-repetition prepared/pipelined compatibility smoke; exact hit counters; relative ratio non-gating |
 | Whole-row RESP `GET` | Valkey and Redis with persistence disabled | Not applicable | `pg_local_cache` KVik-inspired whole-row key | Median ops/s; client-observed p50, p95, p99; reply validation; database-read deltas |
 | RESP payload width | Same key and client settings at each row width | Not applicable | Complete cached row | Median ops/s; encoded row bytes; cache counters |
 
@@ -112,8 +131,10 @@ batch of primary-key reads in three modes:
 2. the mapped server using the same stock query;
 3. the mapped server using `local_cache.mget(regclass, bigint[])`.
 
-All three return the same ordered JSON values for the same input keys. SQL text
-necessarily differs because stock PostgreSQL has no `mget()` function.
+All three queries are designed to return the same ordered JSON values. Before
+timing, the harness byte-compares the first, middle, and last scalar rows and
+checks exact cache accounting; it does not byte-compare every timed batch. SQL
+text necessarily differs because stock PostgreSQL has no `mget()` function.
 
 Each mode is measured independently for both `pgbench -M prepared` and
 `pgbench -M extended`. Prepared mode reuses a server-side prepared statement.
@@ -148,8 +169,9 @@ Throughput runs use persistent connections and a configurable key-array width.
 of key positions for every mode; the report also retains batch TPS, key width,
 and failed batches. This is KV key throughput, not SQL statement throughput.
 
-Latency runs are separate. They use one scalar `get()` or byte-identical stock
-row lookup per transaction, persistent connections, and pgbench latency logs
+Latency runs are separate. They use one scalar `get()` or stock row lookup
+designed to return the same row JSON per transaction, persistent connections,
+and pgbench latency logs
 with deterministic sampling. The report
 contains mean, p50, p95, p99, maximum, and sample count for each protocol and
 each of the three modes. These are client-observed end-to-end operation
@@ -165,12 +187,12 @@ hardware. Set `PGLC_SQL_ONLY_BENCH_LATENCY_MAX_P99_MS` to enforce a deployment-
 specific ceiling. `PGLC_SQL_ONLY_BENCH_LATENCY_MIN_SAMPLES` prevents a sparse
 sample from passing.
 
-Relative throughput gates are mandatory in CI and release evidence. Set
+Relative throughput gates default to `1.50` in CI and in the standalone harness. Set
 `PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_DIRECT_RATIO` and
 `PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_STOCK_RATIO` to reject a cached result below
-the required fraction of the mapped-direct and stock medians. CI sets both to
-`1.50`. The standalone harness still reports an intentionally unset gate as
-`MEASURED`, but the evidence validator rejects anything below `1.50`.
+the required fraction of the mapped-direct and stock medians. A lower numeric
+value changes a local run's threshold; release evidence validation still
+rejects any ratio below `1.50`.
 
 ### c4/k8 and c16/k32 snapshot
 
@@ -276,7 +298,7 @@ On success, the comparison runner writes `whole-row.json` and `whole-row.md`.
 SQL-only evidence is produced separately by `tests/docker_sql_only_smoke.sh` as
 `sql-only.json` and `sql-only.md`. The exact workloads and controls are listed
 in the
-[benchmark scenarios](https://github.com/aicopilot-fr/pg_local_cache/blob/main/benchmarks/SCENARIOS.md).
+[benchmark scenarios](https://github.com/profundium/pg_local_cache/blob/master/benchmarks/SCENARIOS.md).
 
 ## Fairness rules
 
@@ -284,11 +306,12 @@ in the
 
 - Stock, mapped-direct, and cached runs use the same PostgreSQL major and
   checked comparison settings.
-- Schema, generated data, key sequence, returned bytes, role capabilities,
-  connection count, client process, protocol, batch width, and random seed
-  match. Query text differs only because stock PostgreSQL has no `mget()`.
+- Schema, generated data, key sequence, role capabilities, connection count,
+  client process, protocol, batch width, random seed, and intended ordered JSON
+  shape match. Query text differs because stock PostgreSQL has no `mget()`.
 - The stock and mapped-direct lanes use the same ordered PK batch query.
-- Stock and cached sentinel rows are compared before timing.
+- The first, middle, and last stock, mapped-direct, and cached scalar rows are
+  byte-compared before timing; every timed batch is not byte-compared.
 - Prepared and unnamed-extended results are never averaged together.
 - Throughput and single-operation latency are measured in separate passes.
 
@@ -322,7 +345,7 @@ changes, `TRUNCATE`, DDL, RESP writes, and reconciliation are covered by Docker
 integration tests rather than inferred from throughput counters.
 
 See
-[SCENARIOS.md](https://github.com/aicopilot-fr/pg_local_cache/blob/main/benchmarks/SCENARIOS.md)
+[SCENARIOS.md](https://github.com/profundium/pg_local_cache/blob/master/benchmarks/SCENARIOS.md)
 for every timed operation and its required counter evidence.
 
 ## Publishing results

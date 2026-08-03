@@ -59,21 +59,26 @@ COMMIT
     <section class="page-section section-grid" aria-labelledby="benchmark-title">
       <div class="section-intro">
         <div class="section-rule"></div>
-        <h2 id="benchmark-title">One strict SQL KV release gate</h2>
-        <p>The runner keeps schema, values, keys, returned bytes, role, PostgreSQL version and client settings fixed.</p>
+        <h2 id="benchmark-title">Reference SQL KV snapshot</h2>
+        <p>PostgreSQL 16.14, 4,096 incompressible 3,000-byte values, 16 connections, batches of 32 key positions, and three rotated five-second repetitions.</p>
         <a href="{{ '/docs/BENCHMARKS.html' | relative_url }}">Read the methodology →</a>
       </div>
       <div>
-        <div class="table-scroll" role="region" aria-label="Latest SQL-only benchmark comparison" tabindex="0">
+        <div class="table-scroll" role="region" aria-label="Reference SQL-only benchmark comparison" tabindex="0">
           <table class="benchmark-table">
-            <thead><tr><th>Protocol</th><th>Cached path</th><th>Stock baseline</th><th>Payload</th><th>Required ratio</th></tr></thead>
+            <thead><tr><th>Protocol</th><th>Path</th><th>c16/k32 key ops/s</th><th>vs stock</th><th>c16/k1 p50</th><th>p95</th><th>p99</th></tr></thead>
             <tbody>
-              <tr><td>Prepared</td><td><code>local_cache.mget</code></td><td>Ordered PK batch</td><td>3,000 bytes</td><td>≥1.50x</td></tr>
-              <tr><td>Unnamed extended</td><td><code>local_cache.mget</code></td><td>Ordered PK batch</td><td>3,000 bytes</td><td>≥1.50x</td></tr>
+              <tr><td>Prepared</td><td>Stock PostgreSQL</td><td>7,992</td><td>1.00x</td><td>0.323 ms</td><td>0.991 ms</td><td>2.019 ms</td></tr>
+              <tr><td>Prepared</td><td>Mapped, cache off</td><td>8,049</td><td>1.01x</td><td>0.328 ms</td><td>0.919 ms</td><td>1.857 ms</td></tr>
+              <tr><td>Prepared</td><td><code>local_cache.mget</code></td><td>111,103</td><td>13.90x</td><td>0.516 ms</td><td>1.196 ms</td><td>3.150 ms</td></tr>
+              <tr><td>Unnamed extended</td><td>Stock PostgreSQL</td><td>7,992</td><td>1.00x</td><td>0.568 ms</td><td>1.150 ms</td><td>1.649 ms</td></tr>
+              <tr><td>Unnamed extended</td><td>Mapped, cache off</td><td>7,976</td><td>1.00x</td><td>0.561 ms</td><td>1.132 ms</td><td>1.717 ms</td></tr>
+              <tr><td>Unnamed extended</td><td><code>local_cache.mget</code></td><td>104,956</td><td>13.13x</td><td>0.601 ms</td><td>1.356 ms</td><td>2.787 ms</td></tr>
             </tbody>
           </table>
         </div>
-        <div class="benchmark-note"><span>c16/k32 throughput; separate c16/k1 latency; three repetitions.</span><span>Clean release evidence must pass exact cache accounting.</span></div>
+        <div class="benchmark-note"><span>Key ops/s = batch TPS × 32, not SQL statements. Latency is a separate scalar closed-loop pass; cache p99 was not lower here.</span><span>Cached lanes gate at ≥1.50x. A non-gating c4/k8 snapshot measured 1.15x prepared and 1.61x extended, so 13x is profile-specific.</span></div>
+        <p class="benchmark-evidence"><a href="https://github.com/profundium/pg_local_cache/actions/runs/30796269395">Run 30796269395</a> · <a href="https://github.com/profundium/pg_local_cache/commit/ee221410da59a8d5a3adb2068160d441b75e05f2">source ee221410</a> · <a href="{{ '/assets/benchmark-evidence/ee221410/sql-only-benchmark-smoke.zip' | relative_url }}">raw evidence ZIP</a> · digest <code>da4d7cad…e1220</code>. Shared-runner regression evidence, not a capacity claim.</p>
       </div>
     </section>
   </div>

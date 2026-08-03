@@ -5,10 +5,12 @@ from __future__ import annotations
 
 from html.parser import HTMLParser
 from pathlib import Path
+import hashlib
 import json
 import re
 import struct
 import unittest
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,7 +76,13 @@ class PagesSourceContracts(unittest.TestCase):
         self.assertIn("local_cache.mget", source)
         self.assertIn("SELECT * FROM public.items WHERE id = $1::bigint", source)
         self.assertIn("≥1.50x", source)
-        self.assertIn("c16/k32 throughput", source)
+        self.assertIn("c16/k32 key ops/s", source)
+        self.assertIn("111,103", source)
+        self.assertIn("3.150 ms", source)
+        self.assertIn("Key ops/s = batch TPS × 32", source)
+        self.assertIn("cache p99 was not lower", source)
+        self.assertIn("raw evidence ZIP", source)
+        self.assertIn("Reference SQL KV snapshot", source)
 
     def test_benchmark_pages_publish_the_sql_kv_release_contract(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -86,8 +94,47 @@ class PagesSourceContracts(unittest.TestCase):
             self.assertIn("1.50", source)
             self.assertIn("3,000-byte", source)
             self.assertIn("stock PostgreSQL", source)
-        self.assertIn("Historical transparent-SQL results", benchmarks)
+        self.assertIn("Reference SQL-only CI snapshot", benchmarks)
+        self.assertIn("Transparent SELECT and RESP smoke", benchmarks)
+        self.assertIn("30796269395", readme)
+        self.assertIn("30796269395", benchmarks)
+        self.assertIn("13.90x", readme)
+        self.assertIn("3.150 ms", readme)
+        self.assertIn("1.15x", readme)
         self.assertNotIn("30729192604", readme)
+
+    def test_reference_benchmark_evidence_is_complete_and_pinned(self) -> None:
+        evidence = ROOT / "assets" / "benchmark-evidence" / "ee221410"
+        bundles = {
+            "sql-only-benchmark-smoke.zip": (
+                "da4d7cad085e21ed636ee8ea54ab6bc30ec24a482282b15378a037f6ad3e1220",
+                {"sql-only.json", "sql-only.md"},
+            ),
+            "comparison-smoke.zip": (
+                "9facd988ca29b671fc51f3df471bdd013458e29e691cf81d9917979d1781e458",
+                {"whole-row.json", "whole-row.md"},
+            ),
+        }
+        for filename, (expected_digest, expected_members) in bundles.items():
+            with self.subTest(filename=filename):
+                bundle = evidence / filename
+                self.assertEqual(
+                    hashlib.sha256(bundle.read_bytes()).hexdigest(),
+                    expected_digest,
+                )
+                with zipfile.ZipFile(bundle) as archive:
+                    self.assertEqual(set(archive.namelist()), expected_members)
+
+    def test_public_docs_use_the_current_repository_and_default_branch(self) -> None:
+        sources = [
+            (ROOT / "README.md").read_text(encoding="utf-8"),
+            (ROOT / "_config.yml").read_text(encoding="utf-8"),
+            *(path.read_text(encoding="utf-8") for path in PUBLISHED_DOCUMENTS),
+        ]
+        combined = "\n".join(sources)
+        self.assertNotIn("aicopilot-fr/pg_local_cache", combined)
+        self.assertNotIn("/pg_local_cache/blob/main/", combined)
+        self.assertIn("profundium/pg_local_cache", combined)
 
     def test_docs_prefer_ordinary_sql_for_native_tuples(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -120,7 +167,7 @@ class PagesSourceContracts(unittest.TestCase):
 
     def test_published_documents_do_not_link_to_unbuilt_markdown(self) -> None:
         github_source_prefix = (
-            "https://github.com/aicopilot-fr/pg_local_cache/blob/main/"
+            "https://github.com/profundium/pg_local_cache/blob/master/"
         )
         for path in PUBLISHED_DOCUMENTS:
             source = path.read_text(encoding="utf-8")
@@ -230,7 +277,8 @@ class PagesSourceContracts(unittest.TestCase):
         config = (ROOT / "_config.yml").read_text(encoding="utf-8")
         robots = (ROOT / "robots.txt").read_text(encoding="utf-8")
         sitemap = (ROOT / "sitemap.xml").read_text(encoding="utf-8")
-        self.assertIn("url: https://aicopilot-fr.github.io", config)
+        self.assertIn("url: https://profundium.github.io", config)
+        self.assertIn("repository: profundium/pg_local_cache", config)
         self.assertIn("baseurl: /pg_local_cache", config)
         self.assertIn("Sitemap:", robots)
         for page in (

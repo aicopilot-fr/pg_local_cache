@@ -24,7 +24,7 @@ jobs:
       (
         github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.event == 'push' &&
-        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_branch == 'master' &&
         github.event.workflow_run.head_repository.full_name == github.repository
       )
     runs-on: ubuntu-24.04
@@ -67,11 +67,11 @@ jobs:
           sha="$(git rev-parse HEAD)"
           [[ "$sha" == "$TARGET_SHA" ]]
 
-          main_sha="$(
-            gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha
+          master_sha="$(
+            gh api "repos/${GITHUB_REPOSITORY}/commits/master" --jq .sha
           )"
-          [[ "$sha" == "$main_sha" ]] || {
-            echo "::error::Release candidate is no longer the tip of main"
+          [[ "$sha" == "$master_sha" ]] || {
+            echo "::error::Release candidate is no longer the tip of master"
             exit 1
           }
 
@@ -88,7 +88,7 @@ jobs:
           version="${versions[0]}"
           stable_tag="v${version}"
           short_sha="${sha:0:12}"
-          commit_tag="main-${short_sha}"
+          commit_tag="master-${short_sha}"
 
           test -f "sql/pg_local_cache--${version}.sql"
           grep -Fq "pg_local_cache--${version}.sql" Dockerfile
@@ -109,12 +109,12 @@ jobs:
           if [[ -z "$workflow_run_id" ]]; then
             workflow_run_id="$(
               gh api \
-                "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100" \
+                "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=master&event=push&status=success&per_page=100" \
                 --jq "[.workflow_runs[] | select(.head_sha == \"${sha}\")][0].id // empty"
             )"
           fi
           [[ -n "$workflow_run_id" ]] || {
-            echo "::error::No successful main CI run exists for ${sha}"
+            echo "::error::No successful master CI run exists for ${sha}"
             exit 1
           }
 
@@ -389,8 +389,8 @@ jobs:
               --verify-tag \
               --draft \
               --prerelease \
-              --title "pg_local_cache ${VERSION} — main ${RELEASE_SHA:0:12}" \
-              --notes "Successful main build ${RELEASE_SHA}. Includes PostgreSQL 16 source/binary packages, checksums, installer and CI benchmark evidence."
+              --title "pg_local_cache ${VERSION} — master ${RELEASE_SHA:0:12}" \
+              --notes "Successful master build ${RELEASE_SHA}. Includes PostgreSQL 16 source/binary packages, checksums, installer and CI benchmark evidence."
           fi
           upload_missing_assets "$COMMIT_TAG"
           gh release edit "$COMMIT_TAG" --draft=false --prerelease
