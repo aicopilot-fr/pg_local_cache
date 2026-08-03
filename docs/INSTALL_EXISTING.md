@@ -87,7 +87,7 @@ The commands below select the newest non-draft release, including a prerelease.
 Set `PGLC_RELEASE_TAG` to install a reviewed tag explicitly.
 
 ```bash
-repository=aicopilot-fr/pg_local_cache
+repository=profundium/pg_local_cache
 release_tag="${PGLC_RELEASE_TAG:-$(
   gh api "repos/${repository}/releases" \
     --jq '[.[] | select(.draft == false)][0].tag_name // empty'

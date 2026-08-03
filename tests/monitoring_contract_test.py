@@ -358,6 +358,20 @@ class MonitoringInterfaceSourceTests(unittest.TestCase):
         self.assertIn("wait_for_mapping_ready()", integration)
         self.assertIn("transactional ACL reload", integration)
 
+    def test_sql_fastpath_test_restores_application_acl(self) -> None:
+        integration = (
+            ROOT / "tests" / "sql_fastpath_integration.py"
+        ).read_text(encoding="utf-8")
+        cleanup = integration[integration.index("    finally:\n") :]
+        for statement in (
+            "local_cache.get(regclass, text[])",
+            "local_cache.get(regclass, anyelement)",
+            "local_cache.mget(regclass, anyarray)",
+            "REVOKE USAGE ON SCHEMA local_cache",
+        ):
+            with self.subTest(statement=statement):
+                self.assertIn(statement, cleanup)
+
     def test_mapping_reload_uses_a_resettable_context_and_two_hard_limits(self) -> None:
         reload_mappings = c_function(WORKER, "reload_mappings")
         self.assertGreaterEqual(

@@ -2781,9 +2781,10 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         "",
         f"Generated: `{report['generated_at_utc']}`",
         "",
-        "SQL-only `local_cache.mget(regclass, anyarray)` compared with a "
-        "byte-identical stock PostgreSQL primary-key batch lookup. Both use the "
-        "same LOGIN NOSUPERUSER, key stream, rows, and wire protocol. The mapped "
+        "SQL-only `local_cache.mget(regclass, anyarray)` compared with a stock "
+        "PostgreSQL primary-key batch lookup designed to return the same ordered "
+        "row JSON. The first, middle, and last rows are compared byte-for-byte. "
+        "Both use the same LOGIN NOSUPERUSER, key stream, rows, and wire protocol. The mapped "
         "server has `pg_local_cache.port=0`; no RESP listener, client, or token "
         "is used.",
         "",
@@ -3100,7 +3101,10 @@ def build_report(config: Config) -> dict[str, Any]:
             },
             "methodology": {
                 "transport": "PostgreSQL wire protocol only; RESP disabled",
-                "table_shape": "whole row with composite (tenant_id, id) primary key",
+                "table_shape": (
+                    "whole row with bigint id primary key and fixed tenant_id "
+                    "payload column"
+                ),
                 "application_access": "actual LOGIN NOSUPERUSER, SELECT only",
                 "stock_mode": (
                     "separate PostgreSQL server with no pg_local_cache "
@@ -3116,8 +3120,10 @@ def build_report(config: Config) -> dict[str, Any]:
                 ),
                 "comparability": (
                     "exact server version and query-affecting settings; "
-                    "identical schema, generated data, role, query, protocol, "
-                    "client concurrency, jobs, duration, seed, and keyspace"
+                    "identical schema, generated data, role, protocol, client "
+                    "concurrency, jobs, duration, seed, keyspace, and intended "
+                    "ordered row JSON; SQL differs because stock PostgreSQL "
+                    "does not provide local_cache.mget"
                 ),
                 "latency": (
                     "closed-loop saturation latency from sampled pgbench "

@@ -12,11 +12,11 @@ This document describes the implementation boundaries that affect correctness,
 capacity planning, security, and client compatibility. For task-oriented
 instructions, use these guides:
 
-- [README and Docker quick start](https://github.com/aicopilot-fr/pg_local_cache#readme)
+- [README and Docker quick start](https://github.com/profundium/pg_local_cache#readme)
 - [Install on an existing PostgreSQL server]({{ '/docs/INSTALL_EXISTING.html' | relative_url }})
 - [Benchmark and latency methodology]({{ '/docs/BENCHMARKS.html' | relative_url }})
 - [Monitoring and OOM signals]({{ '/docs/MONITORING.html' | relative_url }})
-- [Benchmark scenario definitions](https://github.com/aicopilot-fr/pg_local_cache/blob/main/benchmarks/SCENARIOS.md)
+- [Benchmark scenario definitions](https://github.com/profundium/pg_local_cache/blob/master/benchmarks/SCENARIOS.md)
 
 The extension and its GUC prefix are named `pg_local_cache`. User-facing SQL
 objects are in the `local_cache` schema, and the default RESP worker role is

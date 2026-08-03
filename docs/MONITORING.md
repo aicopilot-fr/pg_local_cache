@@ -119,6 +119,6 @@ docker compose \
 The repository includes pinned validation commands for Prometheus rules,
 postgres_exporter mappings, the Grafana dashboard, and the combined Compose
 configuration in the
-[monitoring source guide](https://github.com/aicopilot-fr/pg_local_cache/blob/main/monitoring/README.md).
+[monitoring source guide](https://github.com/profundium/pg_local_cache/blob/master/monitoring/README.md).
 For memory accounting and metric semantics, see the
 [technical reference]({{ '/docs/TECHNICAL.html' | relative_url }}).

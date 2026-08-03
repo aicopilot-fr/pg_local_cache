@@ -1236,6 +1236,11 @@ class ValidationAndReportTests(unittest.TestCase):
         self.assertIn("| extended |", markdown)
         self.assertIn("cold read -> fill -> warm read", markdown)
         self.assertIn("stock/mapped/cache check", markdown)
+        self.assertIn("first, middle, and last rows", markdown)
+        self.assertNotIn(
+            "byte-identical stock PostgreSQL primary-key batch lookup",
+            markdown,
+        )
         self.assertIn("pg_local_cache.port=0", markdown)
         self.assertIn("independent >=10k", markdown)
 

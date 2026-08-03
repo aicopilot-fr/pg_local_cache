@@ -579,17 +579,17 @@ class InstallerContracts(unittest.TestCase):
 
 
 class ReleaseContracts(unittest.TestCase):
-    def test_release_waits_for_successful_main_ci(self) -> None:
+    def test_release_waits_for_successful_master_ci(self) -> None:
         source = RELEASE.read_text(encoding="utf-8")
         self.assertIn('workflows: ["CI"]', source)
         self.assertIn("workflow_run.conclusion == 'success'", source)
         self.assertIn("workflow_run.event == 'push'", source)
-        self.assertIn("workflow_run.head_branch == 'main'", source)
+        self.assertIn("workflow_run.head_branch == 'master'", source)
         self.assertIn("head_repository.full_name == github.repository", source)
 
     def test_release_is_downloadable_versioned_and_immutable(self) -> None:
         source = RELEASE.read_text(encoding="utf-8")
-        self.assertIn('commit_tag="main-${short_sha}"', source)
+        self.assertIn('commit_tag="master-${short_sha}"', source)
         self.assertIn('stable_tag="v${version}"', source)
         self.assertIn("Refusing to move immutable tag", source)
         self.assertIn("refusing overwrite", source)
