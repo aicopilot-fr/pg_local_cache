@@ -23,7 +23,7 @@ from benchmarks import sql_only as sql_only_benchmark
 WHOLE_ROW_SCHEMA_VERSION = 2
 SQL_ONLY_SCHEMA_VERSION = 3
 MINIMUM_OPERATIONS_PER_SECOND = 10_000
-MINIMUM_RELATIVE_THROUGHPUT = 0.80
+MINIMUM_RELATIVE_THROUGHPUT = 1.50
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 IMAGE_IDENTITY_PATTERN = re.compile(r"(?:[^\s]+@)?sha256:[0-9a-f]{64}")
 
@@ -77,6 +77,19 @@ def require_known_string(value: Any, context: str) -> None:
         and value.strip().lower() not in {"unknown", "unavailable"},
         f"{context}: value is missing or unknown",
     )
+
+
+def require_cpu_identity(
+    environment: Mapping[str, Any], client: Mapping[str, Any], context: str
+) -> None:
+    cpu_model = client.get("cpu_model")
+    if isinstance(cpu_model, str) and cpu_model.strip().lower() not in {
+        "",
+        "unknown",
+        "unavailable",
+    }:
+        return
+    require_known_string(environment.get("machine"), f"{context} architecture")
 
 
 def require_image_identity(value: Any, context: str) -> None:
@@ -195,7 +208,7 @@ def validate_whole_row(path: Path, expected_revision: str) -> None:
     require_minimum(
         client.get("logical_cpu_count"), 1, f"{path}: benchmark client CPUs"
     )
-    require_known_string(client.get("cpu_model"), f"{path}: benchmark CPU model")
+    require_cpu_identity(environment, client, f"{path}: benchmark CPU")
     cgroup = require_mapping(client.get("cgroup_v2"), f"{path}: benchmark cgroup")
     require_known_string(cgroup.get("cpu.max"), f"{path}: benchmark cpu.max")
     require_known_string(cgroup.get("memory.max"), f"{path}: benchmark memory.max")
@@ -320,7 +333,7 @@ def validate_sql_only(path: Path, expected_revision: str) -> None:
     require_minimum(
         client.get("logical_cpu_count"), 1, f"{path}: benchmark client CPUs"
     )
-    require_known_string(client.get("cpu_model"), f"{path}: benchmark CPU model")
+    require_cpu_identity(environment, client, f"{path}: benchmark CPU")
     cgroup = require_mapping(client.get("cgroup_v2"), f"{path}: benchmark cgroup")
     require_known_string(cgroup.get("cpu.max"), f"{path}: benchmark cpu.max")
     require_known_string(cgroup.get("memory.max"), f"{path}: benchmark memory.max")
@@ -449,10 +462,10 @@ def validate_sql_only(path: Path, expected_revision: str) -> None:
                 f"{path}: {protocol}/{mode} raw latency sample count is inconsistent",
             )
 
-    require(
-        workload.get("scaling_snapshot_enabled") is True,
-        f"{path}: c4/p8 scaling snapshot is not enabled",
-    )
+    if workload.get("scaling_snapshot_enabled") is not True:
+        validate_markdown(path)
+        return
+
     snapshot = require_mapping(
         report.get("scaling_snapshot"), f"{path}: scaling snapshot"
     )
@@ -468,81 +481,81 @@ def validate_sql_only(path: Path, expected_revision: str) -> None:
         snapshot.get("profiles"), f"{path}: scaling profiles"
     )
     primary = require_mapping(
-        profiles.get("c16_p32"), f"{path}: c16/p32 profile"
+        profiles.get("c16_p32"), f"{path}: c16/k32 profile"
     )
     require(
         primary.get("source") == "primary_strict_profile"
         and primary.get("source_path") == "$.protocols"
         and "protocols" not in primary,
-        f"{path}: c16/p32 must reference primary evidence without copying it",
+        f"{path}: c16/k32 must reference primary evidence without copying it",
     )
     primary_workload = require_mapping(
-        primary.get("workload"), f"{path}: c16/p32 workload"
+        primary.get("workload"), f"{path}: c16/k32 workload"
     )
     require(
         primary_workload.get("concurrency") == 16
         and primary_workload.get("throughput_pipeline") == 32
         and primary_workload.get("latency_pipeline") == 1,
-        f"{path}: c16/p32 workload is invalid",
+        f"{path}: c16/k32 workload is invalid",
     )
 
     secondary = require_mapping(
-        profiles.get("c4_p8"), f"{path}: c4/p8 profile"
+        profiles.get("c4_p8"), f"{path}: c4/k8 profile"
     )
     secondary_workload = require_mapping(
-        secondary.get("workload"), f"{path}: c4/p8 workload"
+        secondary.get("workload"), f"{path}: c4/k8 workload"
     )
     require(
         secondary_workload.get("concurrency") == 4
         and secondary_workload.get("throughput_pipeline") == 8
         and secondary_workload.get("latency_pipeline") == 1,
-        f"{path}: c4/p8 workload is invalid",
+        f"{path}: c4/k8 workload is invalid",
     )
     secondary_repetitions = require_positive_integer(
         secondary_workload.get("repetitions"),
-        f"{path}: c4/p8 repetitions",
+        f"{path}: c4/k8 repetitions",
     )
     secondary_protocols = require_mapping(
-        secondary.get("protocols"), f"{path}: c4/p8 protocols"
+        secondary.get("protocols"), f"{path}: c4/k8 protocols"
     )
     for protocol in ("prepared", "extended"):
         lane = require_mapping(
             secondary_protocols.get(protocol),
-            f"{path}: c4/p8 {protocol}",
+            f"{path}: c4/k8 {protocol}",
         )
         throughput_gate = require_mapping(
             lane.get("throughput_gate"),
-            f"{path}: c4/p8 {protocol} throughput status",
+            f"{path}: c4/k8 {protocol} throughput status",
         )
         require(
             throughput_gate.get("status") == "MEASURED"
             and throughput_gate.get("minimum_cached_operations_per_second")
             is None,
-            f"{path}: c4/p8 {protocol} must not have a performance gate",
+            f"{path}: c4/k8 {protocol} must not have a performance gate",
         )
         for mode in ("stock", "direct", "cached"):
             result = require_mapping(
                 lane.get(f"{mode}_mode"),
-                f"{path}: c4/p8 {protocol}/{mode}",
+                f"{path}: c4/k8 {protocol}/{mode}",
             )
             validate_throughput_result(
                 result,
-                f"{path}: c4/p8 {protocol}/{mode}",
+                f"{path}: c4/k8 {protocol}/{mode}",
                 expected_runs=secondary_repetitions,
             )
             latency = require_mapping(
                 result.get("latency"),
-                f"{path}: c4/p8 {protocol}/{mode} latency",
+                f"{path}: c4/k8 {protocol}/{mode} latency",
             )
             distribution = require_mapping(
                 latency.get("distribution"),
-                f"{path}: c4/p8 {protocol}/{mode} latency distribution",
+                f"{path}: c4/k8 {protocol}/{mode} latency distribution",
             )
             raw_samples = latency.get("raw_samples_ms")
             require(
                 isinstance(raw_samples, list)
                 and len(raw_samples) == distribution.get("sample_count"),
-                f"{path}: c4/p8 {protocol}/{mode} raw latency samples are inconsistent",
+                f"{path}: c4/k8 {protocol}/{mode} raw latency samples are inconsistent",
             )
     validate_markdown(path)
 
@@ -558,7 +571,9 @@ def validate_markdown(json_path: Path) -> None:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--revision", required=True, help="expected source commit SHA")
-    parser.add_argument("--whole", required=True, type=Path, help="whole-row JSON report")
+    parser.add_argument(
+        "--whole", type=Path, help="optional whole-row RESP JSON report"
+    )
     parser.add_argument(
         "--sql-only", required=True, type=Path, help="SQL-only JSON report"
     )
@@ -567,7 +582,8 @@ def parse_arguments() -> argparse.Namespace:
 
 def main() -> int:
     arguments = parse_arguments()
-    validate_whole_row(arguments.whole, arguments.revision)
+    if arguments.whole is not None:
+        validate_whole_row(arguments.whole, arguments.revision)
     validate_sql_only(arguments.sql_only, arguments.revision)
     return 0
 

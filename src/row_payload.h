@@ -62,8 +62,17 @@ extern bool pglc_row_payload_decode_in_place(
 	uint64 expected_descriptor_fingerprint,
 	PgLocalCacheRowPayloadView *view);
 extern bool pglc_row_payload_get_json(const PgLocalCacheRowPayloadView *view,
-									  const char **json,
-									  Size *json_len);
+										  const char **json,
+										  Size *json_len);
+extern bool pglc_row_payload_get_json_checked(
+	const char *payload,
+	Size payload_len,
+	Oid expected_row_type_oid,
+	int32 expected_row_typmod,
+	uint32 expected_natts,
+	uint64 expected_descriptor_fingerprint,
+	const char **json,
+	Size *json_len);
 extern bool pglc_row_payload_render_json(
 	const PgLocalCacheRowPayloadView *view,
 	MemoryContext result_context,

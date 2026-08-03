@@ -356,12 +356,13 @@ class CacheOwnershipSourceTests(unittest.TestCase):
         )
 
         visible = c_function(SQL_FASTPATH, "pglc_sql_source_visibility")
+        visible_at = c_function(SQL_FASTPATH, "pglc_sql_source_visibility_at")
         self.assertIn("ReadNextFullTransactionId()", visible)
-        self.assertIn("current_full_xid < source_observed_full_xid", visible)
-        self.assertIn("UINT64CONST(0x80000000)", visible)
-        self.assertIn("PGLC_SOURCE_AGE_EXPIRED", visible)
-        self.assertIn("PGLC_SOURCE_SNAPSHOT_REJECTED", visible)
-        self.assertIn("XidInMVCCSnapshot(source_xmin, snapshot)", visible)
+        self.assertIn("current_full_xid < source_observed_full_xid", visible_at)
+        self.assertIn("UINT64CONST(0x80000000)", visible_at)
+        self.assertIn("PGLC_SOURCE_AGE_EXPIRED", visible_at)
+        self.assertIn("PGLC_SOURCE_SNAPSHOT_REJECTED", visible_at)
+        self.assertIn("XidInMVCCSnapshot(source_xmin, snapshot)", visible_at)
 
         retire = c_function(CORE, "pglc_cache_retire_positive")
         for fence in (
@@ -413,20 +414,21 @@ class CacheOwnershipSourceTests(unittest.TestCase):
         self.assertNotIn("operator->opno != type_cache->eq_opr", matcher)
 
     def test_sql_cache_rejects_aliasing_custom_btree_families(self) -> None:
+        relation_meta = c_function(
+            SQL_FASTPATH, "pglc_sql_relation_base_meta"
+        )
         index_path = c_function(SQL_FASTPATH, "pglc_sql_primary_index_path")
-        self.assertIn("TYPECACHE_BTREE_OPFAMILY", index_path)
+        self.assertIn("TYPECACHE_BTREE_OPFAMILY", relation_meta)
         self.assertIn(
-            "index_info->opfamily[key_index] != type_cache->btree_opf",
+            "index_info->opfamily[key_index] !=\n"
+            "\t\t\t\t\tmeta->key_btree_opfamilies[key_index]",
             index_path,
         )
         self.assertIn("index_info->indexkeys[key_index]", index_path)
         self.assertIn("match_index_to_operand(left, key_index", index_path)
         self.assertIn("match_index_to_operand(right, key_index", index_path)
-        self.assertIn(
-            "get_op_opfamily_strategy(index_operator,\n"
-            "\t\t\t\t\t\t\t\t type_cache->btree_opf)",
-            index_path,
-        )
+        self.assertIn("get_op_opfamily_strategy(index_operator", index_path)
+        self.assertIn("meta->key_btree_opfamilies[key_index]", index_path)
 
     def test_sql_fast_path_requires_source_and_trigger_provenance(self) -> None:
         source = c_function(
@@ -479,15 +481,19 @@ class CacheOwnershipSourceTests(unittest.TestCase):
         )
 
     def test_sql_fast_path_uses_only_the_primary_index(self) -> None:
-        primary = c_function(SQL_FASTPATH, "pglc_sql_index_is_primary")
-        self.assertIn("SearchSysCache1(INDEXRELID", primary)
-        self.assertIn("index_form->indisprimary", primary)
-        self.assertIn("ReleaseSysCache(index_tuple)", primary)
+        relation_meta = c_function(
+            SQL_FASTPATH, "pglc_sql_relation_base_meta"
+        )
+        self.assertIn("RelationGetPrimaryKeyIndex(relation)", relation_meta)
+        self.assertIn("SearchSysCache1(INDEXRELID", relation_meta)
+        self.assertIn("index->indisprimary", relation_meta)
+        self.assertIn("ReleaseSysCache(index_tuple)", relation_meta)
 
         index_path = c_function(SQL_FASTPATH, "pglc_sql_primary_index_path")
         self.assertIn(
-            "pglc_sql_index_is_primary(index_info->indexoid)", index_path
+            "index_info->indexoid != meta->primary_index_oid", index_path
         )
+        self.assertNotIn("SearchSysCache1", index_path)
 
     def test_worker_trigger_query_uses_real_pg16_catalog_columns(self) -> None:
         # tgisclone/tgnattr exist only in the relcache Trigger C struct; the

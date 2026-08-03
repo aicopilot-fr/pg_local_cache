@@ -11,6 +11,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -42,6 +43,9 @@ def _fake_packaged_install(
 ) -> dict[str, Path | str]:
     """Create a binary-release layout and a controllable fake local cluster."""
 
+    if not sys.platform.startswith("linux"):
+        raise unittest.SkipTest("installer runtime fixtures require GNU/Linux")
+
     package = directory / "pg_local_cache-1.0.0-pg16-bookworm-amd64"
     package_lib = package / "usr/lib/postgresql/16/lib"
     package_extension = package / "usr/share/postgresql/16/extension"
@@ -65,10 +69,14 @@ def _fake_packaged_install(
     shutil.copy2(INSTALLER, installer)
     installer.chmod(0o755)
 
-    # A known dynamic ELF keeps the installer's ldd preflight realistic while
+    # A known platform executable keeps dependency preflight realistic while
     # the fixture remains independent of PostgreSQL development packages.
     source_library = package_lib / "pg_local_cache.so"
-    shutil.copy2("/bin/true", source_library)
+    true_binary = shutil.which("true")
+    if true_binary is None:
+        raise RuntimeError("the installer fixture requires a true executable")
+    shutil.copyfile(true_binary, source_library)
+    source_library.chmod(0o755)
     (package_extension / "pg_local_cache.control").write_text(
         "comment = 'fixture'\ndefault_version = '1.0.0'\n"
         "module_pathname = '$libdir/pg_local_cache'\n",

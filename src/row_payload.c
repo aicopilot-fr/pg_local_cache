@@ -197,6 +197,56 @@ pglc_row_payload_checksum(const char *payload, Size payload_len)
 	return (uint32) crc;
 }
 
+bool
+pglc_row_payload_get_json_checked(const char *payload, Size payload_len,
+								  Oid expected_row_type_oid,
+								  int32 expected_row_typmod,
+								  uint32 expected_natts,
+								  uint64 expected_descriptor_fingerprint,
+								  const char **json, Size *json_len)
+{
+	uint16		flags;
+	uint32		composite_len;
+	uint32		stored_json_len;
+	Size		json_offset;
+
+	*json = NULL;
+	*json_len = 0;
+	if (payload == NULL || payload_len < PGLC_ROW_PAYLOAD_HEADER_SIZE ||
+		payload_len > PGLC_VALUE_MAX || expected_descriptor_fingerprint == 0 ||
+		pglc_row_get_u32(payload + PGLC_ROW_OFF_MAGIC) !=
+			PGLC_ROW_PAYLOAD_MAGIC ||
+		pglc_row_get_u16(payload + PGLC_ROW_OFF_VERSION) !=
+			PGLC_ROW_PAYLOAD_VERSION)
+		return false;
+	flags = pglc_row_get_u16(payload + PGLC_ROW_OFF_FLAGS);
+	if ((flags & ~PGLC_ROW_PAYLOAD_KNOWN_FLAGS) != 0 ||
+		(flags & PGLC_ROW_PAYLOAD_FLAG_HAS_JSON) == 0 ||
+		pglc_row_get_u32(payload + PGLC_ROW_OFF_CHECKSUM) !=
+			pglc_row_payload_checksum(payload, payload_len) ||
+		(Oid) pglc_row_get_u32(payload + PGLC_ROW_OFF_TYPE_OID) !=
+			expected_row_type_oid ||
+		(int32) pglc_row_get_u32(payload + PGLC_ROW_OFF_TYPMOD) !=
+			expected_row_typmod ||
+		pglc_row_get_u32(payload + PGLC_ROW_OFF_NATTS) != expected_natts ||
+		pglc_row_get_u64(payload + PGLC_ROW_OFF_FINGERPRINT) !=
+			expected_descriptor_fingerprint)
+		return false;
+	composite_len = pglc_row_get_u32(payload + PGLC_ROW_OFF_COMPOSITE_LEN);
+	stored_json_len = pglc_row_get_u32(payload + PGLC_ROW_OFF_JSON_LEN);
+	if (composite_len < SizeofHeapTupleHeader ||
+		composite_len > payload_len - PGLC_ROW_PAYLOAD_HEADER_SIZE)
+		return false;
+	json_offset = PGLC_ROW_PAYLOAD_HEADER_SIZE + composite_len;
+	if (stored_json_len < 2 || stored_json_len > payload_len - json_offset ||
+		json_offset + stored_json_len != payload_len ||
+		payload[json_offset] != '{' || payload[payload_len - 1] != '}')
+		return false;
+	*json = payload + json_offset;
+	*json_len = stored_json_len;
+	return true;
+}
+
 /*
  * Reject obviously oversized external attributes before
  * heap_copy_tuple_as_datum() detoasts them.  This is a conservative lower

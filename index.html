@@ -1,15 +1,15 @@
 ---
 layout: default
-title: PostgreSQL row cache for ordinary SQL
-description: pg_local_cache is a PostgreSQL 16 extension for bounded shared-memory row caching with ordinary SQL and transaction-aware invalidation.
+title: Transactional SQL key-value cache for PostgreSQL
+description: pg_local_cache adds SQL GET and MGET over bounded shared-memory rows with transaction-aware PostgreSQL invalidation.
 home: true
 permalink: /
 ---
 <main id="main-content">
   <section id="sql-api" class="page-section hero" aria-labelledby="hero-title">
     <div class="hero-copy">
-      <h1 id="hero-title">A local row cache inside PostgreSQL</h1>
-      <p>Keep ordinary SQL. Cache complete rows by primary key. Fence affected entries before commit visibility.</p>
+      <h1 id="hero-title">A transactional SQL KV cache inside PostgreSQL</h1>
+      <p>Use GET and MGET through your PostgreSQL driver. Keep ordinary DML and fence affected entries before commit visibility.</p>
       <div class="hero-actions">
         <a class="button primary" href="{{ '/docs/INSTALL_EXISTING.html' | relative_url }}">Install on PostgreSQL 16 <span aria-hidden="true">→</span></a>
         <a class="button" href="{{ '/docs/BENCHMARKS.html' | relative_url }}">Benchmark methodology <span aria-hidden="true">→</span></a>
@@ -18,7 +18,8 @@ permalink: /
         <button class="copy-button" type="button" data-copy="hero-sql">Copy</button>
         <pre id="hero-sql"><code>SELECT local_cache.attach_table('public.items'::regclass);
 
-SELECT * FROM public.items WHERE id = $1;</code></pre>
+SELECT * FROM public.items WHERE id = $1::bigint;
+SELECT value FROM public.items WHERE id = $1::bigint;</code></pre>
       </div>
     </div>
     <div class="terminal" aria-label="PostgreSQL cache hit example">
@@ -48,7 +49,7 @@ COMMIT
   </section>
 
   <section class="proof-rail" aria-label="Core properties">
-    <div class="proof-item"><strong>Ordinary SQL</strong><p>Supported primary-key reads need no cache-specific driver or query API.</p></div>
+    <div class="proof-item"><strong>SQL only</strong><p>Primary-key SELECT uses the existing PostgreSQL connection and permissions.</p></div>
     <div class="proof-item"><strong>Whole rows</strong><p>Complete tuples keyed by the table primary key.</p></div>
     <div class="proof-item"><strong>Transaction-aware invalidation</strong><p>Source writes fence affected entries before commit visibility.</p></div>
     <div class="proof-item"><strong>Bounded extension memory</strong><p>Deterministic extension allocations are bounded at startup; host limits remain separate.</p></div>
@@ -58,21 +59,21 @@ COMMIT
     <section class="page-section section-grid" aria-labelledby="benchmark-title">
       <div class="section-intro">
         <div class="section-rule"></div>
-        <h2 id="benchmark-title">Three SQL paths, one workload</h2>
-        <p>The SQL-only runner keeps the schema, rows, query, role, PostgreSQL version and client settings fixed.</p>
+        <h2 id="benchmark-title">One strict SQL KV release gate</h2>
+        <p>The runner keeps schema, values, keys, returned bytes, role, PostgreSQL version and client settings fixed.</p>
         <a href="{{ '/docs/BENCHMARKS.html' | relative_url }}">Read the methodology →</a>
       </div>
       <div>
         <div class="table-scroll" role="region" aria-label="Latest SQL-only benchmark comparison" tabindex="0">
           <table class="benchmark-table">
-            <thead><tr><th>Protocol</th><th>Stock ops/s</th><th>Cache off</th><th>Cache on</th><th>Cache/stock</th><th>p99 stock/on</th></tr></thead>
+            <thead><tr><th>Protocol</th><th>Cached path</th><th>Stock baseline</th><th>Payload</th><th>Required ratio</th></tr></thead>
             <tbody>
-              <tr><td>Prepared</td><td>37,054</td><td>37,310</td><td>34,662</td><td>0.94x</td><td>3.982 / 3.989 ms</td></tr>
-              <tr><td>Extended</td><td>16,595</td><td>16,704</td><td>14,941</td><td>0.90x</td><td>6.162 / 6.366 ms</td></tr>
+              <tr><td>Prepared</td><td><code>local_cache.mget</code></td><td>Ordered PK batch</td><td>3,000 bytes</td><td>≥1.50x</td></tr>
+              <tr><td>Unnamed extended</td><td><code>local_cache.mget</code></td><td>Ordered PK batch</td><td>3,000 bytes</td><td>≥1.50x</td></tr>
             </tbody>
           </table>
         </div>
-        <div class="benchmark-note"><span>c16/p32 throughput; separate c16/p1 latency; three repetitions.</span><span><a href="https://github.com/aicopilot-fr/pg_local_cache/actions/runs/30729192604">CI run 30729192604</a></span></div>
+        <div class="benchmark-note"><span>c16/k32 throughput; separate c16/k1 latency; three repetitions.</span><span>Clean release evidence must pass exact cache accounting.</span></div>
       </div>
     </section>
   </div>
@@ -83,7 +84,7 @@ COMMIT
       <div class="step"><span class="step-number">1</span><strong>Preflight</strong><p>Check PostgreSQL, target paths, role and pending settings.</p></div>
       <div class="step"><span class="step-number">2</span><strong>Stage files</strong><p>Install the extension and stage postmaster configuration online.</p></div>
       <div class="step"><span class="step-number">3</span><strong>Restart once</strong><p>Load shared memory and hooks with one controlled restart.</p></div>
-      <div class="step"><span class="step-number">4</span><strong>Attach a table</strong><p>Register the primary key and keep querying it normally.</p></div>
+      <div class="step"><span class="step-number">4</span><strong>Attach a table</strong><p>Register the primary key and use typed SQL GET/MGET.</p></div>
     </div>
     <div class="install-command">
       <div class="command-label">Read-only preflight</div>
@@ -108,7 +109,7 @@ COMMIT
     <div class="docs-list">
       <a class="docs-link" href="{{ '/docs/INSTALL_EXISTING.html' | relative_url }}"><strong>Existing database</strong><span>Preflight, staging, restart, verification and rollback.</span><b>→</b></a>
       <a class="docs-link" href="{{ '/docs/TECHNICAL.html' | relative_url }}#architecture"><strong>Architecture</strong><span>Shared memory, hooks, workers and invalidation.</span><b>→</b></a>
-      <a class="docs-link" href="{{ '/#sql-api' | relative_url }}"><strong>SQL API</strong><span>Attach a table and use ordinary primary-key queries.</span><b>→</b></a>
+      <a class="docs-link" href="{{ '/#sql-api' | relative_url }}"><strong>SQL API</strong><span>Attach a table and use typed primary-key GET/MGET.</span><b>→</b></a>
       <a class="docs-link" href="{{ '/docs/BENCHMARKS.html' | relative_url }}"><strong>Benchmark methodology</strong><span>Workloads, limits, latency and downloadable evidence.</span><b>→</b></a>
       <a class="docs-link" href="{{ '/docs/MONITORING.html' | relative_url }}"><strong>Monitoring &amp; OOM</strong><span>Prometheus metrics, alerts, budgets and health checks.</span><b>→</b></a>
       <a class="docs-link" href="{{ '/docs/TECHNICAL.html' | relative_url }}#security-boundary"><strong>Security</strong><span>Privileges, token boundary, RLS and fail-closed checks.</span><b>→</b></a>

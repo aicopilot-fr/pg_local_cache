@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Standalone benchmark for pg_local_cache's transparent SQL-only API.
+"""Standalone benchmark for pg_local_cache's canonical SQL-only KV API.
 
 The harness talks only to PostgreSQL.  It deliberately requires
 ``pg_local_cache.port = 0`` and never opens a RESP connection.  A disposable
 whole-row table is attached with ``local_cache.attach_table`` and queried by
-a real LOGIN NOSUPERUSER role through ordinary ``SELECT *`` statements.
+a real LOGIN NOSUPERUSER role through ``local_cache.get`` and
+``local_cache.mget``.
 
 Two protocol lanes are reported independently:
 
 * pgbench ``prepared`` (server-side prepared statement reuse), and
 * pgbench ``extended`` (unnamed Parse/Bind/Execute for every statement).
 
-Each lane compares a separate stock PostgreSQL server, the mapped table with
-the cache disabled, and the same mapped table with the cache enabled.  The
-schema, generated rows, query, role, client limits, seed, and protocol are
-identical.  A separate one-SELECT transaction pass records end-to-end latency
-percentiles; throughput remains pipelined and is reported independently.
+Each lane compares a separate stock PostgreSQL server, an ordered mapped-table
+batch lookup, and the SQL KV API.  All modes return the same bytes for the same
+schema, rows, role, key stream, client limits, and protocol.  A separate scalar
+key pass records end-to-end latency percentiles; throughput reports resolved
+key positions per second from equal-width batches.
 
 Cache counters are sampled around every mapped-server run.  Unrelated
 pg_local_cache SQL traffic therefore makes the benchmark fail closed instead
@@ -241,10 +242,10 @@ class Config:
                 concurrency,
             ),
             pipeline=env_int("PGLC_SQL_ONLY_BENCH_PIPELINE", 32, 1, 256),
-            keys=env_int("PGLC_SQL_ONLY_BENCH_KEYS", 16_384, 1, 65_536),
+            keys=env_int("PGLC_SQL_ONLY_BENCH_KEYS", 4_096, 1, 65_536),
             payload_bytes=env_int(
                 "PGLC_SQL_ONLY_BENCH_PAYLOAD_BYTES",
-                128,
+                3_000,
                 1,
                 MAX_PAYLOAD_BYTES,
             ),
@@ -260,13 +261,15 @@ class Config:
                 0.0,
                 1e12,
             ),
-            min_cached_to_direct_ratio=env_optional_float(
+            min_cached_to_direct_ratio=env_float(
                 "PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_DIRECT_RATIO",
+                1.5,
                 0.0,
                 1_000.0,
             ),
-            min_cached_to_stock_ratio=env_optional_float(
+            min_cached_to_stock_ratio=env_float(
                 "PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_STOCK_RATIO",
+                1.5,
                 0.0,
                 1_000.0,
             ),
@@ -339,7 +342,7 @@ class Config:
             ):
                 raise ValueError(
                     "the scaling snapshot requires the strict primary profile "
-                    f"c{SCALING_PRIMARY_CONCURRENCY}/p{SCALING_PRIMARY_PIPELINE}"
+                    f"c{SCALING_PRIMARY_CONCURRENCY}/k{SCALING_PRIMARY_PIPELINE}"
                 )
             if self.keys < SCALING_SECONDARY_CONCURRENCY:
                 raise ValueError(
@@ -388,8 +391,17 @@ class Config:
     @property
     def lookup_query(self) -> str:
         return (
-            f"SELECT * FROM {self.qualified_table} "
-            "WHERE tenant_id = :tenant AND id = :key;"
+            "SELECT local_cache.get("
+            f"{sql_literal(self.schema + '.' + self.table)}::regclass, "
+            "(:key)::bigint);"
+        )
+
+    @property
+    def direct_lookup_query(self) -> str:
+        return (
+            "SELECT pg_catalog.row_to_json(pglc_source)::text "
+            f"FROM {self.qualified_table} AS pglc_source "
+            "WHERE id = :key;"
         )
 
 
@@ -677,21 +689,36 @@ def discover_client_resources() -> dict[str, Any]:
     }
 
 
-def lookup_script(config: Config) -> str:
-    lines = [f"\\set tenant {TENANT_ID}", "\\startpipeline"]
+def lookup_script(config: Config, *, cached: bool = True) -> str:
+    lines: list[str] = []
+    variables: list[str] = []
     for index in range(config.pipeline):
         variable = f"key_{index}"
+        variables.append(variable)
         lines.append(f"\\set {variable} random(1, {config.keys})")
-        lines.append(config.lookup_query.replace(":key", f":{variable}"))
-    lines.append("\\endpipeline")
+    array = "ARRAY[" + ", ".join(f":{name}" for name in variables) + "]::bigint[]"
+    if cached:
+        lines.append(
+            "SELECT local_cache.mget("
+            f"{sql_literal(config.schema + '.' + config.table)}::regclass, "
+            f"{array});"
+        )
+    else:
+        lines.append(
+            "SELECT pg_catalog.array_agg("
+            "pg_catalog.row_to_json(pglc_source)::text ORDER BY pglc_input.ordinality) "
+            f"FROM pg_catalog.unnest({array}) WITH ORDINALITY "
+            "AS pglc_input(id, ordinality) LEFT JOIN "
+            f"{config.qualified_table} AS pglc_source USING (id);"
+        )
     return "\n".join(lines) + "\n"
 
 
-def latency_lookup_script(config: Config) -> str:
+def latency_lookup_script(config: Config, query: str | None = None) -> str:
     return (
         f"\\set tenant {TENANT_ID}\n"
         f"\\set key random(1, {config.keys})\n"
-        + config.lookup_query
+        + (query or config.lookup_query)
         + "\n"
     )
 
@@ -944,14 +971,19 @@ def setup_sql(config: Config, *, database: str, attach: bool) -> str:
         "tenant_id bigint NOT NULL, id bigint NOT NULL, payload text NOT NULL, "
         "amount numeric(18,2) NOT NULL, enabled boolean NOT NULL, "
         "metadata jsonb NOT NULL, note text, "
-        "PRIMARY KEY (tenant_id, id));"
+        "PRIMARY KEY (id));"
         f"INSERT INTO {table} "
-        f"SELECT {TENANT_ID}, g, repeat('x', {config.payload_bytes}), "
+        f"SELECT {TENANT_ID}, g, p.payload, "
         "(g % 10000)::numeric / 100, (g % 2 = 0), "
         "pg_catalog.jsonb_build_object('bucket', g % 16, "
         "'active', g % 2 = 0), "
         "CASE WHEN g % 3 = 0 THEN NULL ELSE 'note-' || g::text END "
-        f"FROM pg_catalog.generate_series(1, {config.keys}) AS g;"
+        f"FROM pg_catalog.generate_series(1, {config.keys}) AS g "
+        "CROSS JOIN LATERAL (SELECT pg_catalog.left("
+        "pg_catalog.string_agg(pg_catalog.md5(g::text || ':' || chunk::text), "
+        "'' ORDER BY chunk), "
+        f"{config.payload_bytes}) AS payload FROM pg_catalog.generate_series("
+        f"1, ({config.payload_bytes} + 31) / 32) AS chunk) AS p;"
         f"GRANT USAGE ON SCHEMA {schema} TO {role};"
         f"GRANT SELECT ON TABLE {table} TO {role};"
         f"ANALYZE {table};"
@@ -961,6 +993,13 @@ def setup_sql(config: Config, *, database: str, attach: bool) -> str:
             "SELECT local_cache.attach_table("
             f"{sql_literal(config.schema + '.' + config.table)}::regclass, false, "
             f"{sql_literal(config.namespace)})::text;"
+            f"GRANT USAGE ON SCHEMA local_cache TO {role};"
+            "GRANT EXECUTE ON FUNCTION local_cache.get(regclass, text[]) TO "
+            f"{role};"
+            "GRANT EXECUTE ON FUNCTION local_cache.get(regclass, anyelement) TO "
+            f"{role};"
+            "GRANT EXECUTE ON FUNCTION local_cache.mget(regclass, anyarray) TO "
+            f"{role};"
         )
     return statements + "COMMIT;"
 
@@ -1056,7 +1095,17 @@ def validate_application_role(
         target=target,
     )
     fields = output.split("|")
-    expected = [config.app_user, "f", "t", "f", "f", "f", "f", "f", "f"]
+    expected = [
+        config.app_user,
+        "f",
+        "t",
+        "f",
+        "f",
+        "f",
+        "f",
+        "f",
+        "t" if target == "mapped" else "f",
+    ]
     if fields != expected:
         raise RuntimeError(
             f"benchmark application role is not isolated NOSUPERUSER: {fields!r}"
@@ -1071,60 +1120,64 @@ def validate_application_role(
         "createrole": False,
         "replication": False,
         "bypass_rls": False,
-        "local_cache_schema_usage": False,
+        "local_cache_schema_usage": target == "mapped",
     }
 
 
 def explain_and_sample(config: Config) -> dict[str, Any]:
-    literal_query = config.lookup_query.replace(
+    cached_query = config.lookup_query.replace(
+        ":tenant", str(TENANT_ID)
+    ).replace(":key", "1")
+    direct_query = config.direct_lookup_query.replace(
         ":tenant", str(TENANT_ID)
     ).replace(":key", "1")
     direct_plan = psql(
         config,
         "SET pg_local_cache.sql_cache = off;"
-        f"EXPLAIN (COSTS OFF) {literal_query}",
+        f"EXPLAIN (COSTS OFF) {direct_query}",
         application=True,
     )
     direct_value = psql(
         config,
-        "SET pg_local_cache.sql_cache = off;" + literal_query,
+        "SET pg_local_cache.sql_cache = off;" + direct_query,
         application=True,
     )
     cached_plan = psql(
         config,
         "SET pg_local_cache.sql_cache = on;"
-        f"EXPLAIN (COSTS OFF) {literal_query}",
+        f"EXPLAIN (COSTS OFF) {cached_query}",
         application=True,
     )
     cached_value = psql(
         config,
-        "SET pg_local_cache.sql_cache = on;" + literal_query,
+        "SET pg_local_cache.sql_cache = on;" + cached_query,
         application=True,
     )
     stock_plan = psql(
         config,
-        f"EXPLAIN (COSTS OFF) {literal_query}",
+        f"EXPLAIN (COSTS OFF) {direct_query}",
         application=True,
         target="stock",
     )
     stock_value = psql(
         config,
-        literal_query,
+        direct_query,
         application=True,
         target="stock",
     )
     if CUSTOM_SCAN_NAME in direct_plan:
         raise RuntimeError("cache-off plan unexpectedly contains pg_local_cache CustomScan")
-    if CUSTOM_SCAN_NAME not in cached_plan:
-        raise RuntimeError("cache-on whole-row lookup lacks pg_local_cache CustomScan")
+    if CUSTOM_SCAN_NAME in cached_plan:
+        raise RuntimeError("SQL KV lookup unexpectedly contains pg_local_cache CustomScan")
     if CUSTOM_SCAN_NAME in stock_plan:
         raise RuntimeError("stock PostgreSQL plan unexpectedly contains CustomScan")
     if not direct_value or cached_value != direct_value or stock_value != direct_value:
         raise RuntimeError(
-            "stock, cached, and direct ordinary SELECT returned different rows"
+            "stock, cached, and direct SQL KV reads returned different rows"
         )
     return {
         "query": config.lookup_query,
+        "stock_and_direct_query": config.direct_lookup_query,
         "validated_key": {"tenant_id": TENANT_ID, "id": 1},
         "direct_plan": direct_plan,
         "cached_plan": cached_plan,
@@ -1167,16 +1220,14 @@ def validate_expected_deltas(
 def cold_miss_fill_hit_proof(config: Config) -> dict[str, Any]:
     invalidated = invalidate_namespace(config)
     before = read_stats(config)
-    statement = config.lookup_query.replace(":tenant", "$1").replace(
-        ":key", "$2"
-    )
+    statement = config.lookup_query.replace(":key", "$1")
     output = psql(
         config,
         "SET pg_local_cache.sql_cache = on;\n"
         "SET plan_cache_mode = force_generic_plan;\n"
-        f"PREPARE pglc_cold(bigint, bigint) AS {statement}\n"
-        f"EXECUTE pglc_cold({TENANT_ID}, 1);\n"
-        f"EXECUTE pglc_cold({TENANT_ID}, 1);\n"
+        f"PREPARE pglc_cold(bigint) AS {statement}\n"
+        "EXECUTE pglc_cold(1);\n"
+        "EXECUTE pglc_cold(1);\n"
         "DEALLOCATE pglc_cold;\n",
         application=True,
         script=True,
@@ -1202,16 +1253,14 @@ def cold_miss_fill_hit_proof(config: Config) -> dict[str, Any]:
 
 def warm_all_keys(config: Config) -> dict[str, Any]:
     invalidated = invalidate_namespace(config)
-    statement = config.lookup_query.replace(":tenant", "$1").replace(
-        ":key", "$2"
-    )
+    statement = config.lookup_query.replace(":key", "$1")
     lines = [
         "SET pg_local_cache.sql_cache = on;",
         "SET plan_cache_mode = force_generic_plan;",
-        f"PREPARE pglc_warm(bigint, bigint) AS {statement}",
+        f"PREPARE pglc_warm(bigint) AS {statement}",
     ]
     lines.extend(
-        f"EXECUTE pglc_warm({TENANT_ID}, {key});"
+        f"EXECUTE pglc_warm({key});"
         for key in range(1, config.keys + 1)
     )
     lines.append("DEALLOCATE pglc_warm;")
@@ -1265,19 +1314,17 @@ def sentinel_row_integrity_check(config: Config) -> dict[str, Any]:
         )
 
     sentinel_keys = sorted({1, (config.keys + 1) // 2, config.keys})
-    statement = config.lookup_query.replace(":tenant", "$1").replace(
-        ":key", "$2"
-    )
-
     def execute(cache_enabled: bool) -> tuple[list[str], dict[str, int]]:
         mode = "on" if cache_enabled else "off"
+        query = config.lookup_query if cache_enabled else config.direct_lookup_query
+        statement = query.replace(":key", "$1")
         lines = [
             f"SET pg_local_cache.sql_cache = {mode};",
             "SET plan_cache_mode = force_generic_plan;",
-            f"PREPARE pglc_integrity(bigint, bigint) AS {statement}",
+            f"PREPARE pglc_integrity(bigint) AS {statement}",
         ]
         lines.extend(
-            f"EXECUTE pglc_integrity({TENANT_ID}, {key});"
+            f"EXECUTE pglc_integrity({key});"
             for key in sentinel_keys
         )
         lines.append("DEALLOCATE pglc_integrity;")
@@ -1301,12 +1348,17 @@ def sentinel_row_integrity_check(config: Config) -> dict[str, Any]:
             )
         returned_keys: list[int] = []
         for row in rows:
-            fields = row.split("|", 2)
-            if len(fields) < 2 or fields[0] != str(TENANT_ID):
+            try:
+                parsed = json.loads(row)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(
+                    f"sentinel check returned malformed JSON: {row!r}"
+                ) from error
+            if not isinstance(parsed, dict) or parsed.get("tenant_id") != TENANT_ID:
                 raise RuntimeError(f"sentinel check returned malformed row: {row!r}")
             try:
-                returned_keys.append(int(fields[1]))
-            except ValueError as error:
+                returned_keys.append(int(parsed["id"]))
+            except (KeyError, TypeError, ValueError) as error:
                 raise RuntimeError(
                     f"sentinel check returned a non-integer key: {row!r}"
                 ) from error
@@ -1319,12 +1371,13 @@ def sentinel_row_integrity_check(config: Config) -> dict[str, Any]:
 
     direct_rows, direct_deltas = execute(False)
     cached_rows, cached_deltas = execute(True)
+    statement = config.direct_lookup_query.replace(":key", "$1")
     stock_lines = [
         "SET plan_cache_mode = force_generic_plan;",
-        f"PREPARE pglc_integrity(bigint, bigint) AS {statement}",
+        f"PREPARE pglc_integrity(bigint) AS {statement}",
     ]
     stock_lines.extend(
-        f"EXECUTE pglc_integrity({TENANT_ID}, {key});"
+        f"EXECUTE pglc_integrity({key});"
         for key in sentinel_keys
     )
     stock_lines.append("DEALLOCATE pglc_integrity;")
@@ -1499,7 +1552,7 @@ def mode_order(repetition: int) -> tuple[str, str, str]:
 
 
 def measure_latency_protocol(
-    config: Config, script_path: Path, protocol: str
+    config: Config, script_paths: Mapping[str, Path], protocol: str
 ) -> dict[str, Any]:
     per_mode_runs: dict[str, list[dict[str, Any]]] = {
         mode: [] for mode in BENCHMARK_MODES
@@ -1519,7 +1572,7 @@ def measure_latency_protocol(
                 seed = 81_000 + protocol_offset * 1_000 + repetition
                 run = run_with_counter_accounting(
                     config,
-                    script_path,
+                    script_paths[benchmark_mode],
                     protocol=protocol,
                     benchmark_mode=benchmark_mode,
                     duration=config.latency_duration,
@@ -1643,8 +1696,8 @@ def relative_throughput_gate(
 
 def measure_protocol(
     config: Config,
-    script_path: Path,
-    latency_script_path: Path,
+    script_paths: Mapping[str, Path],
+    latency_script_paths: Mapping[str, Path],
     protocol: str,
     minimum_ops: float | None,
 ) -> dict[str, Any]:
@@ -1654,7 +1707,7 @@ def measure_protocol(
         for benchmark_mode in BENCHMARK_MODES:
             warmup = run_pgbench_once(
                 config,
-                script_path,
+                script_paths[benchmark_mode],
                 protocol=protocol,
                 benchmark_mode=benchmark_mode,
                 duration=config.warmup_seconds,
@@ -1670,7 +1723,7 @@ def measure_protocol(
         for benchmark_mode in mode_order(repetition):
             run = run_with_counter_accounting(
                 config,
-                script_path,
+                script_paths[benchmark_mode],
                 protocol=protocol,
                 benchmark_mode=benchmark_mode,
                 duration=config.duration,
@@ -1682,7 +1735,7 @@ def measure_protocol(
     stock = aggregate_mode(runs["stock"])
     direct = aggregate_mode(runs["direct"])
     cached = aggregate_mode(runs["cached"])
-    latency = measure_latency_protocol(config, latency_script_path, protocol)
+    latency = measure_latency_protocol(config, latency_script_paths, protocol)
     stock["latency"] = latency["stock"]
     direct["latency"] = latency["direct"]
     cached["latency"] = latency["cached"]
@@ -1795,15 +1848,29 @@ def measure_scaling_snapshot(
         return {"status": "DISABLED", "performance_gating": False}
 
     secondary = scaling_profile_config(config)
-    throughput_path = script_directory / "scaling-c4-p8-throughput.sql"
-    latency_path = script_directory / "scaling-c4-p8-latency.sql"
-    throughput_path.write_text(lookup_script(secondary), encoding="utf-8")
-    latency_path.write_text(latency_lookup_script(secondary), encoding="utf-8")
+    throughput_paths: dict[str, Path] = {}
+    latency_paths: dict[str, Path] = {}
+    for mode in BENCHMARK_MODES:
+        query = (
+            secondary.lookup_query
+            if mode == "cached"
+            else secondary.direct_lookup_query
+        )
+        throughput_path = script_directory / f"scaling-c4-p8-{mode}-throughput.sql"
+        latency_path = script_directory / f"scaling-c4-p8-{mode}-latency.sql"
+        throughput_path.write_text(
+            lookup_script(secondary, cached=mode == "cached"), encoding="utf-8"
+        )
+        latency_path.write_text(
+            latency_lookup_script(secondary, query), encoding="utf-8"
+        )
+        throughput_paths[mode] = throughput_path
+        latency_paths[mode] = latency_path
     protocols = {
         protocol: measure_protocol(
             secondary,
-            throughput_path,
-            latency_path,
+            throughput_paths,
+            latency_paths,
             protocol,
             None,
         )
@@ -2332,14 +2399,14 @@ def validate_scaling_snapshot(report: Mapping[str, Any]) -> list[str]:
 
     primary = profiles.get(SCALING_PRIMARY_PROFILE)
     if not isinstance(primary, Mapping):
-        failures.append("c16/p32 scaling reference is missing")
+        failures.append("c16/k32 scaling reference is missing")
     else:
         if primary.get("source") != "primary_strict_profile":
-            failures.append("c16/p32 must reference the strict primary profile")
+            failures.append("c16/k32 must reference the strict primary profile")
         if primary.get("source_path") != "$.protocols":
-            failures.append("c16/p32 primary evidence path is invalid")
+            failures.append("c16/k32 primary evidence path is invalid")
         if "protocols" in primary:
-            failures.append("c16/p32 raw evidence must not be duplicated")
+            failures.append("c16/k32 raw evidence must not be duplicated")
         primary_workload = primary.get("workload")
         expected_primary = {
             "concurrency": SCALING_PRIMARY_CONCURRENCY,
@@ -2384,7 +2451,7 @@ def validate_scaling_snapshot(report: Mapping[str, Any]) -> list[str]:
             ),
         }
         if primary_workload != expected_primary:
-            failures.append("c16/p32 workload does not match the strict profile")
+            failures.append("c16/k32 workload does not match the strict profile")
         primary_protocols = report.get("protocols")
         if isinstance(primary_protocols, Mapping):
             for protocol in PROTOCOLS:
@@ -2403,18 +2470,18 @@ def validate_scaling_snapshot(report: Mapping[str, Any]) -> list[str]:
                             != SCALING_PRIMARY_PIPELINE
                         ):
                             failures.append(
-                                f"c16/p32 {protocol} {benchmark_mode} run "
-                                f"{index} does not use throughput pipeline 32"
+                                f"c16/k32 {protocol} {benchmark_mode} run "
+                                f"{index} does not use 32 keys per MGET"
                             )
 
     secondary = profiles.get(SCALING_SECONDARY_PROFILE)
     if not isinstance(secondary, Mapping):
-        return failures + ["c4/p8 scaling evidence is missing"]
+        return failures + ["c4/k8 scaling evidence is missing"]
     if secondary.get("source") != "embedded":
-        failures.append("c4/p8 scaling evidence source is invalid")
+        failures.append("c4/k8 scaling evidence source is invalid")
     secondary_workload = secondary.get("workload")
     if not isinstance(secondary_workload, Mapping):
-        return failures + ["c4/p8 scaling workload is missing"]
+        return failures + ["c4/k8 scaling workload is missing"]
     try:
         primary_jobs = int(workload.get("jobs", 1))
     except (AttributeError, TypeError, ValueError):
@@ -2432,25 +2499,25 @@ def validate_scaling_snapshot(report: Mapping[str, Any]) -> list[str]:
     }
     for field, expected in expected_secondary_fields.items():
         if secondary_workload.get(field) != expected:
-            failures.append(f"c4/p8 scaling workload {field} is invalid")
+            failures.append(f"c4/k8 scaling workload {field} is invalid")
     repetitions = secondary_workload.get("repetitions")
     if (
         not isinstance(repetitions, int)
         or isinstance(repetitions, bool)
         or repetitions < 1
     ):
-        failures.append("c4/p8 scaling repetition count is invalid")
+        failures.append("c4/k8 scaling repetition count is invalid")
         repetitions = 0
     protocols = secondary.get("protocols")
     if not isinstance(protocols, Mapping):
-        return failures + ["c4/p8 scaling protocols are missing"]
+        return failures + ["c4/k8 scaling protocols are missing"]
     for protocol in PROTOCOLS:
         lane = protocols.get(protocol)
         if not isinstance(lane, Mapping):
-            failures.append(f"c4/p8 {protocol} result is missing")
+            failures.append(f"c4/k8 {protocol} result is missing")
             continue
         failures.extend(
-            f"c4/p8 {failure}"
+            f"c4/k8 {failure}"
             for failure in validate_protocol_lane(
                 lane,
                 protocol,
@@ -2472,8 +2539,8 @@ def validate_scaling_snapshot(report: Mapping[str, Any]) -> list[str]:
                     != SCALING_SECONDARY_PIPELINE
                 ):
                     failures.append(
-                        f"c4/p8 {protocol} {benchmark_mode} run {index} "
-                        "does not use throughput pipeline 8"
+                        f"c4/k8 {protocol} {benchmark_mode} run {index} "
+                        "does not use 8 keys per MGET"
                     )
     return failures
 
@@ -2501,8 +2568,8 @@ def validate_report(report: Mapping[str, Any]) -> list[str]:
     role = report.get("ordinary_application_role", {})
     if not isinstance(role, Mapping) or role.get("superuser") is not False:
         failures.append("ordinary benchmark role is not a proven NOSUPERUSER")
-    if isinstance(role, Mapping) and role.get("local_cache_schema_usage") is not False:
-        failures.append("ordinary benchmark role can access local_cache schema")
+    if isinstance(role, Mapping) and role.get("local_cache_schema_usage") is not True:
+        failures.append("SQL KV benchmark role cannot access local_cache schema")
     stock_role = report.get("stock_application_role", {})
     if not isinstance(stock_role, Mapping) or stock_role.get("superuser") is not False:
         failures.append("stock benchmark role is not a proven NOSUPERUSER")
@@ -2561,8 +2628,8 @@ def validate_report(report: Mapping[str, Any]) -> list[str]:
     if not isinstance(plan, Mapping):
         failures.append("ordinary SELECT plan proof is missing")
     else:
-        if CUSTOM_SCAN_NAME not in str(plan.get("cached_plan", "")):
-            failures.append("cached ordinary SELECT did not use CustomScan")
+        if CUSTOM_SCAN_NAME in str(plan.get("cached_plan", "")):
+            failures.append("SQL KV function unexpectedly used CustomScan")
         if CUSTOM_SCAN_NAME in str(plan.get("direct_plan", "")):
             failures.append("direct ordinary SELECT unexpectedly used CustomScan")
         if CUSTOM_SCAN_NAME in str(plan.get("stock_plan", "")):
@@ -2652,7 +2719,7 @@ def render_scaling_markdown(
         return []
     lines = [
         "",
-        "## c4/p8 and c16/p32 scaling snapshot",
+        "## c4/k8 and c16/k32 scaling snapshot",
         "",
         "| Protocol | Mode | Throughput profile | Median throughput | "
         "Latency profile | Mean | p50 | p95 | p99 | Samples |",
@@ -2673,9 +2740,9 @@ def render_scaling_markdown(
                 ]
                 lines.append(
                     f"| {protocol} | {mode_labels[benchmark_mode]} | "
-                    f"{profile_name.replace('_', '/')} | "
+                    f"{profile_name.replace('_p', '/k')} | "
                     f"{format_number(throughput)} ops/s | "
-                    f"c{concurrency}/p1 | "
+                    f"c{concurrency}/k1 | "
                     f"{format_number(latency['mean_ms'], 3)} ms | "
                     f"{format_number(latency['p50_ms'], 3)} ms | "
                     f"{format_number(latency['p95_ms'], 3)} ms | "
@@ -2691,10 +2758,10 @@ def render_scaling_markdown(
     lines.extend(
         (
             "",
-            "The profile pipeline applies to throughput only. Latency uses "
-            "one `SELECT` per transaction: c4/p1 and c16/p1. The c4/p8 "
+            "The MGET key width applies to throughput only. Latency uses "
+            "one scalar key read per transaction: c4/k1 and c16/k1. The c4/k8 "
             f"snapshot uses {secondary_workload['repetitions']} repetition; "
-            "its performance values are non-gating. c16/p32 references the "
+            "its performance values are non-gating. c16/k32 references the "
             f"{primary_workload['repetitions']}-repetition strict profile "
             "above without copying its raw latency samples.",
         )
@@ -2714,10 +2781,11 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         "",
         f"Generated: `{report['generated_at_utc']}`",
         "",
-        "Ordinary `SELECT *` by the complete composite primary key, executed "
-        "by the same LOGIN NOSUPERUSER against a stock PostgreSQL 16 server "
-        "and the mapped server. The mapped server has `pg_local_cache.port=0`; "
-        "no RESP listener, client, or token is used.",
+        "SQL-only `local_cache.mget(regclass, anyarray)` compared with a "
+        "byte-identical stock PostgreSQL primary-key batch lookup. Both use the "
+        "same LOGIN NOSUPERUSER, key stream, rows, and wire protocol. The mapped "
+        "server has `pg_local_cache.port=0`; no RESP listener, client, or token "
+        "is used.",
         "",
         "## Throughput and end-to-end latency",
         "",
@@ -2733,9 +2801,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             latency = mode["latency"]["distribution"]
             lines.append(
                 f"| {protocol} | {mode_labels[benchmark_mode]} | "
-                f"c{workload['concurrency']}/p{workload['pipeline']} | "
+                f"c{workload['concurrency']}/k{workload['pipeline']} | "
                 f"{format_number(throughput)} ops/s | "
-                f"c{workload['concurrency']}/p1 | "
+                f"c{workload['concurrency']}/k1 | "
                 f"{format_number(latency['mean_ms'], 3)} ms | "
                 f"{format_number(latency['p50_ms'], 3)} ms | "
                 f"{format_number(latency['p95_ms'], 3)} ms | "
@@ -2746,11 +2814,11 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         (
             "",
             "Latency is measured in separate, rotated repetitions with one "
-            "`SELECT` per transaction (`pipeline_depth=1`). This is a "
+            "scalar key read per transaction. This is a "
             "closed-loop saturation measurement, not an equal offered-rate "
             "test. Aggregate "
             "percentiles are recomputed from the retained raw samples. "
-            "Throughput uses the configured pipeline.",
+            "Throughput is batch TPS multiplied by the configured keys per MGET.",
         )
     )
     lines.extend(render_scaling_markdown(report, mode_labels))
@@ -2816,7 +2884,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             f"{cached_sentinel_hits} | "
             "0 | 0 | 0 |",
             "",
-            "Every cached timed run requires `hits == successful SELECTs` and "
+            "Every cached timed run requires `hits == successful key reads` and "
             "zero misses, fills, or bypasses. Every direct run requires all "
             "four SQL-cache counter deltas to be zero.",
             "",
@@ -2838,18 +2906,19 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             f"| Repetitions per mode/protocol | {workload['repetitions']} |",
             f"| Concurrent connections | {workload['concurrency']} |",
             f"| pgbench jobs | {workload['jobs']} |",
-            f"| SELECTs per pipeline batch | {workload['pipeline']} |",
-            f"| Distinct whole rows | {workload['keys']} |",
+            f"| Keys per SQL MGET | {workload['pipeline']} |",
+            f"| Distinct KV rows | {workload['keys']} |",
             f"| Text payload bytes | {workload['payload_bytes']} |",
             "",
             f"Overall gate: **{report['gate']['status']}** — "
             f"{report['gate']['message']}",
             "",
             "Prepared and unnamed-extended results have independent >=10k "
-            "gates and are never pooled. Optional cache/direct and cache/stock "
-            "ratio gates are reported separately. A rotating three-mode order "
-            "reduces run-order bias. All modes use identical schema, data, SQL, role, "
-            "key stream, connections, jobs, duration, and protocol settings.",
+            "gates and are never pooled. Cache/direct and cache/stock ratio "
+            "gates are reported separately. A rotating three-mode order "
+            "reduces run-order bias. All modes use identical schema, data, returned "
+            "bytes, role, key stream, connections, jobs, duration, and protocol "
+            "settings; SQL differs only because stock PostgreSQL has no `mget`.",
             "",
         )
     )
@@ -2928,27 +2997,40 @@ def build_report(config: Config) -> dict[str, Any]:
         cold_proof = cold_miss_fill_hit_proof(config)
         warm_proof = warm_all_keys(config)
         integrity_check = sentinel_row_integrity_check(config)
-        script = lookup_script(config)
-        latency_script = latency_lookup_script(config)
         with tempfile.TemporaryDirectory(
             prefix="pglc_sql_only_scripts_"
         ) as directory:
-            script_path = Path(directory) / "throughput.sql"
-            latency_script_path = Path(directory) / "latency.sql"
-            script_path.write_text(script, encoding="utf-8")
-            latency_script_path.write_text(latency_script, encoding="utf-8")
+            script_paths: dict[str, Path] = {}
+            latency_script_paths: dict[str, Path] = {}
+            for mode in BENCHMARK_MODES:
+                query = (
+                    config.lookup_query
+                    if mode == "cached"
+                    else config.direct_lookup_query
+                )
+                script_path = Path(directory) / f"{mode}-throughput.sql"
+                latency_script_path = Path(directory) / f"{mode}-latency.sql"
+                script_path.write_text(
+                    lookup_script(config, cached=mode == "cached"),
+                    encoding="utf-8",
+                )
+                latency_script_path.write_text(
+                    latency_lookup_script(config, query), encoding="utf-8"
+                )
+                script_paths[mode] = script_path
+                latency_script_paths[mode] = latency_script_path
             protocols = {
                 "prepared": measure_protocol(
                     config,
-                    script_path,
-                    latency_script_path,
+                    script_paths,
+                    latency_script_paths,
                     "prepared",
                     config.prepared_min_ops,
                 ),
                 "extended": measure_protocol(
                     config,
-                    script_path,
-                    latency_script_path,
+                    script_paths,
+                    latency_script_paths,
                     "extended",
                     config.extended_min_ops,
                 ),
@@ -3048,8 +3130,8 @@ def build_report(config: Config) -> dict[str, Any]:
                     "cached rows at the first, middle, and last key"
                 ),
                 "scaling_snapshot": (
-                    "non-gating c4/p8 measurement on the same servers after "
-                    "the strict c16/p32 profile; correctness accounting remains "
+                    "non-gating c4/k8 measurement on the same servers after "
+                    "the strict c16/k32 profile; correctness accounting remains "
                     "fail-closed and latency uses pipeline depth one"
                 ),
             },

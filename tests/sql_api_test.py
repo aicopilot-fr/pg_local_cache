@@ -116,6 +116,22 @@ class ConsistencyTests(unittest.TestCase):
 
 
 class PrivilegeTests(unittest.TestCase):
+    def test_sql_kv_reads_are_security_invoker_c_functions(self) -> None:
+        for signature, symbol in (
+            ("get(relation regclass, key_values text[])", "pg_local_cache_sql_get"),
+            ("get(relation regclass, key_value anyelement)", "pg_local_cache_sql_get_scalar"),
+            ("mget(relation regclass, key_values anyarray)", "pg_local_cache_sql_mget"),
+        ):
+            definition = SQL.partition(f"CREATE FUNCTION {signature}")[2].partition(";")[0]
+            self.assertIn(symbol, definition)
+            self.assertIn("LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE", definition)
+            self.assertIn("SECURITY INVOKER", definition)
+
+    def test_sql_api_does_not_expose_a_polymorphic_row_witness(self) -> None:
+        self.assertNotIn("row_type anyelement", SQL)
+        self.assertNotIn("anycompatible", SQL)
+        self.assertNotIn("pg_local_cache_sql_get_row", SQL)
+
     def test_admin_and_internal_functions_are_not_public(self) -> None:
         signatures = (
             "attach_table(regclass, boolean, text)",

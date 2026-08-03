@@ -284,20 +284,30 @@ index-column order. It supports 1–16 PK columns. It acquires
 `ShareRowExclusiveLock` while installing and validating extension-owned
 triggers, so it can briefly conflict with DML and DDL.
 
-Application users need only their normal privileges on the source table:
+Application users keep their normal source-table privileges:
 
 ```sql
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.items TO app_user;
 ```
 
-They do not need `USAGE` on `local_cache`. The existing driver keeps issuing
-normal parameterized queries:
+The existing PostgreSQL driver continues issuing normal typed SQL:
 
 ```sql
-SELECT * FROM public.items WHERE id = $1;
+SELECT * FROM public.items WHERE id = $1::bigint;
+SELECT value FROM public.items WHERE id = $1::bigint;
 ```
 
-Verify the cache path:
+No output column list or cache-specific function is required. `SELECT *`
+returns the complete tuple; an ordinary projection returns only requested
+columns. Grant the optional JSON functions only to applications that use them:
+
+```sql
+GRANT USAGE ON SCHEMA local_cache TO app_user;
+GRANT EXECUTE ON FUNCTION local_cache.get(regclass, anyelement) TO app_user;
+GRANT EXECUTE ON FUNCTION local_cache.mget(regclass, anyarray) TO app_user;
+```
+
+Verify the transparent exact-PK fast path:
 
 ```sql
 EXPLAIN (ANALYZE, COSTS OFF)
@@ -308,8 +318,9 @@ SELECT * FROM local_cache.metrics();
 ```
 
 A supported cold lookup reads the source table and fills the cache. For a
-missing or unsafe entry, ordinary SQL runs PostgreSQL's normal plan and returns
-the authoritative result.
+missing or unsafe entry, ordinary PostgreSQL reads the authoritative source
+row. Composite primary keys use normal equality predicates for every key
+column; see the technical reference for details.
 
 ## Optional RESP mode
 

@@ -230,7 +230,12 @@ def assert_no_custom_scan(plan: str) -> None:
 def main() -> None:
     suffix = str(os.getpid())
     table = f"pglc_sql_fastpath_{suffix}"
+    barrier = f"public.pglc_sql_barrier_{suffix}"
     namespace = f"sqlfast{suffix}"
+    inheritance_schema = f"pglc_sql_inh_{suffix}"
+    inheritance_namespace = f"sqlinh{suffix}"
+    inheritance_parent = f"{inheritance_schema}.parent_rows"
+    inheritance_child = f"{inheritance_schema}.child_rows"
     missing_id = 9_000_000_000 + os.getpid()
     relation = f"public.{table}"
     quoted_app_role = sql_identifier(APP_ROLE)
@@ -250,9 +255,19 @@ def main() -> None:
             f"CREATE TABLE {relation} ("
             "id bigint PRIMARY KEY, value text NOT NULL);"
             f"INSERT INTO {relation} VALUES (1, 'one'), (-1, 'minus-one');"
+            f"CREATE TABLE {barrier} (id integer PRIMARY KEY, value integer);"
+            f"INSERT INTO {barrier} VALUES (1, 0);"
             "SELECT local_cache.attach_table("
             f"'{relation}'::regclass, false, '{namespace}');"
-            f"GRANT SELECT, UPDATE ON TABLE {relation} TO {quoted_app_role}"
+            f"GRANT SELECT, UPDATE ON TABLE {relation} TO {quoted_app_role};"
+            f"GRANT SELECT, UPDATE ON TABLE {barrier} TO {quoted_app_role};"
+            f"GRANT USAGE ON SCHEMA local_cache TO {quoted_app_role};"
+            "GRANT EXECUTE ON FUNCTION local_cache.get(regclass, text[]) "
+            f"TO {quoted_app_role};"
+            "GRANT EXECUTE ON FUNCTION local_cache.get(regclass, anyelement) "
+            f"TO {quoted_app_role};"
+            "GRANT EXECUTE ON FUNCTION local_cache.mget(regclass, anyarray) "
+            f"TO {quoted_app_role}"
         )
 
         # A literal PK lookup is eligible even on a tiny table.  The original
@@ -269,6 +284,106 @@ def main() -> None:
         before = stats()
         assert app_sql(f"SELECT value FROM {relation} WHERE id = 1") == "one"
         assert app_sql(f"SELECT value FROM {relation} WHERE id = 1") == "one"
+        assert_counter_delta(
+            before,
+            stats(),
+            sql_cache_hits=1,
+            sql_cache_misses=1,
+            sql_cache_fills=1,
+        )
+        expected_row_json = '{"id":1,"value":"one"}'
+
+        # The fast scalar overload and batch API keep PostgreSQL array order,
+        # duplicates, and NULLs without requiring a non-SQL client protocol.
+        admin_sql(f"SELECT local_cache.invalidate('{namespace}')")
+        before = stats()
+        scalar_rows = app_script(
+            "SET plan_cache_mode = force_generic_plan;\n"
+            f"PREPARE pglc_scalar_{suffix}(regclass, bigint) AS "
+            "SELECT local_cache.get($1, $2);\n"
+            f"EXECUTE pglc_scalar_{suffix}('{relation}', 1);\n"
+            f"EXECUTE pglc_scalar_{suffix}('{relation}', 1);\n"
+            f"DEALLOCATE pglc_scalar_{suffix};\n"
+        ).splitlines()
+        assert scalar_rows == [expected_row_json, expected_row_json], scalar_rows
+        assert_counter_delta(
+            before,
+            stats(),
+            sql_cache_hits=1,
+            sql_cache_misses=1,
+            sql_cache_fills=1,
+        )
+
+        # Ordinary PostgreSQL SQL is the native tuple API.  The same prepared
+        # statement can expand the whole row or project selected columns.
+        admin_sql(f"SELECT local_cache.invalidate('{namespace}')")
+        before = stats()
+        tuple_rows = app_script(
+            "SET plan_cache_mode = force_generic_plan;\n"
+            f"PREPARE pglc_row_{suffix}(bigint) AS "
+            f"SELECT * FROM {relation} WHERE id = $1;\n"
+            f"EXECUTE pglc_row_{suffix}(1);\n"
+            f"EXECUTE pglc_row_{suffix}(1);\n"
+            f"DEALLOCATE pglc_row_{suffix};\n"
+        ).splitlines()
+        assert tuple_rows == ["1|one", "1|one"], tuple_rows
+        assert_counter_delta(
+            before,
+            stats(),
+            sql_cache_hits=1,
+            sql_cache_misses=1,
+            sql_cache_fills=1,
+        )
+
+        admin_sql(f"SELECT local_cache.invalidate('{namespace}')")
+        before = stats()
+        batch_rows = app_script(
+            "SET plan_cache_mode = force_generic_plan;\n"
+            f"PREPARE pglc_mget_{suffix}(regclass, bigint[]) AS "
+            "SELECT array_to_json(local_cache.mget($1, $2))::text;\n"
+            f"EXECUTE pglc_mget_{suffix}('{relation}', "
+            f"ARRAY[1, -1, 1, NULL, {missing_id}]::bigint[]);\n"
+            f"EXECUTE pglc_mget_{suffix}('{relation}', "
+            f"ARRAY[1, -1, 1, NULL, {missing_id}]::bigint[]);\n"
+            f"DEALLOCATE pglc_mget_{suffix};\n"
+        ).splitlines()
+        expected_batch = [
+            expected_row_json,
+            '{"id":-1,"value":"minus-one"}',
+            expected_row_json,
+            None,
+            None,
+        ]
+        assert [json.loads(row) for row in batch_rows] == [
+            expected_batch,
+            expected_batch,
+        ], batch_rows
+        assert_counter_delta(
+            before,
+            stats(),
+            sql_cache_hits=5,
+            sql_cache_misses=3,
+            sql_cache_fills=3,
+        )
+
+        # The canonical KV API stays inside ordinary PostgreSQL SQL.  Its
+        # first execution reads the attached source and fills; the second
+        # returns the byte-identical whole-row JSON directly from the cache.
+        admin_sql(f"SELECT local_cache.invalidate('{namespace}')")
+        before = stats()
+        kv_rows = app_script(
+            "SET plan_cache_mode = force_generic_plan;\n"
+            f"PREPARE pglc_get_{suffix}(regclass, text[]) AS "
+            "SELECT local_cache.get($1, $2);\n"
+            f"EXECUTE pglc_get_{suffix}('{relation}', ARRAY['1']);\n"
+            f"EXECUTE pglc_get_{suffix}('{relation}', ARRAY['1']);\n"
+            f"DEALLOCATE pglc_get_{suffix};\n"
+        ).splitlines()
+        assert kv_rows == [expected_row_json, expected_row_json], kv_rows
+        assert app_sql(
+            f"SELECT row_to_json(pglc_source)::text FROM {relation} "
+            "AS pglc_source WHERE id = 1"
+        ) == expected_row_json
         assert_counter_delta(
             before,
             stats(),
@@ -372,8 +487,43 @@ def main() -> None:
         assert admin_sql(f"SELECT value FROM {relation} WHERE id = 1") == "one"
         assert app_sql(f"SELECT value FROM {relation} WHERE id = 1") == "one"
 
+        # The same clean prepared SQL KV functions must bypass after a write
+        # and read the transaction's own tuple.  ROLLBACK preserves old data.
+        before = stats()
+        kv_rollback = app_script(
+            "SET plan_cache_mode = force_generic_plan;\n"
+            f"PREPARE pglc_get_rollback_{suffix}(regclass, bigint) AS "
+            "SELECT local_cache.get($1, $2);\n"
+            f"PREPARE pglc_mget_rollback_{suffix}(regclass, bigint[]) AS "
+            "SELECT array_to_json(local_cache.mget($1, $2))::text;\n"
+            f"EXECUTE pglc_get_rollback_{suffix}('{relation}', 1);\n"
+            "BEGIN;\n"
+            f"UPDATE {relation} SET value = 'own-write' WHERE id = 1;\n"
+            f"EXECUTE pglc_get_rollback_{suffix}('{relation}', 1);\n"
+            f"EXECUTE pglc_mget_rollback_{suffix}('{relation}', "
+            "ARRAY[1, -1]::bigint[]);\n"
+            "ROLLBACK;\n"
+            f"DEALLOCATE pglc_get_rollback_{suffix};\n"
+            f"DEALLOCATE pglc_mget_rollback_{suffix};\n"
+        ).splitlines()
+        assert kv_rollback[:2] == [
+            expected_row_json,
+            '{"id":1,"value":"own-write"}',
+        ], kv_rollback
+        assert json.loads(kv_rollback[2]) == [
+            '{"id":1,"value":"own-write"}',
+            '{"id":-1,"value":"minus-one"}',
+        ], kv_rollback
+        assert_counter_delta(
+            before, stats(), sql_cache_hits=1, sql_cache_bypasses=3
+        )
+        assert app_sql(
+            f"SELECT local_cache.get('{relation}'::regclass, 1::bigint)"
+        ) == expected_row_json
+
         # A committed writer publishes the invalidation before its new tuple
-        # can become visible.  The next SELECT therefore refills, then hits.
+        # can become visible.  The next scalar GET therefore refills, then
+        # both GET and MGET can hit the committed whole-row value.
         assert (
             app_sql(
                 f"UPDATE {relation} SET value = 'committed' WHERE id = 1 "
@@ -382,12 +532,23 @@ def main() -> None:
             == "committed"
         )
         before = stats()
-        assert app_sql(f"SELECT value FROM {relation} WHERE id = 1") == "committed"
-        assert app_sql(f"SELECT value FROM {relation} WHERE id = 1") == "committed"
+        expected_committed_json = '{"id":1,"value":"committed"}'
+        assert app_sql(
+            f"SELECT local_cache.get('{relation}'::regclass, 1::bigint)"
+        ) == expected_committed_json
+        assert app_sql(
+            f"SELECT local_cache.get('{relation}'::regclass, 1::bigint)"
+        ) == expected_committed_json
+        assert json.loads(
+            app_sql(
+                "SELECT array_to_json(local_cache.mget("
+                f"'{relation}'::regclass, ARRAY[1]::bigint[]))::text"
+            )
+        ) == [expected_committed_json]
         assert_counter_delta(
             before,
             stats(),
-            sql_cache_hits=1,
+            sql_cache_hits=2,
             sql_cache_misses=1,
             sql_cache_fills=1,
         )
@@ -400,15 +561,28 @@ def main() -> None:
             "SET plan_cache_mode = force_generic_plan;\n"
             f"PREPARE pglc_rr_{suffix}(bigint) AS "
             f"SELECT value FROM {relation} WHERE id = $1;\n"
+            f"PREPARE pglc_get_rr_{suffix}(regclass, bigint) AS "
+            "SELECT local_cache.get($1, $2);\n"
+            f"PREPARE pglc_mget_rr_{suffix}(regclass, bigint[]) AS "
+            "SELECT array_to_json(local_cache.mget($1, $2))::text;\n"
             f"EXECUTE pglc_rr_{suffix}(1);\n"
             "BEGIN ISOLATION LEVEL REPEATABLE READ;\n"
             f"EXECUTE pglc_rr_{suffix}(1);\n"
+            f"EXECUTE pglc_get_rr_{suffix}('{relation}', 1);\n"
+            f"EXECUTE pglc_mget_rr_{suffix}('{relation}', ARRAY[1]::bigint[]);\n"
             "COMMIT;\n"
             f"DEALLOCATE pglc_rr_{suffix};\n"
+            f"DEALLOCATE pglc_get_rr_{suffix};\n"
+            f"DEALLOCATE pglc_mget_rr_{suffix};\n"
         ).splitlines()
-        assert repeatable_values == ["committed", "committed"], repeatable_values
+        assert repeatable_values[:3] == [
+            "committed",
+            "committed",
+            expected_committed_json,
+        ], repeatable_values
+        assert json.loads(repeatable_values[3]) == [expected_committed_json]
         assert_counter_delta(
-            before, stats(), sql_cache_hits=1, sql_cache_bypasses=1
+            before, stats(), sql_cache_hits=1, sql_cache_bypasses=3
         )
 
         if RESP_PORT != 0:
@@ -429,6 +603,73 @@ def main() -> None:
             == ""
         )
         assert_counter_delta(before, stats(), sql_cache_misses=1)
+
+        # A statement can take its READ COMMITTED snapshot, block, and then
+        # execute GET after another transaction commits.  Return the old
+        # snapshot result, but never publish it as a current negative entry.
+        admin_sql(f"SELECT local_cache.invalidate('{namespace}')")
+        marker = f"pglc_stale_fill_{suffix}"
+        writer = subprocess.Popen(
+            psql_base_args(application=False),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        assert writer.stdin is not None
+        writer.stdin.write(
+            "BEGIN;\n"
+            f"UPDATE {barrier} SET value = value + 1 WHERE id = 1;\n"
+            f"SELECT pg_sleep(1) /* {marker} */;\n"
+            f"INSERT INTO {relation} VALUES ({missing_id}, 'concurrent');\n"
+            "COMMIT;\n"
+        )
+        writer.stdin.close()
+        deadline = time.monotonic() + 5
+        while admin_sql(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity "
+            f"WHERE query LIKE '%{marker}%' AND wait_event = 'PgSleep')"
+        ) != "t":
+            assert time.monotonic() < deadline, "writer did not reach stale-fill gate"
+            time.sleep(0.02)
+
+        before = stats()
+        reader = subprocess.Popen(
+            psql_base_args(application=True)
+            + [
+                "-c",
+                "WITH gate AS MATERIALIZED ("
+                f"SELECT id FROM {barrier} WHERE id = 1 FOR UPDATE) "
+                "SELECT local_cache.get("
+                f"'{relation}'::regclass, {missing_id}::bigint) FROM gate",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env={**os.environ, "PGPASSWORD": APP_PASSWORD},
+        )
+        writer_output = writer.stdout.read() if writer.stdout is not None else ""
+        assert writer.wait(timeout=10) == 0, writer_output
+        reader_output, _ = reader.communicate(timeout=10)
+        assert reader.returncode == 0, reader_output
+        assert reader_output.strip() == "", reader_output
+
+        concurrent_json = (
+            f'{{"id":{missing_id},"value":"concurrent"}}'
+        )
+        assert app_sql(
+            f"SELECT local_cache.get('{relation}'::regclass, {missing_id}::bigint)"
+        ) == concurrent_json
+        assert app_sql(
+            f"SELECT local_cache.get('{relation}'::regclass, {missing_id}::bigint)"
+        ) == concurrent_json
+        assert_counter_delta(
+            before,
+            stats(),
+            sql_cache_hits=1,
+            sql_cache_misses=2,
+            sql_cache_fills=1,
+        )
 
         # Additional predicates retain stock PostgreSQL semantics and do not
         # affect SQL-cache counters.
@@ -455,13 +696,60 @@ def main() -> None:
             f"SELECT value FROM {relation} WHERE id = 1",
             "permission denied",
         )
+        app_sql_fails(
+            f"SELECT local_cache.get('{relation}'::regclass, 1::bigint)",
+            "permission denied",
+        )
+        app_sql_fails(
+            "SELECT local_cache.mget("
+            f"'{relation}'::regclass, ARRAY[1]::bigint[])",
+            "permission denied",
+        )
         assert_counter_delta(before, stats())
+
+        # A cached relation-validation token must be cleared when a parent
+        # gains an inherited child.  The next ordinary SELECT in the same
+        # backend must see both rows; after DROP, the fast path may recover.
+        admin_sql(
+            f"CREATE SCHEMA {inheritance_schema} AUTHORIZATION {quoted_app_role};"
+            f"CREATE TABLE {inheritance_parent} ("
+            "id bigint PRIMARY KEY, value text NOT NULL);"
+            f"ALTER TABLE {inheritance_parent} OWNER TO {quoted_app_role};"
+            f"INSERT INTO {inheritance_parent} VALUES (1, 'parent');"
+            "SELECT local_cache.attach_table("
+            f"'{inheritance_parent}'::regclass, false, "
+            f"'{inheritance_namespace}')"
+        )
+        before = stats()
+        inheritance_values = app_script(
+            f"SELECT value FROM {inheritance_parent} WHERE id = 1;\n"
+            f"CREATE TABLE {inheritance_child} () "
+            f"INHERITS ({inheritance_parent});\n"
+            f"INSERT INTO {inheritance_child} VALUES (1, 'child');\n"
+            f"SELECT value FROM {inheritance_parent} WHERE id = 1;\n"
+            f"DROP TABLE {inheritance_child};\n"
+            f"SELECT value FROM {inheritance_parent} WHERE id = 1;\n"
+        ).splitlines()
+        assert inheritance_values[0] == "parent", inheritance_values
+        assert sorted(inheritance_values[1:3]) == ["child", "parent"], (
+            inheritance_values
+        )
+        assert inheritance_values[3] == "parent", inheritance_values
+        assert_counter_delta(
+            before,
+            stats(),
+            sql_cache_hits=0,
+            sql_cache_misses=2,
+            sql_cache_fills=2,
+        )
 
         print(
             "ok: transparent SQL cold fill/hit, Param and LIMIT 1, EXPLAIN, "
             "GUC fallback, transactional read-your-writes/rollback, "
-            "commit invalidation, old-snapshot bypass, negative fallback, "
-            "unsupported-shape fallback, and NOSUPERUSER ACL enforcement"
+            "JSON GET/MGET, commit and inheritance invalidation, "
+            "old-snapshot bypass, "
+            "negative fallback, unsupported-shape fallback, and NOSUPERUSER "
+            "ACL enforcement"
         )
     finally:
         if client is not None:
@@ -480,6 +768,8 @@ def main() -> None:
                 "END\n"
                 "$cleanup$;\n"
                 f"DROP TABLE IF EXISTS {relation};\n"
+                f"DROP TABLE IF EXISTS {barrier};\n"
+                f"DROP SCHEMA IF EXISTS {inheritance_schema} CASCADE;\n"
             ),
             text=True,
             stdout=subprocess.DEVNULL,

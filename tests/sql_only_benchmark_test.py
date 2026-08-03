@@ -244,7 +244,7 @@ def valid_report() -> dict[str, object]:
         "ordinary_application_role": {
             "name": cfg.app_user,
             "superuser": False,
-            "local_cache_schema_usage": False,
+            "local_cache_schema_usage": True,
         },
         "stock_application_role": {
             "name": cfg.app_user,
@@ -253,7 +253,7 @@ def valid_report() -> dict[str, object]:
         },
         "ordinary_select_proof": {
             "query": cfg.lookup_query,
-            "cached_plan": "Custom Scan (pg_local_cache_sql)\n  Cache Namespace: x",
+            "cached_plan": "Result",
             "direct_plan": "Index Scan using rows_pkey on rows",
             "stock_plan": "Index Scan using rows_pkey on rows",
             "stock_mapped_and_cached_rows_equal": True,
@@ -439,8 +439,9 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(parsed.prepared_min_ops, 10_000.0)
         self.assertEqual(parsed.extended_min_ops, 10_000.0)
         self.assertIsNone(parsed.latency_max_p99_ms)
-        self.assertIsNone(parsed.min_cached_to_direct_ratio)
-        self.assertIsNone(parsed.min_cached_to_stock_ratio)
+        self.assertEqual(parsed.min_cached_to_direct_ratio, 1.5)
+        self.assertEqual(parsed.min_cached_to_stock_ratio, 1.5)
+        self.assertEqual((parsed.keys, parsed.payload_bytes), (4096, 3000))
         self.assertFalse(hasattr(parsed, "auth_token"))
 
     def test_protocol_gates_are_configured_independently(self) -> None:
@@ -483,7 +484,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(secondary.run_id, parsed.run_id)
 
     def test_scaling_snapshot_does_not_replace_another_primary_profile(self) -> None:
-        with self.assertRaisesRegex(ValueError, "strict primary profile c16/p32"):
+        with self.assertRaisesRegex(ValueError, "strict primary profile c16/k32"):
             config(
                 scaling_snapshot_enabled=True,
                 concurrency=4,
@@ -524,13 +525,13 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "boolean"):
                 sql_only.Config.from_environment()
 
-    def test_generated_names_and_query_use_whole_composite_primary_key(self) -> None:
+    def test_generated_names_and_query_use_scalar_sql_get(self) -> None:
         cfg = config()
         self.assertEqual(cfg.schema, "pglc_sql_bench_abc12345")
         self.assertEqual(cfg.namespace, "sqlbench_abc12345")
-        self.assertIn("SELECT *", cfg.lookup_query)
-        self.assertIn("tenant_id = :tenant", cfg.lookup_query)
-        self.assertIn("id = :key", cfg.lookup_query)
+        self.assertIn("local_cache.get", cfg.lookup_query)
+        self.assertIn("(:key)::bigint", cfg.lookup_query)
+        self.assertIn("row_to_json", cfg.direct_lookup_query)
 
     def test_connection_arguments_use_hostname_env_and_real_app_role(self) -> None:
         cfg = config()
@@ -569,19 +570,17 @@ class ParserAndWorkloadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "could not parse"):
             sql_only.parse_pgbench_output("tps = 1", 1)
 
-    def test_lookup_script_pipelines_identical_full_pk_selects(self) -> None:
+    def test_lookup_script_batches_keys_through_sql_mget(self) -> None:
         cfg = config(pipeline=3, keys=100)
         script = sql_only.lookup_script(cfg)
-        self.assertEqual(script.count("SELECT *"), 3)
-        self.assertEqual(script.count("tenant_id = :tenant"), 3)
-        self.assertIn("\\set tenant 7", script)
-        self.assertIn("id = :key_0", script)
-        self.assertIn("id = :key_2", script)
-        self.assertEqual(script.count("\\startpipeline"), 1)
-        self.assertEqual(script.count("\\endpipeline"), 1)
+        self.assertEqual(script.count("local_cache.mget"), 1)
+        self.assertIn(":key_0", script)
+        self.assertIn(":key_2", script)
+        self.assertNotIn("\\startpipeline", script)
+        self.assertNotIn("\\endpipeline", script)
 
         latency_script = sql_only.latency_lookup_script(cfg)
-        self.assertEqual(latency_script.count("SELECT *"), 1)
+        self.assertEqual(latency_script.count("local_cache.get"), 1)
         self.assertNotIn("\\startpipeline", latency_script)
 
     def test_scaling_snapshot_reuses_primary_evidence_and_measures_only_c4(self) -> None:
@@ -594,14 +593,15 @@ class ParserAndWorkloadTests(unittest.TestCase):
 
         def measured(
             profile: object,
-            throughput_path: Path,
-            latency_path: Path,
+            throughput_paths: dict[str, Path],
+            latency_paths: dict[str, Path],
             protocol: str,
             minimum_ops: object,
         ) -> dict[str, object]:
             self.assertEqual((profile.concurrency, profile.pipeline), (4, 8))
-            self.assertEqual(throughput_path.read_text().count("SELECT *"), 8)
-            self.assertEqual(latency_path.read_text().count("SELECT *"), 1)
+            self.assertIn("local_cache.mget", throughput_paths["cached"].read_text())
+            self.assertIn("array_agg", throughput_paths["stock"].read_text())
+            self.assertIn("local_cache.get", latency_paths["cached"].read_text())
             self.assertIsNone(minimum_ops)
             return {"query_protocol": protocol}
 
@@ -659,7 +659,9 @@ class ParserAndWorkloadTests(unittest.TestCase):
             side_effect=[[float(index), float(index) + 0.5] for index in range(1, 10)],
         ):
             result = sql_only.measure_latency_protocol(
-                cfg, Path(script.name), "prepared"
+                cfg,
+                {mode: Path(script.name) for mode in sql_only.BENCHMARK_MODES},
+                "prepared",
             )
 
         self.assertEqual(
@@ -869,16 +871,16 @@ class DatabaseContractTests(unittest.TestCase):
         mapping = {
             "whole_row": True,
             "namespace": cfg.namespace,
-            "primary_key_columns": ["tenant_id", "id"],
+            "primary_key_columns": ["id"],
         }
         with mock.patch.object(
             sql_only, "psql", return_value=json.dumps(mapping)
         ) as psql:
             returned = sql_only.setup_objects(cfg)
         query = psql.call_args.args[1]
-        self.assertIn("PRIMARY KEY (tenant_id, id)", query)
+        self.assertIn("PRIMARY KEY (id)", query)
         self.assertIn("generate_series(1, 9)", query)
-        self.assertIn("repeat('x', 77)", query)
+        self.assertIn("string_agg(pg_catalog.md5", query)
         self.assertIn('GRANT CONNECT ON DATABASE "app"', query)
         self.assertIn("local_cache.attach_table", query)
         self.assertNotIn("attach_value", query)
@@ -888,7 +890,7 @@ class DatabaseContractTests(unittest.TestCase):
         with mock.patch.object(sql_only, "psql", return_value="") as psql:
             sql_only.setup_stock_objects(cfg)
         stock_query = psql.call_args.args[1]
-        self.assertIn("PRIMARY KEY (tenant_id, id)", stock_query)
+        self.assertIn("PRIMARY KEY (id)", stock_query)
         self.assertNotIn("local_cache", stock_query)
         self.assertEqual(psql.call_args.kwargs["target"], "stock")
 
@@ -908,12 +910,12 @@ class DatabaseContractTests(unittest.TestCase):
 
     def test_application_role_must_be_actual_isolated_login(self) -> None:
         cfg = config()
-        identity = f"{cfg.app_user}|f|t|f|f|f|f|f|f"
+        identity = f"{cfg.app_user}|f|t|f|f|f|f|f|t"
         with mock.patch.object(sql_only, "psql", return_value=identity) as psql:
             role = sql_only.validate_application_role(cfg)
         self.assertTrue(psql.call_args.kwargs["application"])
         self.assertFalse(role["superuser"])
-        self.assertFalse(role["local_cache_schema_usage"])
+        self.assertTrue(role["local_cache_schema_usage"])
 
         with mock.patch.object(
             sql_only,
@@ -927,17 +929,17 @@ class DatabaseContractTests(unittest.TestCase):
         cfg = config()
         replies = [
             "Index Scan using rows_pkey on rows",
-            "7|1|payload",
-            "Custom Scan (pg_local_cache_sql)\n  Cache Namespace: test",
-            "7|1|payload",
+            '{"tenant_id":7,"id":1}',
+            "Result",
+            '{"tenant_id":7,"id":1}',
             "Index Scan using rows_pkey on rows",
-            "7|1|payload",
+            '{"tenant_id":7,"id":1}',
         ]
         with mock.patch.object(sql_only, "psql", side_effect=replies):
             proof = sql_only.explain_and_sample(cfg)
         self.assertTrue(proof["direct_and_cached_rows_equal"])
         self.assertTrue(proof["stock_mapped_and_cached_rows_equal"])
-        self.assertIn("SELECT *", proof["query"])
+        self.assertIn("local_cache.get", proof["query"])
 
     def test_cold_probe_requires_exact_one_miss_fill_then_hit(self) -> None:
         cfg = config()
@@ -957,7 +959,7 @@ class DatabaseContractTests(unittest.TestCase):
         self.assertEqual(proof["sql_cache_hits_during_measurement"], 1)
         script = psql.call_args.args[1]
         self.assertIn("PREPARE pglc_cold", script)
-        self.assertEqual(script.count("EXECUTE pglc_cold(7, 1)"), 2)
+        self.assertEqual(script.count("EXECUTE pglc_cold(1)"), 2)
 
     def test_cold_probe_rejects_counter_contamination(self) -> None:
         cfg = config()
@@ -982,15 +984,17 @@ class DatabaseContractTests(unittest.TestCase):
         ), mock.patch.object(sql_only, "psql", return_value="") as psql:
             proof = sql_only.warm_all_keys(cfg)
         script = psql.call_args.args[1]
-        self.assertIn("EXECUTE pglc_warm(7, 1)", script)
-        self.assertIn("EXECUTE pglc_warm(7, 2)", script)
-        self.assertIn("EXECUTE pglc_warm(7, 3)", script)
+        self.assertIn("EXECUTE pglc_warm(1)", script)
+        self.assertIn("EXECUTE pglc_warm(2)", script)
+        self.assertIn("EXECUTE pglc_warm(3)", script)
         self.assertEqual(proof["keys_filled"], 3)
         self.assertTrue(psql.call_args.kwargs["discard_rows"])
 
     def test_sentinel_integrity_checks_bounds_rows_and_exact_hits(self) -> None:
         cfg = config(keys=8)
-        rows = "7|1|first\n7|4|middle\n7|8|last"
+        rows = "\n".join(
+            json.dumps({"tenant_id": 7, "id": key}) for key in (1, 4, 8)
+        )
         replies = ["8|1|8|8|t", "8|1|8|8|t", rows, rows, rows]
         snapshots = [
             counters(hits=10),
@@ -1018,7 +1022,7 @@ class DatabaseContractTests(unittest.TestCase):
         cached_script = psql.call_args_list[3].args[1]
         self.assertIn("pg_local_cache.sql_cache = off", direct_script)
         self.assertIn("pg_local_cache.sql_cache = on", cached_script)
-        self.assertIn("EXECUTE pglc_integrity(7, 4)", cached_script)
+        self.assertIn("EXECUTE pglc_integrity(4)", cached_script)
 
     def test_sentinel_integrity_rejects_wrong_rows(self) -> None:
         cfg = config(keys=8)
@@ -1057,7 +1061,7 @@ class ValidationAndReportTests(unittest.TestCase):
         cached_run["sql_cache_hits_during_measurement"] -= 1
         failures = sql_only.validate_report(report)
         self.assertTrue(
-            any("c4/p8" in item and "non-exact hit" in item for item in failures)
+            any("c4/k8" in item and "non-exact hit" in item for item in failures)
         )
 
     def test_scaling_snapshot_rejects_wrong_pipeline_and_primary_copy(self) -> None:
@@ -1074,8 +1078,8 @@ class ValidationAndReportTests(unittest.TestCase):
             copy.deepcopy(report["protocols"])
         )
         failures = sql_only.validate_report(report)
-        self.assertTrue(any("throughput pipeline 8" in item for item in failures))
-        self.assertTrue(any("throughput pipeline 32" in item for item in failures))
+        self.assertTrue(any("8 keys per MGET" in item for item in failures))
+        self.assertTrue(any("32 keys per MGET" in item for item in failures))
         self.assertTrue(any("must not be duplicated" in item for item in failures))
 
     def test_cached_hit_accounting_must_equal_successful_selects(self) -> None:
@@ -1216,13 +1220,13 @@ class ValidationAndReportTests(unittest.TestCase):
         self.assertIn("# pg_local_cache SQL-only benchmark", markdown)
         self.assertIn("## Throughput and end-to-end latency", markdown)
         self.assertIn(
-            "| prepared | Stock PostgreSQL (no extension) | c2/p2 | "
-            "10 000 ops/s | c2/p1 |",
+            "| prepared | Stock PostgreSQL (no extension) | c2/k2 | "
+            "10 000 ops/s | c2/k1 |",
             markdown,
         )
         self.assertIn(
-            "| prepared | pg_local_cache, cache on | c2/p2 | "
-            "20 000 ops/s | c2/p1 |",
+            "| prepared | pg_local_cache, cache on | c2/k2 | "
+            "20 000 ops/s | c2/k1 |",
             markdown,
         )
         self.assertIn("p50", markdown)
@@ -1243,19 +1247,19 @@ class ValidationAndReportTests(unittest.TestCase):
         ]["prepared"]["cached_mode"]
         secondary["summary"]["median_operations_per_second"] = 34_567.0
         markdown = sql_only.render_markdown(report)
-        self.assertIn("## c4/p8 and c16/p32 scaling snapshot", markdown)
+        self.assertIn("## c4/k8 and c16/k32 scaling snapshot", markdown)
         self.assertIn("Throughput profile", markdown)
         self.assertIn("Latency profile", markdown)
         self.assertIn(
-            "| prepared | pg_local_cache, cache on | c4/p8 | "
-            "34 567 ops/s | c4/p1 |",
+            "| prepared | pg_local_cache, cache on | c4/k8 | "
+            "34 567 ops/s | c4/k1 |",
             markdown,
         )
         self.assertIn(
-            "| prepared | pg_local_cache, cache on | c16/p32 |",
+            "| prepared | pg_local_cache, cache on | c16/k32 |",
             markdown,
         )
-        self.assertIn("c4/p1 and c16/p1", markdown)
+        self.assertIn("c4/k1 and c16/k1", markdown)
 
     def test_report_writer_publishes_json_and_markdown_atomically(self) -> None:
         report = valid_report()

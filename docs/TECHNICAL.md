@@ -123,6 +123,49 @@ backpressure handling, and slow-client disconnects. In SQL-only mode
 `pg_local_cache.port=0` starts no RESP workers and allocates no RESP client
 slots.
 
+## SQL APIs
+
+The canonical application path is ordinary PostgreSQL SQL over the existing
+database connection:
+
+```sql
+SELECT * FROM public.items WHERE id = $1::bigint;
+SELECT value FROM public.items WHERE id = $1::bigint;
+```
+
+This returns the table's normal tuple type with PostgreSQL's normal projection,
+ACL, prepared-statement, and zero-or-one-row behavior. No result-type witness,
+column definition list, custom driver, or rewritten result decoder is involved.
+The planner and executor fast path below is an implementation detail.
+
+KV-style callers can opt into the JSON functions:
+
+```sql
+SELECT local_cache.get('public.items'::regclass, $1::bigint);
+SELECT local_cache.mget('public.items'::regclass, $1::bigint[]);
+```
+
+`get(regclass, anyelement)` returns complete-row JSON text and
+`mget(regclass, anyarray)` returns `text[]`. Duplicate keys and `NULL` elements
+are preserved. Bind or cast the scalar/array element to the actual single-column
+primary-key type.
+
+`get(regclass, text[])` is the fallback for composite and heterogeneous primary
+keys. Its components are in the order recorded by `attach_table()`. The function
+converts each component with the primary-key type's normal PostgreSQL input
+function.
+
+All three functions are `SECURITY INVOKER`, enforce `SELECT` on the source
+relation, and fail closed to a source lookup whenever the shared entry cannot be
+used safely. After the current transaction writes an attached table, both the
+ordinary SQL and function paths bypass the cache and use the transaction's own
+snapshot. The normal pre-commit invalidation fence makes the new row refillable
+only after commit; rollback does not publish it.
+
+The caller needs `USAGE` on schema `local_cache`, `EXECUTE` on the selected
+function overloads, and its normal source-table `SELECT` privilege. No RESP
+listener, authentication token, or cache-specific client connection is involved.
+
 ## Planner and executor fast path
 
 `pg_local_cache.sql_cache` is a `USERSET` GUC and defaults to `on`. The planner

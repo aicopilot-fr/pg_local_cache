@@ -7,8 +7,10 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from tests import sql_only_benchmark_test as sql_only_contract
 
@@ -128,16 +130,16 @@ def sql_only_report() -> dict[str, object]:
             },
         },
     }
-    report["workload"]["min_cached_to_direct_ratio"] = 0.80
-    report["workload"]["min_cached_to_stock_ratio"] = 0.80
+    report["workload"]["min_cached_to_direct_ratio"] = 1.5
+    report["workload"]["min_cached_to_stock_ratio"] = 1.5
     for protocol in ("prepared", "extended"):
         lane = report["protocols"][protocol]
         lane["relative_throughput_gate"] = (
             sql_only_contract.sql_only.relative_throughput_gate(
                 cached_to_direct=lane["cached_to_direct_throughput_ratio"],
                 cached_to_stock=lane["cached_to_stock_throughput_ratio"],
-                minimum_cached_to_direct=0.80,
-                minimum_cached_to_stock=0.80,
+                minimum_cached_to_direct=1.5,
+                minimum_cached_to_stock=1.5,
             )
         )
     return report
@@ -203,7 +205,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
     def test_rejects_relative_gate_below_release_minimum(self) -> None:
         report = sql_only_report()
         gate = report["protocols"]["prepared"]["relative_throughput_gate"]
-        gate["cached_to_stock"]["minimum_ratio"] = 0.79
+        gate["cached_to_stock"]["minimum_ratio"] = 0.98
         self.write_report(self.sql_path, report)
 
         with self.assertRaisesRegex(ValueError, "cached_to_stock"):
@@ -219,7 +221,15 @@ class ReleaseEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "raw latency samples"):
             VALIDATOR.validate_sql_only(self.sql_path, REVISION)
 
-    def test_rejects_release_without_scaling_snapshot(self) -> None:
+    def test_accepts_architecture_when_runtime_hides_cpu_model(self) -> None:
+        report = sql_only_report()
+        report["environment"]["benchmark_client"]["cpu_model"] = "unknown"
+        report["environment"]["machine"] = "aarch64"
+        self.write_report(self.sql_path, report)
+
+        VALIDATOR.validate_sql_only(self.sql_path, REVISION)
+
+    def test_accepts_release_without_non_gating_scaling_snapshot(self) -> None:
         report = sql_only_report()
         report["workload"]["scaling_snapshot_enabled"] = False
         report["scaling_snapshot"] = {
@@ -228,8 +238,29 @@ class ReleaseEvidenceTests(unittest.TestCase):
         }
         self.write_report(self.sql_path, report)
 
-        with self.assertRaisesRegex(ValueError, "scaling snapshot is not enabled"):
-            VALIDATOR.validate_sql_only(self.sql_path, REVISION)
+        VALIDATOR.validate_sql_only(self.sql_path, REVISION)
+
+    def test_cli_accepts_sql_only_release_evidence(self) -> None:
+        report = sql_only_report()
+        report["workload"]["scaling_snapshot_enabled"] = False
+        report["scaling_snapshot"] = {
+            "status": "DISABLED",
+            "performance_gating": False,
+        }
+        self.write_report(self.sql_path, report)
+
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                str(VALIDATOR_PATH),
+                "--revision",
+                REVISION,
+                "--sql-only",
+                str(self.sql_path),
+            ],
+        ):
+            self.assertEqual(VALIDATOR.main(), 0)
 
     def test_rejects_forged_pass_with_failed_generator_proof(self) -> None:
         report = sql_only_report()

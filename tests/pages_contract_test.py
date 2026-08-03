@@ -71,25 +71,37 @@ class PagesSourceContracts(unittest.TestCase):
         self.assertEqual(parser.image_sources, [])
         self.assertNotIn("lorem ipsum", source.lower())
         self.assertNotIn("10x", source.lower())
-        self.assertIn("CI run 30729192604", source)
-        self.assertIn("34,662", source)
-        self.assertIn("c16/p32 throughput", source)
+        self.assertIn("local_cache.mget", source)
+        self.assertIn("SELECT * FROM public.items WHERE id = $1::bigint", source)
+        self.assertIn("≥1.50x", source)
+        self.assertIn("c16/k32 throughput", source)
 
-    def test_benchmark_pages_publish_pinned_comparative_results(self) -> None:
+    def test_benchmark_pages_publish_the_sql_kv_release_contract(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         benchmarks = (ROOT / "docs" / "BENCHMARKS.md").read_text(
             encoding="utf-8"
         )
         for source in (readme, benchmarks):
-            self.assertIn("30729192604", source)
-            self.assertIn("9cf12e34bee512e4d453e117c39ca8eb140afd4d", source)
-            self.assertIn("Stock PostgreSQL 16", source)
-            self.assertIn("Mapped, cache off", source)
-            self.assertIn("Cache on", source)
-            self.assertIn("165,495", source)
-            self.assertIn("Valkey 9.1.1", source)
-            self.assertIn("Redis 8.8.1", source)
-            self.assertNotIn("No values are published", source)
+            self.assertIn("local_cache.mget", source)
+            self.assertIn("1.50", source)
+            self.assertIn("3,000-byte", source)
+            self.assertIn("stock PostgreSQL", source)
+        self.assertIn("Historical transparent-SQL results", benchmarks)
+        self.assertNotIn("30729192604", readme)
+
+    def test_docs_prefer_ordinary_sql_for_native_tuples(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        technical = (ROOT / "docs" / "TECHNICAL.md").read_text(
+            encoding="utf-8"
+        )
+        install = (ROOT / "docs" / "INSTALL_EXISTING.md").read_text(
+            encoding="utf-8"
+        )
+        for source in (readme, technical, install):
+            self.assertIn("SELECT * FROM public.items WHERE id =", source)
+            self.assertIn("SELECT value", source)
+            self.assertNotIn("NULL::public.items", source)
+        self.assertIn("No result-type witness", technical)
 
     def test_every_published_document_has_metadata(self) -> None:
         documents = {

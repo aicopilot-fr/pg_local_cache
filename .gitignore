@@ -12,3 +12,8 @@ results/
 tmp_check/
 tmp_check_iso/
 secrets/
+docs/superpowers
+.supergoal
+.codegraph
+benchmark-results/
+*.dSYM/

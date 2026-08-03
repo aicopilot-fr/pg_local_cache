@@ -167,9 +167,13 @@ test_argument_boundaries(void)
 	request = malloc(request_length + 1);
 	CHECK(request != NULL);
 	cursor = request;
-	cursor += sprintf(cursor, "*16\r\n");
+	memcpy(cursor, "*16\r\n", strlen("*16\r\n"));
+	cursor += strlen("*16\r\n");
 	for (i = 0; i < PGLC_RESP_MAX_ARGS; i++)
-		cursor += sprintf(cursor, "$1\r\nx\r\n");
+	{
+		memcpy(cursor, "$1\r\nx\r\n", strlen("$1\r\nx\r\n"));
+		cursor += strlen("$1\r\nx\r\n");
+	}
 	CHECK((Size) (cursor - request) == request_length);
 
 	CHECK(parse(request, request_length, args, &argc, &consumed,
@@ -322,15 +326,24 @@ test_deterministic_fuzz_inputs(void)
 		char	   *cursor = frame;
 		int			nargs = 1 + (int) (next_random(&state) % 4);
 		int			arg;
+		int			written;
 		Size		frame_length;
+		Size		remaining;
 
-		cursor += sprintf(cursor, "*%d\r\n", nargs);
+		remaining = (Size) (frame + sizeof(frame) - cursor);
+		written = snprintf(cursor, remaining, "*%d\r\n", nargs);
+		CHECK(written > 0 && (Size) written < remaining);
+		cursor += written;
 		for (arg = 0; arg < nargs; arg++)
 		{
 			Size	payload_length = next_random(&state) % 48;
 			Size	i;
 
-			cursor += sprintf(cursor, "$%zu\r\n", payload_length);
+			remaining = (Size) (frame + sizeof(frame) - cursor);
+			written = snprintf(cursor, remaining, "$%zu\r\n",
+							   payload_length);
+			CHECK(written > 0 && (Size) written < remaining);
+			cursor += written;
 			for (i = 0; i < payload_length; i++)
 				*cursor++ = (char) next_random(&state);
 			*cursor++ = '\r';

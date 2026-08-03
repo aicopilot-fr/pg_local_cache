@@ -8,14 +8,16 @@ permalink: /docs/BENCHMARKS.html
 
 # pg_local_cache benchmarks
 
-The benchmark suite separates ordinary SQL, whole-row RESP reads, and
-payload-width sweeps. Write, rollback, DDL, and invalidation semantics are
-verified by integration tests because they have different durability and
-transaction contracts and do not belong in a cache-read ranking.
+The release gate is SQL-only: `local_cache.mget()` is compared with a
+byte-identical stock PostgreSQL primary-key batch lookup. Transparent SQL and
+RESP measurements are separate compatibility profiles. Write, rollback, DDL,
+and invalidation semantics are verified by integration tests because they have
+different durability and transaction contracts and do not belong in a
+cache-read ranking.
 
-## Results
+## Historical transparent-SQL results
 
-The latest pinned result is [CI run 30729192604](https://github.com/aicopilot-fr/pg_local_cache/actions/runs/30729192604)
+The previous transparent-`SELECT` result is [CI run 30729192604](https://github.com/aicopilot-fr/pg_local_cache/actions/runs/30729192604)
 for [source `9cf12e3`](https://github.com/aicopilot-fr/pg_local_cache/commit/9cf12e34bee512e4d453e117c39ca8eb140afd4d).
 It used three repetitions, 4,096 keys, 128-byte payloads, c16/p32 throughput,
 and a separate c16/p1 latency pass.
@@ -30,9 +32,10 @@ and a separate c16/p1 latency pass.
 | Extended | Cache on | 14,941 | 2.214 ms | 2.016 ms | 4.585 ms | 6.366 ms |
 
 Prepared cache-on was 0.94x stock and 0.93x mapped cache-off. Extended
-cache-on was 0.90x stock and 0.89x mapped cache-off. These short GitHub-hosted
-measurements detect regressions; shared-runner scheduling makes them unsuitable
-for capacity claims.
+cache-on was 0.90x stock and 0.89x mapped cache-off. These results do not
+satisfy the current SQL KV release gate and remain only as compatibility
+history; shared-runner scheduling also makes them unsuitable for capacity
+claims.
 
 The same artifact contains a non-gating c4/p8 throughput snapshot with a
 separate c4/p1 latency pass:
@@ -80,13 +83,14 @@ best repetition.
 
 | Suite | Baseline | Extension control | Cached path | Primary measurements |
 |---|---|---|---|---|
-| SQL-only ordinary `SELECT` | Stock PostgreSQL without `pg_local_cache` | Same mapped server with `pg_local_cache.sql_cache=off` | Same mapped server with `sql_cache=on` | Median ops/s; per-operation mean, p50, p95, p99; cache counters |
+| SQL-only KV batch | Stock PostgreSQL without `pg_local_cache`, using a PK batch query | Same mapped server using the stock batch query | `local_cache.mget()` on the mapped server | Median SQL operations/s; per-operation mean, p50, p95, p99; exact cache counters |
+| Transparent exact-PK `SELECT` | Stock PostgreSQL without `pg_local_cache` | Same mapped server with `pg_local_cache.sql_cache=off` | Same mapped server with `sql_cache=on` | Compatibility regression only |
 | Whole-row RESP `GET` | Valkey and Redis with persistence disabled | Not applicable | `pg_local_cache` KVik-inspired whole-row key | Median ops/s; client-observed p50, p95, p99; reply validation; database-read deltas |
 | RESP payload width | Same key and client settings at each row width | Not applicable | Complete cached row | Median ops/s; encoded row bytes; cache counters |
 
-The SQL-only table is the primary comparison for applications that keep using
-normal PostgreSQL drivers. The RESP table answers a different question: the
-cost of reading an identical JSON row through the optional cache endpoint.
+The SQL KV table is the release comparison for applications that keep using
+normal PostgreSQL drivers. The transparent and RESP tables answer different
+compatibility questions and do not decide the SQL KV performance gate.
 
 ## Dedicated SQL-only benchmark
 
@@ -98,12 +102,18 @@ two PostgreSQL 16 servers:
   listener, worker, or client buffers.
 
 The harness creates the same schema and rows on both servers and verifies that
-their relevant PostgreSQL settings match. A `LOGIN NOSUPERUSER` role executes
-the same complete-primary-key `SELECT *` in three modes:
+their relevant PostgreSQL settings match. Values are deterministic,
+incompressible 3,000-byte text so PostgreSQL cannot turn the stock comparison
+into a small compressed-row lookup. A `LOGIN NOSUPERUSER` role executes one
+batch of primary-key reads in three modes:
 
-1. stock PostgreSQL;
-2. the mapped server with SQL caching disabled;
-3. the mapped server with SQL caching enabled.
+1. stock PostgreSQL using `unnest(bigint[])`, a PK join, and ordered whole-row
+   JSON aggregation;
+2. the mapped server using the same stock query;
+3. the mapped server using `local_cache.mget(regclass, bigint[])`.
+
+All three return the same ordered JSON values for the same input keys. SQL text
+necessarily differs because stock PostgreSQL has no `mget()` function.
 
 Each mode is measured independently for both `pgbench -M prepared` and
 `pgbench -M extended`. Prepared mode reuses a server-side prepared statement.
@@ -120,7 +130,8 @@ Before timing, the harness verifies:
   settings;
 - source row counts and key ranges match;
 - stock, mapped-direct, and cached sentinel rows are byte-identical;
-- the mapped plan includes `Custom Scan (pg_local_cache_sql)` when enabled;
+- the application role can use the `local_cache` schema and the canonical SQL
+  KV function is not a transparent `Custom Scan`;
 - a cold SQL lookup produces one miss and fill, followed by a hit;
 - the SQL-only server reports zero configured/running RESP workers and zero
   RESP memory.
@@ -132,17 +143,18 @@ counter. Any mismatch fails the run rather than reporting a misleading rate.
 
 ### Throughput and latency
 
-Throughput runs use persistent connections and a configurable number of
-validated lookups per transaction batch. `operations_per_second` is batch TPS
-multiplied by that exact lookup count; failed batches remain visible in the raw
-report.
+Throughput runs use persistent connections and a configurable key-array width.
+`operations_per_second` is successful batch TPS multiplied by that exact number
+of key positions for every mode; the report also retains batch TPS, key width,
+and failed batches. This is KV key throughput, not SQL statement throughput.
 
-Latency runs are separate. They use one `SELECT` per transaction, persistent
-connections, and pgbench latency logs with deterministic sampling. The report
+Latency runs are separate. They use one scalar `get()` or byte-identical stock
+row lookup per transaction, persistent connections, and pgbench latency logs
+with deterministic sampling. The report
 contains mean, p50, p95, p99, maximum, and sample count for each protocol and
 each of the three modes. These are client-observed end-to-end operation
 latencies, including PostgreSQL protocol and transaction overhead after the
-connection is established. They are not inferred by dividing pipelined batch
+connection is established. They are not inferred by dividing batch
 latency. This is a closed-loop saturation measurement: each client submits its
 next transaction after the previous one completes. It does not hold the offered
 request rate constant across modes, so it should not be read as a fixed-rate
@@ -153,32 +165,36 @@ hardware. Set `PGLC_SQL_ONLY_BENCH_LATENCY_MAX_P99_MS` to enforce a deployment-
 specific ceiling. `PGLC_SQL_ONLY_BENCH_LATENCY_MIN_SAMPLES` prevents a sparse
 sample from passing.
 
-Relative throughput gates are also optional. Set
+Relative throughput gates are mandatory in CI and release evidence. Set
 `PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_DIRECT_RATIO` and
 `PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_STOCK_RATIO` to reject a cached result below
-the required fraction of the mapped-direct and stock medians. CI currently
-sets both to `0.80`; an unset gate is reported as `MEASURED` rather than passed.
+the required fraction of the mapped-direct and stock medians. CI sets both to
+`1.50`. The standalone harness still reports an intentionally unset gate as
+`MEASURED`, but the evidence validator rejects anything below `1.50`.
 
-### c4/p8 and c16/p32 snapshot
+### c4/k8 and c16/k32 snapshot
 
 CI also records a short scaling snapshot on the same runner and the same two
-PostgreSQL containers. The existing c16/p32 result remains the strict primary
-profile with three repetitions and all configured gates. The harness then runs
-one non-gating c4/p8 repetition for both prepared and unnamed-extended SQL.
+PostgreSQL containers. The c16/k32 result is the strict primary profile: 16
+connections and 32 key positions per batch, with three repetitions and all
+configured gates. The harness then runs one non-gating c4/k8 repetition for
+both prepared and unnamed-extended SQL.
 
-The profile pipeline applies only to the throughput pass. Latency is always
-measured with one `SELECT` per transaction, so the corresponding latency
-profiles are c4/p1 and c16/p1. The generated table reports stock PostgreSQL,
+The key-array width applies only to the throughput pass. Latency is always
+measured with one scalar key per transaction, so the corresponding latency
+profiles are c4/k1 and c16/k1. The generated table reports stock PostgreSQL,
 the mapped table with caching off, and caching on with median throughput plus
-latency mean, p50, p95, and p99.
+latency mean, p50, p95, and p99. The environment variable retains its historical
+name `PGLC_SQL_ONLY_BENCH_PIPELINE`; for this SQL KV workload it is the keys per
+MGET, not a count of SQL statements queued on the wire.
 
-The c4/p8 performance numbers do not decide the build result. Incorrect cache
-counters, failed batches, missing raw latency samples, or a wrong pipeline do
-fail the benchmark. The c16/p32 entry reuses the strict primary result.
+The c4/k8 performance numbers do not decide the build result. Incorrect cache
+counters, failed batches, missing raw latency samples, or a wrong key width do
+fail the benchmark. The c16/k32 entry reuses the strict primary result.
 
-This snapshot changes connection count and throughput pipeline together. It
-compares two operating profiles; it is not a causal concurrency curve. Use a
-long, repeated dedicated run before publishing capacity claims.
+This snapshot changes connection count and MGET width together. It compares two
+operating profiles; it is not a causal concurrency curve. Use a long, repeated
+dedicated run before publishing capacity claims.
 
 ### Run it
 
@@ -194,10 +210,12 @@ PGLC_SQL_ONLY_BENCH_LATENCY_MIN_SAMPLES=200 \
 PGLC_SQL_ONLY_BENCH_REPETITIONS=3 \
 PGLC_SQL_ONLY_BENCH_CONCURRENCY=16 \
 PGLC_SQL_ONLY_BENCH_PIPELINE=32 \
-PGLC_SQL_ONLY_BENCH_KEYS=16384 \
-PGLC_SQL_ONLY_BENCH_PAYLOAD_BYTES=128 \
+PGLC_SQL_ONLY_BENCH_KEYS=4096 \
+PGLC_SQL_ONLY_BENCH_PAYLOAD_BYTES=3000 \
 PGLC_SQL_ONLY_BENCH_PREPARED_MIN_OPS=10000 \
 PGLC_SQL_ONLY_BENCH_EXTENDED_MIN_OPS=10000 \
+PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_DIRECT_RATIO=1.50 \
+PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_STOCK_RATIO=1.50 \
 PGLC_SQL_ONLY_BENCH_SCALING_SNAPSHOT=true \
 PGLC_SQL_ONLY_BENCH_SCALING_DURATION=3 \
 PGLC_SQL_ONLY_BENCH_SCALING_WARMUP_SECONDS=1 \
@@ -262,14 +280,14 @@ in the
 
 ## Fairness rules
 
-### Ordinary SQL
+### SQL KV
 
 - Stock, mapped-direct, and cached runs use the same PostgreSQL major and
   checked comparison settings.
-- Schema, generated data, query text, key sequence, role capabilities,
-  connection count, client process, protocol, pipeline, and random seed match.
-- The mapped direct/cache pair differs only by
-  `SET pg_local_cache.sql_cache=off|on`.
+- Schema, generated data, key sequence, returned bytes, role capabilities,
+  connection count, client process, protocol, batch width, and random seed
+  match. Query text differs only because stock PostgreSQL has no `mget()`.
+- The stock and mapped-direct lanes use the same ordered PK batch query.
 - Stock and cached sentinel rows are compared before timing.
 - Prepared and unnamed-extended results are never averaged together.
 - Throughput and single-operation latency are measured in separate passes.
@@ -290,7 +308,7 @@ baselines belong in a published table.
 
 ### Latency semantics
 
-SQL-only latency uses one `SELECT` per transaction. RESP latency starts when a
+SQL-only latency uses one scalar key read per transaction. RESP latency starts when a
 pipeline is sent and ends after its replies are decoded, so it includes queueing
 behind earlier commands in that pipeline. Do not compare their percentiles
 directly. Record protocol, pipeline depth, client count, and sampling method

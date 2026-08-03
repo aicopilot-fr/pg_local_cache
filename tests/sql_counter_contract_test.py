@@ -116,8 +116,15 @@ class SqlCounterSourceTests(unittest.TestCase):
         self.assertIn("&pglc_sql_counter_slots[proc_number]", resolver)
         self.assertNotIn("%", resolver)
 
+        hit = c_function(CORE, "pglc_note_sql_cache_hit")
+        self.assertIn("pglc_note_sql_cache_hits(1)", hit)
+        batch_hits = c_function(CORE, "pglc_note_sql_cache_hits")
+        self.assertIn("pglc_current_sql_counter_slot()", batch_hits)
+        self.assertIn("slot->counters.hits", batch_hits)
+        self.assertRegex(HEADER, r"extern void pglc_note_sql_cache_hits\(uint64 count\);")
+        self.assertRegex(HEADER, r"extern void pglc_note_sql_cache_hit\(void\);")
+
         for event, counter in (
-            ("hit", "hits"),
             ("miss", "misses"),
             ("fill", "fills"),
             ("bypass", "bypasses"),

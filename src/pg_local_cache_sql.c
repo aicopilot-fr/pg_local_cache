@@ -19,7 +19,9 @@
 #include "commands/explain.h"
 #include "commands/extension.h"
 #include "commands/trigger.h"
+#include "common/hashfn.h"
 #include "executor/executor.h"
+#include "executor/spi.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
@@ -33,7 +35,9 @@
 #include "optimizer/restrictinfo.h"
 #include "parser/parse_coerce.h"
 #include "utils/array.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -48,6 +52,10 @@
 #include "key_codec.h"
 #include "row_payload.h"
 
+PG_FUNCTION_INFO_V1(pg_local_cache_sql_get);
+PG_FUNCTION_INFO_V1(pg_local_cache_sql_get_scalar);
+PG_FUNCTION_INFO_V1(pg_local_cache_sql_mget);
+
 /*
  * This is intentionally a narrow transparent fast path.  It recognizes only
  *
@@ -60,6 +68,11 @@
 
 #define PGLC_SQL_CUSTOM_NAME "pg_local_cache_sql"
 #define PGLC_SQL_META_CACHE_SLOTS 32
+#define PGLC_SQL_ROW_CACHE_SETS 4096
+#define PGLC_SQL_ROW_CACHE_WAYS 4
+#define PGLC_SQL_ROW_CACHE_ENTRIES \
+	(PGLC_SQL_ROW_CACHE_SETS * PGLC_SQL_ROW_CACHE_WAYS)
+#define PGLC_SQL_ROW_CACHE_DATA_BYTES (16 * 1024 * 1024)
 
 #define PGLC_PRIVATE_NAMESPACE 0
 #define PGLC_PRIVATE_RELATION 1
@@ -85,6 +98,8 @@ typedef struct PgLocalCacheSqlMeta
 	Oid			key_types[PGLC_MAX_KEY_COLUMNS];
 	int32		key_typmods[PGLC_MAX_KEY_COLUMNS];
 	Oid			key_collations[PGLC_MAX_KEY_COLUMNS];
+	Oid			key_btree_opfamilies[PGLC_MAX_KEY_COLUMNS];
+	Oid			primary_index_oid;
 	Oid			row_type_oid;
 	int32		row_typmod;
 	int			row_natts;
@@ -140,12 +155,56 @@ typedef struct PgLocalCacheSqlMetaCacheEntry
 	PgLocalCacheSqlMeta meta;
 } PgLocalCacheSqlMetaCacheEntry;
 
+/*
+ * A shared-cache SQL hit is immutable until data_epoch changes.  Keeping the
+ * validated row in backend memory removes the shared LWLock, dynahash lookup,
+ * copy, CRC and decode from repeated SQL reads without changing the shared
+ * cache's transaction semantics.
+ */
+typedef struct PgLocalCacheSqlRowCacheEntry
+{
+	uint64		hash;
+	uint64		data_epoch;
+	uint64		config_generation;
+	uint64		source_observed_full_xid;
+	uint64		last_access;
+	Oid			database_oid;
+	Oid			relation_oid;
+	TransactionId source_xmin;
+	Size		key_len;
+	Size		storage_len;
+	Datum		composite;
+	char		nspace[PGLC_NAMESPACE_MAX];
+	char	   *storage;
+	char	   *key;
+	char	   *payload;
+	const char *json;
+	Size		json_len;
+	bool		valid;
+} PgLocalCacheSqlRowCacheEntry;
+
+typedef struct PgLocalCacheSqlGetState
+{
+	MemoryContext context;
+	Oid			relation_oid;
+	Oid			user_oid;
+	uint64		config_generation;
+	uint64		row_cache_hash_seed;
+	PgLocalCacheMapping mapping;
+	SPIPlanPtr	get_plan;
+	char	   *payload;
+} PgLocalCacheSqlGetState;
+
 bool		pglc_sql_cache = true;
 
 static set_rel_pathlist_hook_type previous_set_rel_pathlist_hook = NULL;
 static planner_hook_type previous_planner_hook = NULL;
 static PgLocalCacheSqlMetaCacheEntry
 	pglc_sql_meta_cache[PGLC_SQL_META_CACHE_SLOTS];
+static MemoryContext pglc_sql_row_cache_context = NULL;
+static PgLocalCacheSqlRowCacheEntry *pglc_sql_row_cache = NULL;
+static Size pglc_sql_row_cache_data_used = 0;
+static uint64 pglc_sql_row_cache_clock = 0;
 static uint64 pglc_sql_relation_validation_sequence = 0;
 
 static PlannedStmt *pglc_sql_planner(Query *parse, const char *query_string,
@@ -183,6 +242,187 @@ static const CustomExecMethods pglc_sql_exec_methods = {
 	.ReScanCustomScan = pglc_sql_rescan,
 	.ExplainCustomScan = pglc_sql_explain
 };
+
+static void
+pglc_sql_row_cache_init(void)
+{
+	if (pglc_sql_row_cache != NULL)
+		return;
+	pglc_sql_row_cache_context = AllocSetContextCreate(TopMemoryContext,
+												"pg_local_cache SQL rows",
+												ALLOCSET_DEFAULT_SIZES);
+	pglc_sql_row_cache = MemoryContextAllocZero(
+		pglc_sql_row_cache_context,
+		sizeof(*pglc_sql_row_cache) * PGLC_SQL_ROW_CACHE_ENTRIES);
+}
+
+static uint64
+pglc_sql_row_cache_hash_seed(const PgLocalCacheMapping *mapping)
+{
+	uint64		seed;
+
+	seed = ((uint64) MyDatabaseId << 32) ^ mapping->relation_oid;
+	return hash_bytes_extended((const unsigned char *) mapping->nspace,
+							   strlen(mapping->nspace), seed);
+}
+
+static uint64
+pglc_sql_row_cache_hash(uint64 seed, const char *canonical_key,
+						Size canonical_key_len)
+{
+	return hash_bytes_extended((const unsigned char *) canonical_key,
+							   canonical_key_len, seed);
+}
+
+static void
+pglc_sql_row_cache_discard(PgLocalCacheSqlRowCacheEntry *entry)
+{
+	if (!entry->valid)
+		return;
+	Assert(pglc_sql_row_cache_data_used >= entry->storage_len);
+	pglc_sql_row_cache_data_used -= entry->storage_len;
+	pfree(entry->storage);
+	memset(entry, 0, sizeof(*entry));
+}
+
+static PgLocalCacheSqlRowCacheEntry *
+pglc_sql_row_cache_lookup(const PgLocalCacheMapping *mapping,
+						  const char *canonical_key, Size canonical_key_len,
+						  uint64 hash, uint64 data_epoch)
+{
+	PgLocalCacheSqlRowCacheEntry *set;
+	int			way;
+
+	if (pglc_sql_row_cache == NULL)
+		return NULL;
+	set = &pglc_sql_row_cache[
+		(hash & (PGLC_SQL_ROW_CACHE_SETS - 1)) * PGLC_SQL_ROW_CACHE_WAYS];
+	for (way = 0; way < PGLC_SQL_ROW_CACHE_WAYS; way++)
+	{
+		PgLocalCacheSqlRowCacheEntry *entry = &set[way];
+
+		if (entry->valid &&
+			(entry->data_epoch != data_epoch ||
+			 entry->config_generation != mapping->config_generation))
+			pglc_sql_row_cache_discard(entry);
+		if (!entry->valid || entry->hash != hash ||
+			entry->database_oid != MyDatabaseId ||
+			entry->relation_oid != mapping->relation_oid ||
+			entry->key_len != canonical_key_len ||
+			strcmp(entry->nspace, mapping->nspace) != 0 ||
+			memcmp(entry->key, canonical_key, canonical_key_len) != 0)
+			continue;
+		entry->last_access = ++pglc_sql_row_cache_clock;
+		return entry;
+	}
+	return NULL;
+}
+
+static bool
+pglc_sql_row_cache_store(const PgLocalCacheMapping *mapping,
+						 TupleDesc descriptor, uint64 row_fingerprint,
+						 const char *canonical_key, Size canonical_key_len,
+						 uint64 hash, const char *payload, Size payload_len,
+						 TransactionId source_xmin,
+						 const PgLocalCacheReadToken *token, bool json_only,
+						 Datum *composite)
+{
+	PgLocalCacheSqlRowCacheEntry *set;
+	PgLocalCacheSqlRowCacheEntry *victim = NULL;
+	PgLocalCacheRowPayloadView view;
+	char	   *storage;
+	const char *content = payload;
+	Size		content_len = payload_len;
+	const char *checked_json = NULL;
+	Size		checked_json_len = 0;
+	Size		payload_offset = MAXALIGN(canonical_key_len + 1);
+	Size		storage_len;
+	int			way;
+
+	if (token->data_epoch != pglc_data_epoch() ||
+		token->config_generation != mapping->config_generation)
+		return false;
+	if (json_only)
+	{
+		if (!pglc_row_payload_get_json_checked(
+				payload, payload_len, mapping->row_type_oid,
+				mapping->row_typmod, mapping->row_natts,
+				mapping->row_descriptor_fingerprint,
+				&checked_json, &checked_json_len))
+			return false;
+		content = checked_json;
+		content_len = checked_json_len;
+	}
+	storage_len = payload_offset + content_len;
+	pglc_sql_row_cache_init();
+	set = &pglc_sql_row_cache[
+		(hash & (PGLC_SQL_ROW_CACHE_SETS - 1)) * PGLC_SQL_ROW_CACHE_WAYS];
+	for (way = 0; way < PGLC_SQL_ROW_CACHE_WAYS; way++)
+	{
+		PgLocalCacheSqlRowCacheEntry *entry = &set[way];
+
+		if (entry->valid &&
+			(entry->data_epoch != token->data_epoch ||
+			 entry->config_generation != token->config_generation))
+			pglc_sql_row_cache_discard(entry);
+		if (!entry->valid)
+		{
+			victim = entry;
+			break;
+		}
+		if (victim == NULL || entry->last_access < victim->last_access)
+			victim = entry;
+	}
+	Assert(victim != NULL);
+	pglc_sql_row_cache_discard(victim);
+	/* ponytail: fixed backend budget; shard epochs if write-heavy churn matters. */
+	if (storage_len > PGLC_SQL_ROW_CACHE_DATA_BYTES ||
+		pglc_sql_row_cache_data_used + storage_len >
+			PGLC_SQL_ROW_CACHE_DATA_BYTES)
+		return false;
+	storage = MemoryContextAllocExtended(pglc_sql_row_cache_context, storage_len,
+										 MCXT_ALLOC_NO_OOM);
+	if (storage == NULL)
+		return false;
+	memcpy(storage, canonical_key, canonical_key_len);
+	storage[canonical_key_len] = '\0';
+	memcpy(storage + payload_offset, content, content_len);
+	if (token->data_epoch != pglc_data_epoch() ||
+		(!json_only && !pglc_row_payload_decode_in_place(
+			storage + payload_offset, payload_len,
+			descriptor, row_fingerprint, &view)))
+	{
+		pfree(storage);
+		return false;
+	}
+	victim->hash = hash;
+	victim->data_epoch = token->data_epoch;
+	victim->config_generation = token->config_generation;
+	victim->source_observed_full_xid = token->source_observed_full_xid;
+	victim->last_access = ++pglc_sql_row_cache_clock;
+	victim->database_oid = MyDatabaseId;
+	victim->relation_oid = mapping->relation_oid;
+	victim->source_xmin = source_xmin;
+	victim->key_len = canonical_key_len;
+	victim->storage_len = storage_len;
+	victim->composite = json_only ? (Datum) 0 : view.composite;
+	strlcpy(victim->nspace, mapping->nspace, sizeof(victim->nspace));
+	victim->storage = storage;
+	victim->key = storage;
+	victim->payload = json_only ? NULL : storage + payload_offset;
+	if (json_only)
+	{
+		victim->json = storage + payload_offset;
+		victim->json_len = content_len;
+	}
+	else
+		(void) pglc_row_payload_get_json(&view, &victim->json, &victim->json_len);
+	victim->valid = true;
+	pglc_sql_row_cache_data_used += storage_len;
+	if (!json_only && composite != NULL)
+		*composite = view.composite;
+	return true;
+}
 
 static Const *
 pglc_sql_oid_const(Oid value)
@@ -725,9 +965,18 @@ pglc_sql_normalize_query_inheritance(Query *parse)
 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(cell);
 		PgLocalCacheSqlMeta meta;
 		Relation	relation;
+		uint64		current_generation;
 
 		if (rte->rtekind != RTE_RELATION || !rte->inh)
 			continue;
+
+		current_generation = pglc_config_generation();
+		if (pglc_sql_relation_validation_token(rte->relid,
+											 current_generation) != 0)
+		{
+			rte->inh = false;
+			continue;
+		}
 
 		relation = try_table_open(rte->relid, AccessShareLock);
 		if (relation == NULL)
@@ -761,6 +1010,7 @@ pglc_sql_relation_base_meta(Relation relation, PgLocalCacheSqlMeta *meta,
 							bool check_catalog_provenance)
 {
 	TupleDesc	descriptor;
+	HeapTuple	index_tuple;
 	int			key_index;
 
 	if (relation->rd_rel->relkind != RELKIND_RELATION ||
@@ -772,6 +1022,23 @@ pglc_sql_relation_base_meta(Relation relation, PgLocalCacheSqlMeta *meta,
 		 !pglc_sql_source_relation_allowed(relation)) ||
 		!pglc_sql_triggers_valid(relation, meta, check_catalog_provenance))
 		return false;
+
+	meta->primary_index_oid = RelationGetPrimaryKeyIndex(relation);
+	if (!OidIsValid(meta->primary_index_oid))
+		return false;
+	index_tuple = SearchSysCache1(INDEXRELID,
+							  ObjectIdGetDatum(meta->primary_index_oid));
+	if (!HeapTupleIsValid(index_tuple))
+		return false;
+	{
+		Form_pg_index index = (Form_pg_index) GETSTRUCT(index_tuple);
+		bool		valid = index->indisprimary && index->indisvalid &&
+			index->indisready && index->indimmediate;
+
+		ReleaseSysCache(index_tuple);
+		if (!valid)
+			return false;
+	}
 
 	descriptor = RelationGetDescr(relation);
 	if (meta->key_count < 1 || meta->key_count > PGLC_MAX_KEY_COLUMNS)
@@ -798,6 +1065,11 @@ pglc_sql_relation_base_meta(Relation relation, PgLocalCacheSqlMeta *meta,
 		meta->key_types[key_index] = key_attribute->atttypid;
 		meta->key_typmods[key_index] = key_attribute->atttypmod;
 		meta->key_collations[key_index] = key_attribute->attcollation;
+		meta->key_btree_opfamilies[key_index] =
+			lookup_type_cache(key_attribute->atttypid,
+							  TYPECACHE_BTREE_OPFAMILY)->btree_opf;
+		if (!OidIsValid(meta->key_btree_opfamilies[key_index]))
+			return false;
 	}
 
 	meta->row_type_oid = relation->rd_rel->reltype;
@@ -1111,23 +1383,6 @@ pglc_sql_match_clauses(RelOptInfo *rel, Index rti,
 	return true;
 }
 
-static bool
-pglc_sql_index_is_primary(Oid index_oid)
-{
-	HeapTuple	index_tuple;
-	bool		is_primary = false;
-
-	index_tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(index_oid));
-	if (HeapTupleIsValid(index_tuple))
-	{
-		Form_pg_index index_form = (Form_pg_index) GETSTRUCT(index_tuple);
-
-		is_primary = index_form->indisprimary;
-		ReleaseSysCache(index_tuple);
-	}
-	return is_primary;
-}
-
 static IndexPath *
 pglc_sql_primary_index_path(PlannerInfo *root, RelOptInfo *rel,
 							   const PgLocalCacheSqlMeta *meta,
@@ -1154,7 +1409,7 @@ pglc_sql_primary_index_path(PlannerInfo *root, RelOptInfo *rel,
 		int			key_index;
 
 		if (index_info == NULL || index_info->relam != BTREE_AM_OID ||
-			!pglc_sql_index_is_primary(index_info->indexoid) ||
+			index_info->indexoid != meta->primary_index_oid ||
 			!index_info->unique || !index_info->immediate ||
 			index_info->hypothetical || !index_info->amhasgettuple ||
 			index_info->nkeycolumns != meta->key_count ||
@@ -1165,19 +1420,17 @@ pglc_sql_primary_index_path(PlannerInfo *root, RelOptInfo *rel,
 		{
 			RestrictInfo *rinfo = restrict_infos[key_index];
 			RestrictInfo *indexqual_rinfo;
-			TypeCacheEntry *type_cache;
 			OpExpr	  *operator = (OpExpr *) rinfo->clause;
 			Node	  *left = (Node *) linitial(operator->args);
 			Node	  *right = (Node *) lsecond(operator->args);
 			Oid			index_operator;
 			IndexClause *index_clause;
 
-			type_cache = lookup_type_cache(meta->key_types[key_index],
-									   TYPECACHE_BTREE_OPFAMILY);
-			if (!OidIsValid(type_cache->btree_opf) ||
+			if (!OidIsValid(meta->key_btree_opfamilies[key_index]) ||
 				index_info->indexkeys[key_index] !=
-				meta->key_attnos[key_index] ||
-				index_info->opfamily[key_index] != type_cache->btree_opf ||
+					meta->key_attnos[key_index] ||
+				index_info->opfamily[key_index] !=
+					meta->key_btree_opfamilies[key_index] ||
 				(index_info->indexcollations[key_index] != InvalidOid &&
 				 index_info->indexcollations[key_index] !=
 				 operator->inputcollid))
@@ -1208,7 +1461,7 @@ pglc_sql_primary_index_path(PlannerInfo *root, RelOptInfo *rel,
 				break;
 			}
 			if (get_op_opfamily_strategy(index_operator,
-								 type_cache->btree_opf) !=
+									 meta->key_btree_opfamilies[key_index]) !=
 				BTEqualStrategyNumber)
 			{
 				matches = false;
@@ -1709,14 +1962,10 @@ typedef enum PgLocalCacheSourceVisibility
  * miss, never expose a version that was invisible when it was admitted.
  */
 static PgLocalCacheSourceVisibility
-pglc_sql_source_visibility(TransactionId source_xmin,
-							   uint64 source_observed_full_xid,
-							   Snapshot snapshot)
+pglc_sql_source_visibility_at(TransactionId source_xmin,
+                              uint64 source_observed_full_xid,
+                              Snapshot snapshot, uint64 current_full_xid)
 {
-	uint64		current_full_xid;
-
-	current_full_xid =
-		U64FromFullTransactionId(ReadNextFullTransactionId());
 	if (source_observed_full_xid == 0 ||
 		current_full_xid < source_observed_full_xid ||
 		current_full_xid - source_observed_full_xid >=
@@ -1730,6 +1979,621 @@ pglc_sql_source_visibility(TransactionId source_xmin,
 		XidInMVCCSnapshot(source_xmin, snapshot))
 		return PGLC_SOURCE_SNAPSHOT_REJECTED;
 	return PGLC_SOURCE_VISIBLE;
+}
+
+static PgLocalCacheSourceVisibility
+pglc_sql_source_visibility(TransactionId source_xmin,
+							   uint64 source_observed_full_xid,
+							   Snapshot snapshot)
+{
+	return pglc_sql_source_visibility_at(
+		source_xmin, source_observed_full_xid, snapshot,
+		U64FromFullTransactionId(ReadNextFullTransactionId()));
+}
+
+static void
+pglc_sql_get_state_free(PgLocalCacheSqlGetState *state)
+{
+	if (state == NULL)
+		return;
+	if (state->get_plan != NULL)
+		SPI_freeplan(state->get_plan);
+	MemoryContextDelete(state->context);
+	pfree(state);
+}
+
+static PgLocalCacheSqlGetState *
+pglc_sql_get_state(FunctionCallInfo fcinfo, Oid relation_oid)
+{
+	PgLocalCacheSqlGetState *state = fcinfo->flinfo->fn_extra;
+	PgLocalCacheSqlMeta meta;
+	PgLocalCacheSqlMeta validated_meta;
+	MemoryContext function_context = fcinfo->flinfo->fn_mcxt;
+	MemoryContext old_context;
+	Relation	relation;
+	StringInfoData where_clause;
+	char	   *qualified_relation;
+	char	   *query;
+	Oid			argument_types[PGLC_MAX_KEY_COLUMNS];
+	int			key_index;
+
+	if (state != NULL && state->relation_oid == relation_oid &&
+		state->user_oid == GetUserId() &&
+		state->config_generation == pglc_config_generation())
+		return state;
+	pglc_sql_get_state_free(state);
+	fcinfo->flinfo->fn_extra = NULL;
+	if (!pglc_sql_read_mapping(relation_oid, &meta))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("relation %u is not attached to pg_local_cache",
+						relation_oid)));
+
+	relation = table_open(relation_oid, AccessShareLock);
+	validated_meta = meta;
+	if (!pglc_sql_relation_meta(relation, &validated_meta, true) ||
+		!pglc_sql_same_mapping(&meta, &validated_meta))
+	{
+		table_close(relation, NoLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("relation %u is not a valid pg_local_cache mapping",
+							relation_oid)));
+	}
+	meta = validated_meta;
+
+	old_context = MemoryContextSwitchTo(function_context);
+	state = palloc0(sizeof(*state));
+	state->context = AllocSetContextCreate(function_context,
+											"pg_local_cache SQL get",
+											ALLOCSET_DEFAULT_SIZES);
+	MemoryContextSwitchTo(state->context);
+	state->relation_oid = relation_oid;
+	state->user_oid = GetUserId();
+	state->config_generation = meta.config_generation;
+	state->payload = palloc(PGLC_VALUE_MAX);
+	state->mapping.relation_oid = relation_oid;
+	state->mapping.key_count = meta.key_count;
+	state->mapping.row_type_oid = meta.row_type_oid;
+	state->mapping.row_typmod = meta.row_typmod;
+	state->mapping.row_natts = meta.row_natts;
+	state->mapping.row_descriptor_fingerprint = meta.row_fingerprint;
+	state->mapping.config_generation = meta.config_generation;
+	state->mapping.row_desc = CreateTupleDescCopy(RelationGetDescr(relation));
+	strlcpy(state->mapping.nspace, meta.nspace,
+			sizeof(state->mapping.nspace));
+	state->row_cache_hash_seed = pglc_sql_row_cache_hash_seed(&state->mapping);
+	strlcpy(state->mapping.schema_name,
+			get_namespace_name(RelationGetNamespace(relation)),
+			sizeof(state->mapping.schema_name));
+	strlcpy(state->mapping.relation_name, RelationGetRelationName(relation),
+			sizeof(state->mapping.relation_name));
+	for (key_index = 0; key_index < meta.key_count; key_index++)
+	{
+		Oid			input_function;
+		Oid			output_function;
+		bool		is_varlena;
+
+		state->mapping.key_attnos[key_index] = meta.key_attnos[key_index];
+		state->mapping.key_types[key_index] = meta.key_types[key_index];
+		state->mapping.key_typmods[key_index] = meta.key_typmods[key_index];
+		strlcpy(state->mapping.key_columns[key_index],
+				meta.key_columns[key_index], NAMEDATALEN);
+		getTypeInputInfo(meta.key_types[key_index], &input_function,
+						 &state->mapping.key_ioparams[key_index]);
+		getTypeOutputInfo(meta.key_types[key_index], &output_function,
+						  &is_varlena);
+		fmgr_info_cxt(input_function, &state->mapping.key_inputs[key_index],
+					  state->context);
+		fmgr_info_cxt(output_function, &state->mapping.key_outputs[key_index],
+					  state->context);
+		argument_types[key_index] = meta.key_types[key_index];
+	}
+
+	qualified_relation = quote_qualified_identifier(
+		state->mapping.schema_name, state->mapping.relation_name);
+	initStringInfo(&where_clause);
+	for (key_index = 0; key_index < meta.key_count; key_index++)
+	{
+		if (key_index > 0)
+			appendStringInfoString(&where_clause, " AND ");
+		appendStringInfo(&where_clause, "pglc_source.%s = $%d",
+						 quote_identifier(meta.key_columns[key_index]),
+						 key_index + 1);
+	}
+	query = psprintf(
+		"SELECT pglc_source, pglc_source.xmin "
+		"FROM ONLY %s AS pglc_source WHERE %s LIMIT 1",
+		qualified_relation, where_clause.data);
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "pg_local_cache SQL get could not connect to SPI");
+	state->get_plan = SPI_prepare(query, meta.key_count, argument_types);
+	if (state->get_plan == NULL || SPI_keepplan(state->get_plan) != 0)
+		elog(ERROR, "pg_local_cache SQL get could not retain its source plan");
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "pg_local_cache SQL get could not finish SPI setup");
+	table_close(relation, NoLock);
+	MemoryContextSwitchTo(old_context);
+	fcinfo->flinfo->fn_extra = state;
+	return state;
+}
+
+static bool
+pglc_sql_get_keys(PgLocalCacheSqlGetState *state, ArrayType *array,
+				  Datum *values, char *canonical, Size *canonical_len)
+{
+	Datum	   *elements;
+	bool	   *nulls;
+	bool		key_nulls[PGLC_MAX_KEY_COLUMNS] = {false};
+	int			count;
+	int			key_index;
+
+	deconstruct_array(array, TEXTOID, -1, false, TYPALIGN_INT,
+					  &elements, &nulls, &count);
+	if (count != state->mapping.key_count)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("expected %d primary-key values, got %d",
+						state->mapping.key_count, count)));
+	for (key_index = 0; key_index < count; key_index++)
+	{
+		char	   *input;
+
+		if (nulls[key_index])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("primary-key values cannot be NULL")));
+		input = TextDatumGetCString(elements[key_index]);
+		values[key_index] = InputFunctionCall(
+			&state->mapping.key_inputs[key_index], input,
+			state->mapping.key_ioparams[key_index],
+			state->mapping.key_typmods[key_index]);
+	}
+	return pglc_canonical_key_typed(
+		values, key_nulls, count, state->mapping.key_types,
+		state->mapping.key_outputs, canonical, PGLC_KEY_MAX, canonical_len);
+}
+
+static bool
+pglc_sql_get_can_use_cache(PgLocalCacheSqlGetState *state)
+{
+	Snapshot	snapshot = GetActiveSnapshot();
+
+	return pglc_sql_cache && XactIsoLevel == XACT_READ_COMMITTED &&
+		!RecoveryInProgress() && !IsParallelWorker() && !IsInParallelMode() &&
+		!pglc_current_transaction_is_dirty() && snapshot != NULL &&
+		snapshot->snapshot_type == SNAPSHOT_MVCC &&
+		state->config_generation == pglc_config_generation();
+}
+
+static bool
+pglc_sql_get_latest_matches(PgLocalCacheSqlGetState *state,
+							Datum *key_values, bool found,
+							TransactionId source_xmin)
+{
+	volatile Snapshot latest_snapshot = NULL;
+	volatile bool matches = false;
+
+	PG_TRY();
+	{
+		bool		isnull;
+
+		latest_snapshot = RegisterSnapshot(GetLatestSnapshot());
+		if (SPI_execute_snapshot(
+				state->get_plan, key_values, NULL, (Snapshot) latest_snapshot,
+				InvalidSnapshot, true, false, 1) != SPI_OK_SELECT)
+			elog(ERROR, "pg_local_cache SQL get latest-snapshot proof failed");
+		if (!found)
+			matches = SPI_processed == 0;
+		else if (SPI_processed == 1)
+		{
+			Datum		latest_xmin = SPI_getbinval(
+				SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
+
+			matches = !isnull && TransactionIdEquals(
+				DatumGetTransactionId(latest_xmin), source_xmin);
+		}
+		UnregisterSnapshot((Snapshot) latest_snapshot);
+		latest_snapshot = NULL;
+	}
+	PG_CATCH();
+	{
+		if (latest_snapshot != NULL)
+			UnregisterSnapshot((Snapshot) latest_snapshot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return matches;
+}
+
+static Datum
+pglc_sql_get_source(PgLocalCacheSqlGetState *state, Datum *key_values,
+					bool prove_fill, TransactionId *source_xmin, Size *payload_len,
+					bool *payload_cacheable, bool *found)
+{
+	MemoryContext result_context = CurrentMemoryContext;
+	TupleTableSlot *row_slot;
+	Datum		row;
+	Datum		xmin;
+	Datum		result;
+	bool		isnull;
+	const char *json;
+	Size		json_len;
+	MemoryContext old_context;
+
+	*found = false;
+	*payload_cacheable = false;
+	*payload_len = 0;
+	*source_xmin = InvalidTransactionId;
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "pg_local_cache SQL get could not connect to SPI");
+	if (SPI_execute_plan(state->get_plan, key_values, NULL, true, 1) !=
+		SPI_OK_SELECT)
+		elog(ERROR, "pg_local_cache SQL get source plan failed");
+	if (SPI_processed == 0)
+	{
+		*payload_cacheable = prove_fill && pglc_sql_get_latest_matches(
+			state, key_values, false, InvalidTransactionId);
+		if (SPI_finish() != SPI_OK_FINISH)
+			elog(ERROR, "pg_local_cache SQL get could not finish SPI");
+		pglc_note_database_read();
+		return (Datum) 0;
+	}
+	if (SPI_processed != 1)
+		elog(ERROR, "pg_local_cache SQL get returned more than one primary-key row");
+	row = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1,
+						&isnull);
+	if (isnull)
+		elog(ERROR, "pg_local_cache SQL get row unexpectedly became NULL");
+	xmin = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2,
+						 &isnull);
+	if (isnull)
+		elog(ERROR, "pg_local_cache SQL get xmin unexpectedly became NULL");
+	*source_xmin = DatumGetTransactionId(xmin);
+	row_slot = MakeSingleTupleTableSlot(state->mapping.row_desc, &TTSOpsVirtual);
+	ExecStoreHeapTupleDatum(row, row_slot);
+	*payload_cacheable = pglc_row_payload_encode(
+		row_slot, state->mapping.row_desc, PGLC_ROW_PAYLOAD_FLAG_HAS_JSON,
+		state->payload, PGLC_VALUE_MAX, payload_len);
+	if (*payload_cacheable && pglc_row_payload_get_json_checked(
+			state->payload, *payload_len, state->mapping.row_type_oid,
+			state->mapping.row_typmod, state->mapping.row_natts,
+			state->mapping.row_descriptor_fingerprint, &json, &json_len))
+	{
+		/* JSON already belongs to the payload copied outside SPI memory. */
+	}
+	else
+	{
+		text	   *json_text = DatumGetTextPP(
+			OidFunctionCall1(F_ROW_TO_JSON_RECORD, row));
+
+		*payload_cacheable = false;
+		json = VARDATA_ANY(json_text);
+		json_len = VARSIZE_ANY_EXHDR(json_text);
+	}
+	old_context = MemoryContextSwitchTo(result_context);
+	result = PointerGetDatum(cstring_to_text_with_len(json, json_len));
+	MemoryContextSwitchTo(old_context);
+	ExecDropSingleTupleTableSlot(row_slot);
+	if (*payload_cacheable && prove_fill)
+		*payload_cacheable = pglc_sql_get_latest_matches(
+			state, key_values, true, *source_xmin);
+	else
+		*payload_cacheable = false;
+	*found = true;
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "pg_local_cache SQL get could not finish SPI");
+	pglc_note_database_read();
+	return result;
+}
+
+static Datum
+pglc_sql_get_canonical(FunctionCallInfo fcinfo,
+					   PgLocalCacheSqlGetState *state, Datum *key_values,
+					   const char *canonical, Size canonical_len)
+{
+	Size		cached_len;
+	bool		negative;
+	TransactionId source_xmin;
+	PgLocalCacheReadToken token;
+	PgLocalCacheSourceVisibility visibility;
+	const char *json;
+	Size		json_len;
+	bool		cacheable;
+	bool		owns_load = false;
+	bool		found;
+	bool		payload_cacheable;
+	Size		payload_len;
+	uint64		load_id = 0;
+	uint64		data_epoch;
+	uint64		row_cache_hash;
+	PgLocalCacheSqlRowCacheEntry *row_cache_entry;
+	Datum		result;
+
+	cacheable = pglc_sql_get_can_use_cache(state);
+	data_epoch = cacheable ? pglc_data_epoch() : 0;
+	row_cache_hash = pglc_sql_row_cache_hash(
+		state->row_cache_hash_seed, canonical, canonical_len);
+	row_cache_entry = cacheable ? pglc_sql_row_cache_lookup(
+		&state->mapping, canonical, canonical_len, row_cache_hash, data_epoch) : NULL;
+	if (row_cache_entry != NULL)
+	{
+		visibility = pglc_sql_source_visibility(
+			row_cache_entry->source_xmin,
+			row_cache_entry->source_observed_full_xid, GetActiveSnapshot());
+		if (visibility == PGLC_SOURCE_VISIBLE)
+		{
+			if (row_cache_entry->json != NULL)
+			{
+				pglc_note_sql_cache_hit();
+				PG_RETURN_TEXT_P(cstring_to_text_with_len(
+					row_cache_entry->json, row_cache_entry->json_len));
+			}
+			/* Replace a composite-only local entry before caching JSON. */
+			pglc_sql_row_cache_discard(row_cache_entry);
+		}
+		if (visibility == PGLC_SOURCE_AGE_EXPIRED)
+			pglc_sql_row_cache_discard(row_cache_entry);
+	}
+	if (cacheable && pglc_cache_lookup_quiet(
+			&state->mapping, canonical, state->payload, PGLC_VALUE_MAX,
+			&cached_len, &negative, &source_xmin, &token))
+	{
+		if (negative)
+		{
+			pglc_note_sql_cache_hit();
+			PG_RETURN_NULL();
+		}
+		visibility = pglc_sql_source_visibility(
+			source_xmin, token.source_observed_full_xid, GetActiveSnapshot());
+		if (visibility == PGLC_SOURCE_VISIBLE &&
+			pglc_row_payload_get_json_checked(
+				state->payload, cached_len, state->mapping.row_type_oid,
+				state->mapping.row_typmod, state->mapping.row_natts,
+				state->mapping.row_descriptor_fingerprint, &json, &json_len))
+		{
+			(void) pglc_sql_row_cache_store(
+				&state->mapping, state->mapping.row_desc,
+				state->mapping.row_descriptor_fingerprint, canonical,
+				canonical_len, row_cache_hash, state->payload, cached_len,
+				source_xmin, &token, true, NULL);
+			pglc_note_sql_cache_hit();
+			PG_RETURN_TEXT_P(cstring_to_text_with_len(json, json_len));
+		}
+		if (visibility == PGLC_SOURCE_AGE_EXPIRED ||
+			visibility == PGLC_SOURCE_VISIBLE)
+			(void) pglc_cache_retire_positive(
+				&state->mapping, canonical, &token, source_xmin);
+	}
+	if (cacheable)
+	{
+		(void) pglc_cache_lookup_quiet(
+			&state->mapping, canonical, state->payload, PGLC_VALUE_MAX,
+			&cached_len, &negative, &source_xmin, &token);
+		pglc_note_sql_cache_miss();
+		owns_load = pglc_cache_claim_load(
+			&state->mapping, canonical, &token, &load_id) == PGLC_LOAD_OWNER;
+	}
+	else
+		pglc_note_sql_cache_bypass();
+
+	PG_TRY();
+	{
+		result = pglc_sql_get_source(
+			state, key_values, owns_load, &source_xmin,
+			&payload_len, &payload_cacheable, &found);
+		if (owns_load)
+		{
+			bool		stored = false;
+
+			if (payload_cacheable)
+				stored = pglc_cache_store(
+					&state->mapping, canonical, &token,
+					found ? state->payload : NULL,
+					found ? payload_len : 0, !found, load_id,
+					found ? source_xmin : InvalidTransactionId);
+			if (stored)
+				pglc_note_sql_cache_fill();
+			pglc_cache_release_load(
+				&state->mapping, canonical, &token, load_id);
+			owns_load = false;
+		}
+	}
+	PG_CATCH();
+	{
+		if (owns_load)
+			pglc_cache_release_load(
+				&state->mapping, canonical, &token, load_id);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!found)
+		PG_RETURN_NULL();
+	PG_RETURN_DATUM(result);
+}
+
+static void
+pglc_sql_get_acl_check(const PgLocalCacheSqlGetState *state)
+{
+	if (pg_class_aclcheck(state->relation_oid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
+		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE,
+					   state->mapping.relation_name);
+}
+
+static Datum
+pglc_sql_get_array_common(FunctionCallInfo fcinfo,
+						  PgLocalCacheSqlGetState *state)
+{
+	ArrayType  *key_array;
+	Datum		key_values[PGLC_MAX_KEY_COLUMNS];
+	char		canonical[PGLC_KEY_MAX];
+	Size		canonical_len;
+
+	if (PG_ARGISNULL(1))
+		PG_RETURN_NULL();
+	key_array = PG_GETARG_ARRAYTYPE_P(1);
+	pglc_sql_get_acl_check(state);
+	if (!pglc_sql_get_keys(state, key_array, key_values,
+						   canonical, &canonical_len) || canonical_len == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("canonical primary key exceeds %d bytes", PGLC_KEY_MAX - 1)));
+	return pglc_sql_get_canonical(
+		fcinfo, state, key_values, canonical, canonical_len);
+}
+
+static Datum
+pglc_sql_get_scalar_common(FunctionCallInfo fcinfo,
+						   PgLocalCacheSqlGetState *state)
+{
+	Oid			key_type;
+	Datum		key_value;
+	bool		key_null = false;
+	char		canonical[PGLC_KEY_MAX];
+	Size		canonical_len;
+
+	if (PG_ARGISNULL(1))
+		PG_RETURN_NULL();
+	key_type = get_fn_expr_argtype(fcinfo->flinfo, 1);
+	key_value = PG_GETARG_DATUM(1);
+	pglc_sql_get_acl_check(state);
+	if (state->mapping.key_count != 1 ||
+		key_type != state->mapping.key_types[0])
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("SQL scalar get requires one primary-key column of type %s",
+						format_type_be(state->mapping.key_types[0]))));
+	if (!pglc_canonical_key_typed(
+			&key_value, &key_null, 1, state->mapping.key_types,
+			state->mapping.key_outputs, canonical, sizeof(canonical),
+			&canonical_len) || canonical_len == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("canonical primary key exceeds %d bytes", PGLC_KEY_MAX - 1)));
+	return pglc_sql_get_canonical(
+		fcinfo, state, &key_value, canonical, canonical_len);
+}
+
+static Datum
+pglc_sql_mget_common(FunctionCallInfo fcinfo,
+					 PgLocalCacheSqlGetState *state)
+{
+	ArrayType  *key_array;
+	Oid			key_type;
+	Datum	   *key_values;
+	bool	   *key_nulls;
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+	int			key_count;
+	int			key_index;
+	bool		cacheable;
+	uint64		data_epoch;
+	uint64		current_full_xid;
+	uint64		local_hits = 0;
+	ArrayBuildState *result = NULL;
+
+	if (PG_ARGISNULL(1))
+		PG_RETURN_NULL();
+	key_array = PG_GETARG_ARRAYTYPE_P(1);
+	key_type = ARR_ELEMTYPE(key_array);
+	pglc_sql_get_acl_check(state);
+	if (state->mapping.key_count != 1 ||
+		key_type != state->mapping.key_types[0])
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("SQL mget requires one primary-key column of type %s",
+						format_type_be(state->mapping.key_types[0]))));
+	get_typlenbyvalalign(key_type, &typlen, &typbyval, &typalign);
+	deconstruct_array(key_array, key_type, typlen, typbyval, typalign,
+					  &key_values, &key_nulls, &key_count);
+	cacheable = pglc_sql_get_can_use_cache(state);
+	data_epoch = cacheable ? pglc_data_epoch() : 0;
+	current_full_xid = cacheable ?
+		U64FromFullTransactionId(ReadNextFullTransactionId()) : 0;
+	for (key_index = 0; key_index < key_count; key_index++)
+	{
+		char		canonical[PGLC_KEY_MAX];
+		Size		canonical_len;
+		Datum		value = (Datum) 0;
+		bool		isnull = key_nulls[key_index];
+
+		if (!isnull)
+		{
+			uint64		row_cache_hash;
+			PgLocalCacheSqlRowCacheEntry *row_cache_entry;
+
+			if (!pglc_canonical_key_typed(
+					&key_values[key_index], &isnull, 1,
+					state->mapping.key_types, state->mapping.key_outputs,
+					canonical, sizeof(canonical), &canonical_len) ||
+				canonical_len == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("canonical primary key exceeds %d bytes",
+								PGLC_KEY_MAX - 1)));
+			row_cache_hash = pglc_sql_row_cache_hash(
+				state->row_cache_hash_seed, canonical, canonical_len);
+			row_cache_entry = cacheable ? pglc_sql_row_cache_lookup(
+				&state->mapping, canonical, canonical_len, row_cache_hash,
+				data_epoch) : NULL;
+			if (row_cache_entry != NULL &&
+				pglc_sql_source_visibility_at(
+					row_cache_entry->source_xmin,
+					row_cache_entry->source_observed_full_xid,
+					GetActiveSnapshot(), current_full_xid) == PGLC_SOURCE_VISIBLE)
+			{
+				if (row_cache_entry->json != NULL)
+				{
+					value = PointerGetDatum(cstring_to_text_with_len(
+						row_cache_entry->json, row_cache_entry->json_len));
+					local_hits++;
+				}
+			}
+			if (value == (Datum) 0)
+			{
+				fcinfo->isnull = false;
+				value = pglc_sql_get_canonical(
+					fcinfo, state, &key_values[key_index], canonical,
+					canonical_len);
+				isnull = fcinfo->isnull;
+				fcinfo->isnull = false;
+			}
+		}
+		result = accumArrayResult(
+			result, value, isnull, TEXTOID, CurrentMemoryContext);
+	}
+	pglc_note_sql_cache_hits(local_hits);
+	if (result == NULL)
+		PG_RETURN_ARRAYTYPE_P(construct_empty_array(TEXTOID));
+	PG_RETURN_DATUM(makeArrayResult(result, CurrentMemoryContext));
+}
+
+Datum
+pg_local_cache_sql_get(PG_FUNCTION_ARGS)
+{
+	Oid			relation_oid = PG_GETARG_OID(0);
+	PgLocalCacheSqlGetState *state = pglc_sql_get_state(fcinfo, relation_oid);
+
+	return pglc_sql_get_array_common(fcinfo, state);
+}
+
+Datum
+pg_local_cache_sql_get_scalar(PG_FUNCTION_ARGS)
+{
+	Oid			relation_oid = PG_GETARG_OID(0);
+	PgLocalCacheSqlGetState *state = pglc_sql_get_state(fcinfo, relation_oid);
+
+	return pglc_sql_get_scalar_common(fcinfo, state);
+}
+
+Datum
+pg_local_cache_sql_mget(PG_FUNCTION_ARGS)
+{
+	Oid			relation_oid = PG_GETARG_OID(0);
+	PgLocalCacheSqlGetState *state = pglc_sql_get_state(fcinfo, relation_oid);
+
+	return pglc_sql_mget_common(fcinfo, state);
 }
 
 static TupleTableSlot *
@@ -1846,6 +2710,11 @@ pglc_sql_maybe_store(PgLocalCacheSqlScanState *state,
 
 	if (!pglc_row_payload_encode(
 			latest_slot,
+			RelationGetDescr(state->css.ss.ss_currentRelation),
+			PGLC_ROW_PAYLOAD_FLAG_HAS_JSON,
+			row_payload, sizeof(row_payload), &serialized_len) &&
+		!pglc_row_payload_encode(
+			latest_slot,
 			RelationGetDescr(state->css.ss.ss_currentRelation), 0,
 			row_payload, sizeof(row_payload), &serialized_len))
 		return false;
@@ -1905,9 +2774,12 @@ pglc_sql_access(ScanState *scan_state)
 	char		canonical_key[PGLC_KEY_MAX];
 	Size		canonical_key_len;
 	Size		cached_len;
+	uint64		row_cache_hash;
+	uint64		data_epoch;
 	bool		negative;
 	TransactionId source_xmin;
 	PgLocalCacheReadToken token;
+	PgLocalCacheSqlRowCacheEntry *row_cache_entry;
 	PgLocalCacheSourceVisibility visibility = PGLC_SOURCE_SNAPSHOT_REJECTED;
 	bool		hit;
 	int			lookup_attempt;
@@ -1948,6 +2820,28 @@ pglc_sql_access(ScanState *scan_state)
 		pglc_note_sql_cache_bypass();
 		return pglc_sql_run_child(state, NULL, NULL, 0);
 	}
+	data_epoch = pglc_data_epoch();
+	row_cache_hash = pglc_sql_row_cache_hash(
+		pglc_sql_row_cache_hash_seed(&state->mapping), canonical_key,
+		canonical_key_len);
+	row_cache_entry = pglc_sql_row_cache_lookup(
+		&state->mapping, canonical_key, canonical_key_len, row_cache_hash,
+		data_epoch);
+	if (row_cache_entry != NULL)
+	{
+		visibility = pglc_sql_source_visibility(
+			row_cache_entry->source_xmin,
+			row_cache_entry->source_observed_full_xid,
+			state->css.ss.ps.state->es_snapshot);
+		if (visibility == PGLC_SOURCE_VISIBLE)
+		{
+			state->hits++;
+			pglc_note_sql_cache_hit();
+			return pglc_sql_form_row_tuple(state, row_cache_entry->composite);
+		}
+		if (visibility == PGLC_SOURCE_AGE_EXPIRED)
+			pglc_sql_row_cache_discard(row_cache_entry);
+	}
 
 	for (lookup_attempt = 0; lookup_attempt < 2; lookup_attempt++)
 	{
@@ -1964,15 +2858,26 @@ pglc_sql_access(ScanState *scan_state)
 		if (visibility == PGLC_SOURCE_VISIBLE)
 		{
 			PgLocalCacheRowPayloadView view;
+			Datum		composite;
+			bool		row_cache_stored;
 
-			if (pglc_row_payload_decode_in_place(
-					state->cache_buffer, cached_len,
-					RelationGetDescr(state->css.ss.ss_currentRelation),
-					state->row_fingerprint, &view))
+			row_cache_stored = pglc_sql_row_cache_store(
+				&state->mapping,
+				RelationGetDescr(state->css.ss.ss_currentRelation),
+				state->row_fingerprint, canonical_key, canonical_key_len, row_cache_hash,
+				state->cache_buffer, cached_len, source_xmin, &token, false,
+				&composite);
+			if (row_cache_stored ||
+				pglc_row_payload_decode_in_place(
+						state->cache_buffer, cached_len,
+						RelationGetDescr(state->css.ss.ss_currentRelation),
+						state->row_fingerprint, &view))
 			{
+				if (!row_cache_stored)
+					composite = view.composite;
 				state->hits++;
 				pglc_note_sql_cache_hit();
-				return pglc_sql_form_row_tuple(state, view.composite);
+				return pglc_sql_form_row_tuple(state, composite);
 			}
 			/* Corruption or stale row shape is never exposed to SQL. */
 		}

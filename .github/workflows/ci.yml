@@ -187,7 +187,7 @@ jobs:
         run: bash tests/docker_smoke.sh
 
   docker-sql-only:
-    name: docker-sql-only (ordinary SQL, no RESP secret)
+    name: docker-sql-only (SQL GET/MGET, no RESP secret)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -205,11 +205,11 @@ jobs:
           PGLC_SQL_ONLY_BENCH_CONCURRENCY: "16"
           PGLC_SQL_ONLY_BENCH_PIPELINE: "32"
           PGLC_SQL_ONLY_BENCH_KEYS: "4096"
-          PGLC_SQL_ONLY_BENCH_PAYLOAD_BYTES: "128"
+          PGLC_SQL_ONLY_BENCH_PAYLOAD_BYTES: "3000"
           PGLC_SQL_ONLY_BENCH_PREPARED_MIN_OPS: "10000"
           PGLC_SQL_ONLY_BENCH_EXTENDED_MIN_OPS: "10000"
-          PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_DIRECT_RATIO: "0.80"
-          PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_STOCK_RATIO: "0.80"
+          PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_DIRECT_RATIO: "1.50"
+          PGLC_SQL_ONLY_BENCH_MIN_CACHED_TO_STOCK_RATIO: "1.50"
           PGLC_SQL_ONLY_BENCH_SCALING_SNAPSHOT: "true"
           PGLC_SQL_ONLY_BENCH_SCALING_DURATION: "3"
           PGLC_SQL_ONLY_BENCH_SCALING_WARMUP_SECONDS: "1"

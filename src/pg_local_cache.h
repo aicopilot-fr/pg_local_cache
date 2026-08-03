@@ -103,6 +103,8 @@ typedef struct PgLocalCacheSharedState
 	/* Next dynahash bucket for the bounded eviction sample. */
 	uint32		eviction_bucket_cursor;
 	pg_atomic_uint64 config_generation;
+	/* Fences backend-local SQL row copies across committed invalidations. */
+	pg_atomic_uint64 data_epoch;
 	pg_atomic_uint64 cache_hits;
 	pg_atomic_uint64 cache_misses;
 	pg_atomic_uint64 negative_hits;
@@ -159,6 +161,7 @@ typedef struct PgLocalCacheReadToken
 	uint64		relation_version;
 	uint64		key_version;
 	uint64		source_observed_full_xid;
+	uint64		data_epoch;
 	bool		cacheable;
 	bool		has_entry;
 } PgLocalCacheReadToken;
@@ -224,6 +227,7 @@ extern HTAB *pglc_relation_hash;
 
 extern void pglc_require_preload(void);
 extern uint64 pglc_config_generation(void);
+extern uint64 pglc_data_epoch(void);
 extern bool pglc_cache_lookup(const PgLocalCacheMapping *mapping,
 							 const char *canonical_key,
 							 char *value,
@@ -262,6 +266,7 @@ extern void pglc_note_singleflight_waiter(void);
 extern void pglc_note_singleflight_reuse(void);
 extern void pglc_note_singleflight_timeout(void);
 extern void pglc_note_sql_cache_hit(void);
+extern void pglc_note_sql_cache_hits(uint64 count);
 extern void pglc_note_sql_cache_miss(void);
 extern void pglc_note_sql_cache_fill(void);
 extern void pglc_note_sql_cache_bypass(void);

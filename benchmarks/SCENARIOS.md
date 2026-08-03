@@ -7,9 +7,10 @@ contains three independent measurements:
 - ordinary primary-key SQL against mapped and stock PostgreSQL;
 - a pg_local_cache RESP payload-width sweep.
 
-The separate SQL-only runner compares cached, cache-disabled, and stock
-PostgreSQL for prepared and unnamed extended queries, including p50, p95,
-p99, and mean one-operation latency. See
+The separate SQL-only release runner compares `local_cache.mget()` with an
+ordered, byte-identical stock PostgreSQL PK batch for prepared and unnamed
+extended queries. It also records p50, p95, p99, and mean scalar-key latency.
+See
 [`docs/BENCHMARKS.md`](../docs/BENCHMARKS.md).
 
 ## Run the comparison
@@ -75,15 +76,16 @@ Run the SQL-only comparison for prepared and unnamed extended protocols:
 bash tests/docker_sql_only_smoke.sh
 ```
 
-That report keeps pipelined throughput separate from a pipeline-depth-one
-latency pass. It compares stock PostgreSQL, mapped PostgreSQL with caching
-disabled, and mapped PostgreSQL with caching enabled.
+That report counts equal-width KV key reads (`batch TPS × keys per MGET`) and
+keeps them separate from the scalar-key latency pass. It compares stock
+PostgreSQL, mapped PostgreSQL using the same stock batch with caching disabled,
+and mapped PostgreSQL using `mget()`.
 
-CI keeps c16/p32 as the strict SQL-only profile and adds a short, non-gating
-c4/p8 snapshot on the same servers. Both profiles include prepared and unnamed
-extended protocols. The profile pipeline is used only for throughput; latency
-is reported from c4/p1 and c16/p1 passes. Counter mismatches, failed batches,
-and invalid latency evidence remain fatal in the snapshot.
+CI keeps c16/k32 as the strict SQL-only profile and adds a short, non-gating
+c4/k8 snapshot on the same servers. Both profiles include prepared and unnamed
+extended protocols. Key-array width is used only for throughput; latency is
+reported from c4/k1 and c16/k1 passes. Counter mismatches, failed batches, and
+invalid latency evidence remain fatal in the snapshot.
 
 ## Payload width
 
@@ -98,5 +100,5 @@ tests rather than folded into warm-cache throughput.
 - Publish the raw JSON, source revision, image identities, CPU model, resource
   limits, duration, repetitions, and coefficient of variation.
 - Compare throughput only within the same protocol and workload.
-- Compare latency from the dedicated one-operation pass; pipelined batch
-  latency is not single-request latency.
+- Compare latency from the dedicated scalar-key pass; batch latency is not
+  single-key latency.

@@ -51,6 +51,14 @@ def sql_function(name: str) -> str:
 
 
 class SqlExecutorFastPathContracts(unittest.TestCase):
+    def test_rls_tables_are_never_cached(self) -> None:
+        for function in (
+            c_function("pglc_sql_relation_base_meta"),
+            c_function("pglc_sql_validate_runtime"),
+        ):
+            self.assertIn("relation->rd_rel->relrowsecurity", function)
+            self.assertIn("relation->rd_rel->relforcerowsecurity", function)
+
     def test_fallback_executor_is_initialized_only_when_needed(self) -> None:
         begin = c_function("pglc_sql_begin")
         self.assertIn("state->child_plan =", begin)
@@ -122,6 +130,70 @@ class SqlExecutorFastPathContracts(unittest.TestCase):
         self.assertIn("pglc_row_payload_decode_in_place(", access)
         self.assertNotIn("pglc_row_payload_decode(\n", access)
 
+    def test_backend_row_cache_is_bounded_exact_and_commit_fenced(self) -> None:
+        for bound in (
+            "#define PGLC_SQL_ROW_CACHE_SETS 4096",
+            "#define PGLC_SQL_ROW_CACHE_WAYS 4",
+            "#define PGLC_SQL_ROW_CACHE_DATA_BYTES (16 * 1024 * 1024)",
+        ):
+            self.assertIn(bound, SOURCE)
+
+        lookup = c_function("pglc_sql_row_cache_lookup")
+        for exact_guard in (
+            "entry->data_epoch != data_epoch",
+            "entry->config_generation != mapping->config_generation",
+            "entry->database_oid != MyDatabaseId",
+            "entry->relation_oid != mapping->relation_oid",
+            "strcmp(entry->nspace, mapping->nspace) != 0",
+            "memcmp(entry->key, canonical_key, canonical_key_len) != 0",
+        ):
+            self.assertIn(exact_guard, lookup)
+
+        store = c_function("pglc_sql_row_cache_store")
+        self.assertIn("pglc_sql_row_cache_data_used + storage_len", store)
+        self.assertIn("token->data_epoch != pglc_data_epoch()", store)
+        self.assertLess(
+            store.index("pglc_row_payload_decode_in_place("),
+            store.index("victim->valid = true"),
+        )
+
+        access = c_function("pglc_sql_access")
+        local_at = access.index("pglc_sql_row_cache_lookup(")
+        shared_at = access.index("pglc_cache_lookup_quiet(")
+        self.assertLess(local_at, shared_at)
+        local_path = access[local_at:shared_at]
+        self.assertIn("pglc_sql_source_visibility(", local_path)
+        self.assertIn("row_cache_entry->source_observed_full_xid", local_path)
+        self.assertNotIn("0xfffff", SOURCE)
+
+        mget = c_function("pglc_sql_mget_common")
+        self.assertEqual(mget.count("ReadNextFullTransactionId()"), 1)
+        self.assertIn("pglc_sql_source_visibility_at(", mget)
+        canonical_get = c_function("pglc_sql_get_canonical")
+        self.assertIn("pglc_sql_source_visibility(", canonical_get)
+
+        startup = source_function(CORE, "pglc_shmem_startup")
+        self.assertIn("pg_atomic_init_u64(&pglc_shared->data_epoch, 1)", startup)
+        token = source_function(CORE, "cache_lookup_locked")
+        self.assertIn("token->data_epoch =", token)
+        advance = source_function(CORE, "advance_global_version_locked")
+        self.assertIn("pg_atomic_fetch_add_u64(&pglc_shared->data_epoch, 1)", advance)
+        publish = source_function(CORE, "pglc_publish_dirty")
+        self.assertIn("advance_global_version_locked()", publish)
+
+    def test_sql_get_cold_fill_requires_latest_snapshot_proof(self) -> None:
+        latest = c_function("pglc_sql_get_latest_matches")
+        self.assertIn("RegisterSnapshot(GetLatestSnapshot())", latest)
+        self.assertIn("SPI_execute_snapshot(", latest)
+        self.assertIn("SPI_processed == 0", latest)
+        self.assertIn("TransactionIdEquals(", latest)
+
+        source = c_function("pglc_sql_get_source")
+        self.assertGreaterEqual(source.count("pglc_sql_get_latest_matches("), 2)
+        canonical = c_function("pglc_sql_get_canonical")
+        self.assertIn("if (payload_cacheable)", canonical)
+        self.assertNotIn("if (!found || payload_cacheable)", canonical)
+
     def test_runtime_common_path_uses_an_exact_validation_version(self) -> None:
         invalidate = c_function("pglc_sql_relcache_invalidation")
         self.assertGreaterEqual(
@@ -155,6 +227,52 @@ class SqlExecutorFastPathContracts(unittest.TestCase):
             runtime.count("state->relation_validation_token = validation_token"),
             3,
         )
+
+    def test_inheritance_normalizer_reuses_exact_relation_validation(self) -> None:
+        normalizer = c_function("pglc_sql_normalize_query_inheritance")
+        generation_at = normalizer.index(
+            "current_generation = pglc_config_generation()"
+        )
+        token_at = normalizer.index("pglc_sql_relation_validation_token(")
+        open_at = normalizer.index("try_table_open")
+        self.assertLess(generation_at, token_at)
+        self.assertLess(token_at, open_at)
+
+        token_fast_path = normalizer[token_at:open_at]
+        self.assertIn("current_generation", token_fast_path)
+        self.assertIn("rte->inh = false", token_fast_path)
+        self.assertIn("continue", token_fast_path)
+
+        fallback = normalizer[open_at:]
+        for guard in (
+            "RELKIND_RELATION",
+            "RELPERSISTENCE_PERMANENT",
+            "relation->rd_rel->relhassubclass",
+            "pglc_sql_relation_has_children(relation)",
+            "pglc_sql_source_relation_allowed(relation)",
+            "pglc_sql_read_mapping(rte->relid, &meta)",
+        ):
+            self.assertIn(guard, fallback)
+        self.assertIn("table_close(relation, NoLock)", fallback)
+
+    def test_relation_validation_caches_primary_index_metadata(self) -> None:
+        validation = c_function("pglc_sql_relation_base_meta")
+        for guard in (
+            "RelationGetPrimaryKeyIndex(relation)",
+            "index->indisprimary",
+            "index->indisvalid",
+            "index->indisready",
+            "index->indimmediate",
+            "TYPECACHE_BTREE_OPFAMILY",
+        ):
+            self.assertIn(guard, validation)
+
+        index_path = c_function("pglc_sql_primary_index_path")
+        self.assertIn("index_info->indexoid != meta->primary_index_oid", index_path)
+        self.assertIn("meta->key_btree_opfamilies[key_index]", index_path)
+        self.assertNotIn("SearchSysCache1", index_path)
+        self.assertNotIn("lookup_type_cache", index_path)
+        self.assertNotIn("pglc_sql_index_is_primary", SOURCE)
 
     def test_catalog_provenance_changes_bump_the_shared_generation(self) -> None:
         ddl = sql_function("_ddl_invalidate")

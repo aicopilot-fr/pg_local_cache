@@ -544,6 +544,7 @@ pglc_shmem_startup(void)
 		pg_atomic_init_u64(&pglc_shared->clock, 0);
 		pg_atomic_init_u64(&pglc_shared->entry_generation, 0);
 		pg_atomic_init_u64(&pglc_shared->config_generation, 1);
+		pg_atomic_init_u64(&pglc_shared->data_epoch, 1);
 		pg_atomic_init_u64(&pglc_shared->cache_hits, 0);
 		pg_atomic_init_u64(&pglc_shared->cache_misses, 0);
 		pg_atomic_init_u64(&pglc_shared->negative_hits, 0);
@@ -648,14 +649,23 @@ pglc_increment_owned_sql_counter(pg_atomic_uint64 *counter)
 }
 
 void
-pglc_note_sql_cache_hit(void)
+pglc_note_sql_cache_hits(uint64 count)
 {
 	PgLocalCacheSqlCounterSlot *slot = pglc_current_sql_counter_slot();
 
+	if (count == 0)
+		return;
 	if (slot != NULL)
-		pglc_increment_owned_sql_counter(&slot->counters.hits);
+		pg_atomic_write_u64(&slot->counters.hits,
+			pg_atomic_read_u64(&slot->counters.hits) + count);
 	else if (pglc_shared != NULL)
-		pg_atomic_fetch_add_u64(&pglc_shared->sql_cache_hits, 1);
+		pg_atomic_fetch_add_u64(&pglc_shared->sql_cache_hits, count);
+}
+
+void
+pglc_note_sql_cache_hit(void)
+{
+	pglc_note_sql_cache_hits(1);
 }
 
 void
@@ -733,6 +743,13 @@ pglc_config_generation(void)
 {
 	pglc_require_preload();
 	return pg_atomic_read_u64(&pglc_shared->config_generation);
+}
+
+uint64
+pglc_data_epoch(void)
+{
+	pglc_require_preload();
+	return pg_atomic_read_u64(&pglc_shared->data_epoch);
 }
 
 /*
@@ -871,6 +888,13 @@ cache_entry_is_current_locked(PgLocalCacheCacheEntry *entry,
 			entry->relation_oid == relation_state->relation_oid &&
 			entry->global_epoch == pglc_shared->global_epoch &&
 			entry->relation_version == relation_state->version;
+}
+
+static void
+advance_global_version_locked(void)
+{
+	pglc_shared->global_version++;
+	pg_atomic_fetch_add_u64(&pglc_shared->data_epoch, 1);
 }
 
 static uint64
@@ -1120,6 +1144,7 @@ cache_lookup_locked(const PgLocalCacheMapping *mapping,
 	token->key_version = entry ? entry->version : 0;
 	token->source_observed_full_xid =
 		entry ? entry->source_observed_full_xid : 0;
+	token->data_epoch = pg_atomic_read_u64(&pglc_shared->data_epoch);
 	token->has_entry = entry != NULL;
 	token->cacheable = mapping_matches && mapping_current &&
 		pglc_shared->global_dirty_writers == 0 &&
@@ -1494,7 +1519,7 @@ pglc_cache_invalidate_namespace(Oid database_oid, const char *nspace)
 
 	pglc_require_preload();
 	LWLockAcquire(pglc_shared->lock, LW_EXCLUSIVE);
-	pglc_shared->global_version++;
+	advance_global_version_locked();
 	count = invalidate_namespace_locked(database_oid, nspace);
 	LWLockRelease(pglc_shared->lock);
 	pg_atomic_fetch_add_u64(&pglc_shared->invalidations, 1);
@@ -1512,7 +1537,7 @@ pglc_cache_invalidate_key(const PgLocalCacheMapping *mapping,
 
 	pglc_require_preload();
 	LWLockAcquire(pglc_shared->lock, LW_EXCLUSIVE);
-	pglc_shared->global_version++;
+	advance_global_version_locked();
 	relation_state = get_relation_state(MyDatabaseId, mapping->relation_oid,
 									   mapping->nspace, false);
 	entry = get_cache_entry(MyDatabaseId, mapping->relation_oid,
@@ -1546,7 +1571,7 @@ pglc_cache_invalidate_database(Oid database_oid)
 
 	pglc_require_preload();
 	LWLockAcquire(pglc_shared->lock, LW_EXCLUSIVE);
-	pglc_shared->global_version++;
+	advance_global_version_locked();
 	hash_seq_init(&cache_sequence, pglc_cache_hash);
 	while ((entry = hash_seq_search(&cache_sequence)) != NULL)
 	{
@@ -1588,7 +1613,7 @@ pglc_cache_invalidate_all(void)
 		if (cache_entry_is_current_locked(entry, relation_state))
 			count++;
 	}
-	pglc_shared->global_version++;
+	advance_global_version_locked();
 	(void) invalidate_all_locked();
 	LWLockRelease(pglc_shared->lock);
 	pg_atomic_fetch_add_u64(&pglc_shared->invalidations, count);
@@ -1924,7 +1949,7 @@ pglc_publish_dirty(void)
 		return;
 
 	LWLockAcquire(pglc_shared->lock, LW_EXCLUSIVE);
-	pglc_shared->global_version++;
+	advance_global_version_locked();
 
 	if (local_has_global_dirty() || !precreate_shared_entries_locked())
 	{
