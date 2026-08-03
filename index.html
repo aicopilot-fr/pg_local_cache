@@ -1,15 +1,15 @@
 ---
 layout: default
-title: Transactional SQL key-value cache for PostgreSQL
-description: pg_local_cache adds SQL GET and MGET over bounded shared-memory rows with transaction-aware PostgreSQL invalidation.
+title: Transactional SQL row cache for PostgreSQL
+description: pg_local_cache accelerates ordinary exact-primary-key SELECT queries with bounded shared-memory rows and transaction-aware invalidation.
 home: true
 permalink: /
 ---
 <main id="main-content">
   <section id="sql-api" class="page-section hero" aria-labelledby="hero-title">
     <div class="hero-copy">
-      <h1 id="hero-title">A transactional SQL KV cache inside PostgreSQL</h1>
-      <p>Use GET and MGET through your PostgreSQL driver. Keep ordinary DML and fence affected entries before commit visibility.</p>
+      <h1 id="hero-title">A transactional SQL row cache inside PostgreSQL</h1>
+      <p>Keep using ordinary primary-key SELECT through your PostgreSQL driver. Ordinary DML fences affected entries before commit visibility.</p>
       <div class="hero-actions">
         <a class="button primary" href="{{ '/docs/INSTALL_EXISTING.html' | relative_url }}">Install on PostgreSQL 16 <span aria-hidden="true">→</span></a>
         <a class="button" href="{{ '/docs/BENCHMARKS.html' | relative_url }}">Benchmark methodology <span aria-hidden="true">→</span></a>
@@ -59,26 +59,23 @@ COMMIT
     <section class="page-section section-grid" aria-labelledby="benchmark-title">
       <div class="section-intro">
         <div class="section-rule"></div>
-        <h2 id="benchmark-title">Reference SQL KV snapshot</h2>
-        <p>PostgreSQL 16.14, 4,096 incompressible 3,000-byte values, 16 connections, batches of 32 key positions, and three rotated five-second repetitions.</p>
+        <h2 id="benchmark-title">Current ordinary SQL benchmark</h2>
+        <p>PostgreSQL 16.14, identical prepared SELECT text on both servers, four clients, pipeline depth 8, 128 keys, 128-byte text values, and one one-second CI smoke repetition.</p>
         <a href="{{ '/docs/BENCHMARKS.html' | relative_url }}">Read the methodology →</a>
       </div>
       <div>
-        <div class="table-scroll" role="region" aria-label="Reference SQL-only benchmark comparison" tabindex="0">
+        <div class="table-scroll" role="region" aria-label="Ordinary SQL benchmark comparison" tabindex="0">
           <table class="benchmark-table">
-            <thead><tr><th>Protocol</th><th>Path</th><th>c16/k32 key ops/s</th><th>vs stock</th><th>c16/k1 p50</th><th>p95</th><th>p99</th></tr></thead>
+            <thead><tr><th>Command template (<code>:key</code> is substituted)</th><th>Mapped cache ops/s</th><th>Stock PostgreSQL ops/s</th><th>Mapped/stock</th></tr></thead>
             <tbody>
-              <tr><td>Prepared</td><td>Stock PostgreSQL</td><td>7,992</td><td>1.00x</td><td>0.323 ms</td><td>0.991 ms</td><td>2.019 ms</td></tr>
-              <tr><td>Prepared</td><td>Mapped, cache off</td><td>8,049</td><td>1.01x</td><td>0.328 ms</td><td>0.919 ms</td><td>1.857 ms</td></tr>
-              <tr><td>Prepared</td><td><code>local_cache.mget</code></td><td>111,103</td><td>13.90x</td><td>0.516 ms</td><td>1.196 ms</td><td>3.150 ms</td></tr>
-              <tr><td>Unnamed extended</td><td>Stock PostgreSQL</td><td>7,992</td><td>1.00x</td><td>0.568 ms</td><td>1.150 ms</td><td>1.649 ms</td></tr>
-              <tr><td>Unnamed extended</td><td>Mapped, cache off</td><td>7,976</td><td>1.00x</td><td>0.561 ms</td><td>1.132 ms</td><td>1.717 ms</td></tr>
-              <tr><td>Unnamed extended</td><td><code>local_cache.mget</code></td><td>104,956</td><td>13.13x</td><td>0.601 ms</td><td>1.356 ms</td><td>2.787 ms</td></tr>
+              <tr><td><code>SELECT * FROM public.pg_local_cache_whole_row_comparison WHERE tenant_id = 7 AND id = :key;</code></td><td>126,710</td><td>65,257</td><td>1.94x</td></tr>
+              <tr><td><code>SELECT metadata, payload, enabled, amount, note, id, tenant_id FROM public.pg_local_cache_whole_row_comparison WHERE tenant_id = 7 AND id = :key;</code></td><td>123,051</td><td>65,236</td><td>1.89x</td></tr>
+              <tr><td><code>SELECT payload, metadata, id, tenant_id FROM public.pg_local_cache_whole_row_comparison WHERE id = :key AND tenant_id = 7;</code></td><td>131,017</td><td>71,398</td><td>1.84x</td></tr>
             </tbody>
           </table>
         </div>
-        <div class="benchmark-note"><span>Key ops/s = batch TPS × 32, not SQL statements. Latency is a separate scalar closed-loop pass; cache p99 was not lower here.</span><span>Cached lanes gate at ≥1.50x. A non-gating c4/k8 snapshot measured 1.15x prepared and 1.61x extended, so 13x is profile-specific.</span></div>
-        <p class="benchmark-evidence"><a href="https://github.com/profundium/pg_local_cache/actions/runs/30796269395">Run 30796269395</a> · <a href="https://github.com/profundium/pg_local_cache/commit/ee221410da59a8d5a3adb2068160d441b75e05f2">source ee221410</a> · <a href="{{ '/assets/benchmark-evidence/ee221410/sql-only-benchmark-smoke.zip' | relative_url }}">raw evidence ZIP</a> · digest <code>da4d7cad…e1220</code>. Shared-runner regression evidence, not a capacity claim.</p>
+        <div class="benchmark-note"><span>Both targets receive the exact command shown. The mapped working set was prefilled; every timed lookup was an exact cache hit with zero misses, fills, or bypasses.</span><span>The 10,000 ops/s integrity floor gates CI; the displayed ratios do not. This short shared-runner smoke is not a capacity claim.</span></div>
+        <p class="benchmark-evidence"><a href="https://github.com/profundium/pg_local_cache/actions/runs/30803546805">Run 30803546805</a> · <a href="https://github.com/profundium/pg_local_cache/commit/fe2d23c87ddc7e523ada2951376ebcb7d8570fb1">source fe2d23c</a> · <a href="{{ '/assets/benchmark-evidence/fe2d23c/comparison-smoke.zip' | relative_url }}">raw evidence ZIP</a> · digest <code>fc624e7e…f7c8a76</code>.</p>
       </div>
     </section>
   </div>
@@ -89,7 +86,7 @@ COMMIT
       <div class="step"><span class="step-number">1</span><strong>Preflight</strong><p>Check PostgreSQL, target paths, role and pending settings.</p></div>
       <div class="step"><span class="step-number">2</span><strong>Stage files</strong><p>Install the extension and stage postmaster configuration online.</p></div>
       <div class="step"><span class="step-number">3</span><strong>Restart once</strong><p>Load shared memory and hooks with one controlled restart.</p></div>
-      <div class="step"><span class="step-number">4</span><strong>Attach a table</strong><p>Register the primary key and use typed SQL GET/MGET.</p></div>
+      <div class="step"><span class="step-number">4</span><strong>Attach a table</strong><p>Register the primary key and keep using ordinary exact-key SELECT.</p></div>
     </div>
     <div class="install-command">
       <div class="command-label">Read-only preflight</div>
@@ -114,7 +111,7 @@ COMMIT
     <div class="docs-list">
       <a class="docs-link" href="{{ '/docs/INSTALL_EXISTING.html' | relative_url }}"><strong>Existing database</strong><span>Preflight, staging, restart, verification and rollback.</span><b>→</b></a>
       <a class="docs-link" href="{{ '/docs/TECHNICAL.html' | relative_url }}#architecture"><strong>Architecture</strong><span>Shared memory, hooks, workers and invalidation.</span><b>→</b></a>
-      <a class="docs-link" href="{{ '/#sql-api' | relative_url }}"><strong>SQL API</strong><span>Attach a table and use typed primary-key GET/MGET.</span><b>→</b></a>
+      <a class="docs-link" href="{{ '/#sql-api' | relative_url }}"><strong>SQL API</strong><span>Attach a table and use ordinary exact-primary-key SELECT.</span><b>→</b></a>
       <a class="docs-link" href="{{ '/docs/BENCHMARKS.html' | relative_url }}"><strong>Benchmark methodology</strong><span>Workloads, limits, latency and downloadable evidence.</span><b>→</b></a>
       <a class="docs-link" href="{{ '/docs/MONITORING.html' | relative_url }}"><strong>Monitoring &amp; OOM</strong><span>Prometheus metrics, alerts, budgets and health checks.</span><b>→</b></a>
       <a class="docs-link" href="{{ '/docs/TECHNICAL.html' | relative_url }}#security-boundary"><strong>Security</strong><span>Privileges, token boundary, RLS and fail-closed checks.</span><b>→</b></a>

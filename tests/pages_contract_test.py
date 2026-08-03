@@ -73,57 +73,103 @@ class PagesSourceContracts(unittest.TestCase):
         self.assertEqual(parser.image_sources, [])
         self.assertNotIn("lorem ipsum", source.lower())
         self.assertNotIn("10x", source.lower())
-        self.assertIn("local_cache.mget", source)
+        self.assertNotIn("local_cache.mget", source)
         self.assertIn("SELECT * FROM public.items WHERE id = $1::bigint", source)
-        self.assertIn("≥1.50x", source)
-        self.assertIn("c16/k32 key ops/s", source)
-        self.assertIn("111,103", source)
-        self.assertIn("3.150 ms", source)
-        self.assertIn("Key ops/s = batch TPS × 32", source)
-        self.assertIn("cache p99 was not lower", source)
+        self.assertIn(
+            "SELECT * FROM public.pg_local_cache_whole_row_comparison "
+            "WHERE tenant_id = 7 AND id = :key;",
+            source,
+        )
+        self.assertIn(
+            "SELECT metadata, payload, enabled, amount, note, id, "
+            "tenant_id FROM public.pg_local_cache_whole_row_comparison "
+            "WHERE tenant_id = 7 AND id = :key;",
+            source,
+        )
+        self.assertIn(
+            "SELECT payload, metadata, id, tenant_id FROM public."
+            "pg_local_cache_whole_row_comparison WHERE id = :key AND "
+            "tenant_id = 7;",
+            source,
+        )
+        self.assertIn("126,710", source)
+        self.assertIn("65,257", source)
+        self.assertIn("1.94x", source)
         self.assertIn("raw evidence ZIP", source)
-        self.assertIn("Reference SQL KV snapshot", source)
+        self.assertIn("Current ordinary SQL benchmark", source)
+        self.assertIn("30803546805", source)
+        self.assertNotIn("Reference SQL KV snapshot", source)
 
-    def test_benchmark_pages_publish_the_sql_kv_release_contract(self) -> None:
+    def test_benchmark_pages_publish_only_current_api_results(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         benchmarks = (ROOT / "docs" / "BENCHMARKS.md").read_text(
             encoding="utf-8"
         )
-        for source in (readme, benchmarks):
-            self.assertIn("local_cache.mget", source)
-            self.assertIn("1.50", source)
-            self.assertIn("3,000-byte", source)
+        readme_benchmarks = readme.split("## Benchmarks", 1)[1].split(
+            "## Monitoring", 1
+        )[0]
+        commands = (
+            "SELECT * FROM public.pg_local_cache_whole_row_comparison "
+            "WHERE tenant_id = 7 AND id = :key;",
+            "SELECT metadata, payload, enabled, amount, note, id, tenant_id "
+            "FROM public.pg_local_cache_whole_row_comparison WHERE "
+            "tenant_id = 7 AND id = :key;",
+            "SELECT payload, metadata, id, tenant_id FROM public."
+            "pg_local_cache_whole_row_comparison WHERE id = :key AND "
+            "tenant_id = 7;",
+        )
+        for source in (readme_benchmarks, benchmarks):
+            for command in commands:
+                self.assertIn(command, source)
             self.assertIn("stock PostgreSQL", source)
-        self.assertIn("Reference SQL-only CI snapshot", benchmarks)
-        self.assertIn("Transparent SELECT and RESP smoke", benchmarks)
-        self.assertIn("30796269395", readme)
-        self.assertIn("30796269395", benchmarks)
-        self.assertIn("13.90x", readme)
-        self.assertIn("3.150 ms", readme)
-        self.assertIn("1.15x", readme)
-        self.assertNotIn("30729192604", readme)
+            self.assertIn("30803546805", source)
+            self.assertIn("fe2d23c", source)
+            self.assertNotIn("local_cache.mget", source)
+            self.assertNotIn("Reference SQL", source)
+            self.assertNotIn("historical", source.lower())
+            self.assertNotIn("30796269395", source)
+            self.assertNotIn("13.90x", source)
+        self.assertIn(
+            'GET CRUD:benchmark.public.pg_local_cache_whole_row_comparison:'
+            '{"id":1,"tenant_id":7}',
+            benchmarks,
+        )
 
-    def test_reference_benchmark_evidence_is_complete_and_pinned(self) -> None:
-        evidence = ROOT / "assets" / "benchmark-evidence" / "ee221410"
-        bundles = {
-            "sql-only-benchmark-smoke.zip": (
-                "da4d7cad085e21ed636ee8ea54ab6bc30ec24a482282b15378a037f6ad3e1220",
-                {"sql-only.json", "sql-only.md"},
-            ),
-            "comparison-smoke.zip": (
-                "9facd988ca29b671fc51f3df471bdd013458e29e691cf81d9917979d1781e458",
-                {"whole-row.json", "whole-row.md"},
-            ),
-        }
-        for filename, (expected_digest, expected_members) in bundles.items():
-            with self.subTest(filename=filename):
-                bundle = evidence / filename
-                self.assertEqual(
-                    hashlib.sha256(bundle.read_bytes()).hexdigest(),
-                    expected_digest,
-                )
-                with zipfile.ZipFile(bundle) as archive:
-                    self.assertEqual(set(archive.namelist()), expected_members)
+    def test_current_benchmark_evidence_is_complete_and_pinned(self) -> None:
+        bundle = (
+            ROOT
+            / "assets"
+            / "benchmark-evidence"
+            / "fe2d23c"
+            / "comparison-smoke.zip"
+        )
+        self.assertEqual(
+            hashlib.sha256(bundle.read_bytes()).hexdigest(),
+            "fc624e7ebed11b10c8470d11e7d2a91855813e04f9fb809e62e4f0852f7c8a76",
+        )
+        with zipfile.ZipFile(bundle) as archive:
+            self.assertEqual(
+                set(archive.namelist()), {"whole-row.json", "whole-row.md"}
+            )
+            report = json.loads(archive.read("whole-row.json"))
+        self.assertEqual(
+            report["environment"]["source_revision"],
+            "fe2d23c87ddc7e523ada2951376ebcb7d8570fb1",
+        )
+        self.assertEqual(report["gate"]["status"], "PASS")
+        self.assertEqual(
+            {lane["query"] for lane in report["ordinary_sql"].values()},
+            {
+                "SELECT * FROM public.pg_local_cache_whole_row_comparison "
+                "WHERE tenant_id = 7 AND id = :key;",
+                "SELECT metadata, payload, enabled, amount, note, id, "
+                "tenant_id FROM public.pg_local_cache_whole_row_comparison "
+                "WHERE tenant_id = 7 AND id = :key;",
+                "SELECT payload, metadata, id, tenant_id FROM public."
+                "pg_local_cache_whole_row_comparison WHERE id = :key AND "
+                "tenant_id = 7;",
+            },
+        )
 
     def test_public_docs_use_the_current_repository_and_default_branch(self) -> None:
         sources = [

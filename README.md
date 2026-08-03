@@ -187,70 +187,33 @@ miss. Writable mappings expose PostgreSQL-backed `SET` and `DEL`. See the
 
 ## Benchmarks
 
-### Reference SQL KV snapshot (`ee221410`)
+### Current ordinary SQL result (`fe2d23c`)
 
-[CI run 30796269395](https://github.com/profundium/pg_local_cache/actions/runs/30796269395)
-for [source `ee221410`](https://github.com/profundium/pg_local_cache/commit/ee221410da59a8d5a3adb2068160d441b75e05f2)
-produced the [`sql-only-benchmark-smoke` evidence bundle](assets/benchmark-evidence/ee221410/sql-only-benchmark-smoke.zip)
-(Actions artifact ID `8849113380`, expiry 2026-09-02). The SQL-only job passed
-its throughput and exact-accounting gates. The preserved ZIP digest is
-`sha256:da4d7cad085e21ed636ee8ea54ab6bc30ec24a482282b15378a037f6ad3e1220`.
-Each cached c16/k32 lane had to sustain at least 10,000 key ops/s and at least
-`1.50x` both the stock and mapped-cache-off medians.
+[CI run 30803546805](https://github.com/profundium/pg_local_cache/actions/runs/30803546805)
+for [source `fe2d23c`](https://github.com/profundium/pg_local_cache/commit/fe2d23c87ddc7e523ada2951376ebcb7d8570fb1)
+passed every benchmark gate and produced the preserved
+[`comparison-smoke` evidence bundle](assets/benchmark-evidence/fe2d23c/comparison-smoke.zip)
+(Actions artifact ID `8851825673`; ZIP digest
+`sha256:fc624e7ebed11b10c8470d11e7d2a91855813e04f9fb809e62e4f0852f7c8a76`).
+The table shows the complete prepared SQL template used on both the mapped and
+stock PostgreSQL 16.14 servers. pgbench replaces `:key` with the measured key:
 
-| Protocol | Path | c16/k32 key ops/s | vs stock | c16/k1 mean | p50 | p95 | p99 | Samples |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| Prepared | Stock PostgreSQL 16.14 | 7,992 | 1.00x | 0.409 ms | 0.323 ms | 0.991 ms | 2.019 ms | 48,091 |
-| Prepared | Mapped, cache off | 8,049 | 1.01x | 0.402 ms | 0.328 ms | 0.919 ms | 1.857 ms | 48,495 |
-| Prepared | `local_cache.mget`, cache on | 111,103 | 13.90x | 0.778 ms | 0.516 ms | 1.196 ms | 3.150 ms | 30,091 |
-| Unnamed extended | Stock PostgreSQL 16.14 | 7,992 | 1.00x | 0.601 ms | 0.568 ms | 1.150 ms | 1.649 ms | 38,201 |
-| Unnamed extended | Mapped, cache off | 7,976 | 1.00x | 0.599 ms | 0.561 ms | 1.132 ms | 1.717 ms | 38,274 |
-| Unnamed extended | `local_cache.mget`, cache on | 104,956 | 13.13x | 0.846 ms | 0.601 ms | 1.356 ms | 2.787 ms | 28,689 |
-
-Throughput and latency are different passes. Throughput uses 16 concurrent
-connections and batches of 32 key positions; the cached batch calls MGET.
-Rates count resolved key positions (`batch TPS × 32`), not SQL statements.
-Latency is a separate closed-loop
-scalar-key c16/k1 pass. In this run the cached batch path had much higher key
-throughput, while cached scalar
-p99 was higher than stock in both protocols; no latency limit was configured.
-
-The GitHub-hosted runner exposed four logical Intel Xeon Platinum 8573C CPUs and
-a 1 GiB client cgroup. PostgreSQL 16.14 used 4,096 deterministic,
-incompressible 3,000-byte values, two seconds of warmup, three rotated five-second
-repetitions, and a real LOGIN NOSUPERUSER role. Stock and mapped servers had the
-same checked query-affecting settings. The harness compares the first, middle,
-and last scalar rows byte-for-byte; every timed cached key must also produce one hit
-with zero misses, fills, or bypasses. The stock PostgreSQL query necessarily
-uses different SQL because PostgreSQL has no built-in `mget()`.
-
-The same servers' non-gating c4/k8 snapshot measured 73,302 vs 63,568 key
-ops/s in prepared mode (1.15x) and 68,439 vs 42,491 in unnamed-extended mode
-(1.61x). The much smaller ratios are visible evidence that the c16/k32 13x
-result is profile-specific.
-
-The same workflow's [`comparison-smoke` evidence bundle](assets/benchmark-evidence/ee221410/comparison-smoke.zip)
-(Actions artifact ID `8848997316`, expiry 2026-08-10; ZIP digest
-`sha256:9facd988ca29b671fc51f3df471bdd013458e29e691cf81d9917979d1781e458`)
-came from a separate AMD EPYC 7763 runner job. It used four clients, pipeline
-depth 8, 128 keys, and 128-byte values. The configured timed warmup was zero,
-but the complete cache working set was prefilled and stabilized before the
-single 1-second repetition; timed cache lanes required zero misses and fills:
-
-| Prepared SQL shape | Mapped cache ops/s | Stock PostgreSQL ops/s | Mapped/stock |
+| Command template | Mapped cache ops/s | Stock PostgreSQL ops/s | Mapped/stock |
 |---|---:|---:|---:|
-| `SELECT *` | 126,169 | 67,017 | 1.88x |
-| Reordered projection | 120,354 | 62,733 | 1.92x |
-| Reordered composite predicates | 130,133 | 71,284 | 1.83x |
+| `SELECT * FROM public.pg_local_cache_whole_row_comparison WHERE tenant_id = 7 AND id = :key;` | 126,710 | 65,257 | 1.94x |
+| `SELECT metadata, payload, enabled, amount, note, id, tenant_id FROM public.pg_local_cache_whole_row_comparison WHERE tenant_id = 7 AND id = :key;` | 123,051 | 65,236 | 1.89x |
+| `SELECT payload, metadata, id, tenant_id FROM public.pg_local_cache_whole_row_comparison WHERE id = :key AND tenant_id = 7;` | 131,017 | 71,398 | 1.84x |
 
-The smoke job gates absolute 10,000 ops/s floors plus integrity and counter
-checks; its displayed mapped/stock ratios are non-gating. It is not release
-evidence or a capacity claim. Both tables are workload-specific shared-runner
-results; small hot rows and production hardware can behave differently.
+The AMD EPYC 7763 shared runner exposed four logical CPUs. The client and each
+server target had a two-CPU quota. The smoke used four clients, pipeline depth
+8, 128 keys, 128-byte text values, a prefilled working set, and one one-second
+repetition. Every timed mapped lookup was an exact cache hit with zero misses,
+fills, or bypasses. The absolute 10,000 ops/s floor, result integrity, and
+counter accounting gate CI; the displayed ratios do not. This is a regression
+smoke, not a capacity claim.
 
-The [evidence manifest](assets/benchmark-evidence/ee221410/README.md) records both
-original artifact digests and a stale-label caveat in the archived SQL-only
-metadata.
+The [evidence manifest](assets/benchmark-evidence/fe2d23c/README.md) records the
+artifact identity and digest.
 
 See [benchmark methodology](docs/BENCHMARKS.md) and
 [scenario definitions](benchmarks/SCENARIOS.md).
