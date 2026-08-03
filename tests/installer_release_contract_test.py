@@ -609,6 +609,19 @@ class ReleaseContracts(unittest.TestCase):
         self.assertIn('if resolved_existing="$(\n', source)
         self.assertIn('existing="$resolved_existing"', source)
 
+    def test_release_creation_avoids_cross_api_tag_propagation_race(self) -> None:
+        source = RELEASE.read_text(encoding="utf-8")
+        publish_start = source.index(
+            "- name: Publish immutable commit prerelease"
+        )
+        publish = source[publish_start:]
+        self.assertNotIn("--verify-tag", publish)
+        self.assertEqual(publish.count('--target "$RELEASE_SHA"'), 2)
+        self.assertIn('create_ref "$COMMIT_TAG"', publish)
+        self.assertIn('create_ref "$STABLE_TAG"', publish)
+        self.assertIn('gh release create "$COMMIT_TAG"', publish)
+        self.assertIn('gh release create "$STABLE_TAG"', publish)
+
     def test_binary_asset_scope_and_installer_are_explicit(self) -> None:
         workflow = RELEASE.read_text(encoding="utf-8")
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
