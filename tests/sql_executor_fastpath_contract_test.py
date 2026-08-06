@@ -274,6 +274,75 @@ class SqlExecutorFastPathContracts(unittest.TestCase):
         self.assertNotIn("lookup_type_cache", index_path)
         self.assertNotIn("pglc_sql_index_is_primary", SOURCE)
 
+    def test_scalar_array_fast_path_is_bounded_and_falls_back_atomically(self) -> None:
+        self.assertIn("#define PGLC_SQL_ARRAY_MAX_KEYS 1024", SOURCE)
+        matcher = c_function("pglc_sql_match_clauses")
+        for guard in (
+            "ScalarArrayOpExpr",
+            "operator->useOr",
+            "meta->key_count == 1",
+            "pglc_sql_array_expr_supported",
+            "PGLC_SQL_KEY_ARRAY",
+        ):
+            self.assertIn(guard, matcher)
+
+        index_path = c_function("pglc_sql_primary_index_path")
+        self.assertIn("index_info->amsearcharray", index_path)
+        self.assertIn("BTEqualStrategyNumber", index_path)
+
+        initialize = c_function("pglc_sql_array_initialize")
+        for contract in (
+            "element_count > PGLC_SQL_ARRAY_MAX_KEYS",
+            "qsort(state->array_keys",
+            "pglc_sql_array_lookup_key",
+            "state->array_use_child = true",
+            "pglc_cache_claim_load",
+        ):
+            self.assertIn(contract, initialize)
+        self.assertLess(
+            initialize.index("pglc_sql_array_lookup_key"),
+            initialize.index("state->array_use_child = true"),
+        )
+
+        access = c_function("pglc_sql_array_access")
+        self.assertIn("if (state->array_use_child)", access)
+        self.assertIn("pglc_sql_array_run_child(state)", access)
+        self.assertIn("pglc_note_sql_cache_hit()", access)
+
+        fallback = c_function("pglc_sql_array_run_child")
+        self.assertIn("ExecProcNode(child)", fallback)
+        self.assertIn("pglc_sql_maybe_store", fallback)
+        self.assertIn("pglc_sql_array_release_loads", fallback)
+
+        payload_slot = c_function("pglc_sql_init_array_payload_slot")
+        self.assertIn("MakeSingleTupleTableSlot", payload_slot)
+        self.assertIn("&TTSOpsVirtual", payload_slot)
+        payload_key = c_function("pglc_sql_array_payload_key")
+        self.assertIn("pglc_sql_init_array_payload_slot(state)", payload_key)
+
+    def test_array_hits_copy_composites_out_of_reusable_cache_storage(self) -> None:
+        self.assertIn(
+            "#define PGLC_SQL_ARRAY_DATA_BYTES (16 * 1024 * 1024)", SOURCE
+        )
+        copy = c_function("pglc_sql_array_copy_composite")
+        for guard in (
+            "HeapTupleHeaderGetDatumLength(source)",
+            "PGLC_SQL_ARRAY_DATA_BYTES - state->array_data_used",
+            "MemoryContextAllocExtended(",
+            "MCXT_ALLOC_NO_OOM",
+            "memcpy(copy, source, length)",
+        ):
+            self.assertIn(guard, copy)
+        lookup = c_function("pglc_sql_array_lookup_key")
+        self.assertGreaterEqual(
+            lookup.count("pglc_sql_array_copy_composite"), 2
+        )
+        self.assertIn("row_cache_entry->composite != (Datum) 0", lookup)
+        self.assertIn("JSON-only local entry", lookup)
+        self.assertGreaterEqual(
+            lookup.count("return PGLC_SQL_ARRAY_BYPASS"), 2
+        )
+
     def test_catalog_provenance_changes_bump_the_shared_generation(self) -> None:
         ddl = sql_function("_ddl_invalidate")
         for catalog in (
