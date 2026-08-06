@@ -338,6 +338,118 @@ def main() -> None:
             sql_cache_fills=1,
         )
 
+        # Ordinary IN / = ANY(array) queries use the same transparent tuple
+        # API.  A cold batch falls back atomically to PostgreSQL's scalar-array
+        # index scan and fills every returned key; the next batch is all-cache.
+        admin_sql(f"SELECT local_cache.invalidate('{namespace}')")
+        array_plan = app_sql(
+            f"EXPLAIN (COSTS OFF) SELECT value FROM {relation} "
+            "WHERE id IN (1, -1, 1, NULL)"
+        )
+        assert_custom_scan(array_plan)
+        assert "Lookup Mode: primary-key array" in array_plan, array_plan
+        before = stats()
+        literal_first = app_sql(
+            f"SELECT value FROM {relation} WHERE id IN (1, -1, 1, NULL)"
+        ).splitlines()
+        literal_second = app_sql(
+            f"SELECT value FROM {relation} WHERE id IN (1, -1, 1, NULL)"
+        ).splitlines()
+        assert sorted(literal_first) == ["minus-one", "one"], literal_first
+        assert sorted(literal_second) == ["minus-one", "one"], literal_second
+        assert_counter_delta(
+            before,
+            stats(),
+            sql_cache_hits=2,
+            sql_cache_misses=2,
+            sql_cache_fills=2,
+        )
+
+        # A generic prepared plan keeps the array as PARAM_EXTERN.  Duplicate
+        # and NULL elements retain PostgreSQL semantics: each table row appears
+        # at most once and NULL never creates a result row.
+        admin_sql(f"SELECT local_cache.invalidate('{namespace}')")
+        before = stats()
+        any_rows = app_script(
+            "SET plan_cache_mode = force_generic_plan;\n"
+            f"PREPARE pglc_any_{suffix}(bigint[]) AS "
+            f"SELECT value FROM {relation} WHERE id = ANY($1);\n"
+            f"EXECUTE pglc_any_{suffix}(ARRAY[1, -1, 1, NULL]::bigint[]);\n"
+            f"EXECUTE pglc_any_{suffix}(ARRAY[1, -1, 1, NULL]::bigint[]);\n"
+            f"DEALLOCATE pglc_any_{suffix};\n"
+        ).splitlines()
+        assert sorted(any_rows[:2]) == ["minus-one", "one"], any_rows
+        assert sorted(any_rows[2:]) == ["minus-one", "one"], any_rows
+        assert_counter_delta(
+            before,
+            stats(),
+            sql_cache_hits=2,
+            sql_cache_misses=2,
+            sql_cache_fills=2,
+        )
+
+        # Positive-only caching is deliberately all-or-nothing for transparent
+        # arrays.  One absent key makes the whole statement use PostgreSQL so a
+        # partial cache result can never duplicate or omit a row.
+        before = stats()
+        mixed_first = app_sql(
+            f"SELECT value FROM {relation} "
+            f"WHERE id = ANY(ARRAY[1, {missing_id}]::bigint[])"
+        ).splitlines()
+        mixed_second = app_sql(
+            f"SELECT value FROM {relation} "
+            f"WHERE id = ANY(ARRAY[1, {missing_id}]::bigint[])"
+        ).splitlines()
+        assert mixed_first == ["one"], mixed_first
+        assert mixed_second == ["one"], mixed_second
+        assert_counter_delta(before, stats(), sql_cache_misses=2)
+
+        # Empty and NULL arrays return no rows without touching cache counters.
+        before = stats()
+        assert (
+            app_sql(
+                f"SELECT value FROM {relation} "
+                "WHERE id = ANY(ARRAY[]::bigint[])"
+            )
+            == ""
+        )
+        assert (
+            app_sql(
+                f"SELECT value FROM {relation} "
+                "WHERE id = ANY(NULL::bigint[])"
+            )
+            == ""
+        )
+        assert_counter_delta(before, stats())
+
+        # local_cache.mget() keeps JSON in the backend-local row cache.  An
+        # ordinary tuple SELECT in the same backend must replace that local
+        # representation from the shared payload instead of treating JSON as a
+        # composite Datum.
+        admin_sql(f"SELECT local_cache.invalidate('{namespace}')")
+        before = stats()
+        json_then_tuple = app_script(
+            "SET plan_cache_mode = force_generic_plan;\n"
+            "SELECT array_to_json(local_cache.mget("
+            f"'{relation}'::regclass, ARRAY[1, -1]::bigint[]))::text;\n"
+            f"SELECT value FROM {relation} "
+            "WHERE id = ANY(ARRAY[1, -1]::bigint[]);\n"
+        ).splitlines()
+        assert json.loads(json_then_tuple[0]) == [
+            expected_row_json,
+            '{"id":-1,"value":"minus-one"}',
+        ], json_then_tuple
+        assert sorted(json_then_tuple[1:]) == ["minus-one", "one"], (
+            json_then_tuple
+        )
+        assert_counter_delta(
+            before,
+            stats(),
+            sql_cache_hits=2,
+            sql_cache_misses=2,
+            sql_cache_fills=2,
+        )
+
         admin_sql(f"SELECT local_cache.invalidate('{namespace}')")
         before = stats()
         batch_rows = app_script(
@@ -747,7 +859,8 @@ def main() -> None:
         )
 
         print(
-            "ok: transparent SQL cold fill/hit, Param and LIMIT 1, EXPLAIN, "
+            "ok: transparent SQL cold fill/hit, ordinary IN/ANY batches, "
+            "Param and LIMIT 1, EXPLAIN, "
             "GUC fallback, transactional read-your-writes/rollback, "
             "JSON GET/MGET, commit and inheritance invalidation, "
             "old-snapshot bypass, "
