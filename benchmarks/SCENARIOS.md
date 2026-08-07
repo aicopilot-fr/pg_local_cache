@@ -1,10 +1,12 @@
 # Benchmark workloads
 
 `benchmarks/run.sh` produces `whole-row.json` and `whole-row.md`. The report
-contains three independent measurements:
+contains four independent measurements:
 
 - full-row RESP `GET` against pg_local_cache, Valkey, and Redis;
-- ordinary primary-key SQL against mapped and stock PostgreSQL;
+- ordinary exact-primary-key SQL against mapped and stock PostgreSQL;
+- ordinary single-column-primary-key `IN` SQL against mapped and stock
+  PostgreSQL;
 - a pg_local_cache RESP payload-width sweep.
 
 The separate SQL-only release runner compares `local_cache.mget()` with an
@@ -29,6 +31,7 @@ PGLC_BENCH_CONCURRENCY=16 \
 PGLC_BENCH_PIPELINE=32 \
 PGLC_BENCH_KEYS=16384 \
 PGLC_BENCH_ROW_VALUE_SIZE=512 \
+PGLC_BENCH_ROW_SQL_IN_KEYS=32 \
 PGLC_BENCH_ROW_PAYLOAD_SIZES=64,512,2048 \
 bash benchmarks/run.sh
 ```
@@ -36,11 +39,13 @@ bash benchmarks/run.sh
 Independent regression floors:
 
 - `PGLC_BENCH_ROW_RESP_MIN_OPS` for full-row RESP;
-- `PGLC_BENCH_ROW_SQL_MIN_OPS` for ordinary SQL;
+- `PGLC_BENCH_ROW_SQL_MIN_OPS` for exact-key ordinary SQL;
+- `PGLC_BENCH_ROW_SQL_IN_MIN_OPS` for ordinary SQL `IN` key throughput;
 - `PGLC_BENCH_ROW_WIDTH_MIN_OPS` for the payload-width sweep.
 
-The RESP and SQL floors default to 10,000 operations per second. Width has no
-default floor because response sizes are deliberately different.
+The RESP, scalar SQL, and SQL `IN` floors default to 10,000 operations per
+second. `PGLC_BENCH_ROW_SQL_IN_KEYS` defaults to 32 and is capped at 1,024.
+Width has no default floor because response sizes are deliberately different.
 
 ## Full-row RESP
 
@@ -69,6 +74,25 @@ Mapped and stock PostgreSQL receive identical parameterized queries:
 
 Each operation is one successful `SELECT`, not one pipeline batch. Reports
 retain failed-batch counts and exact pg_local_cache counter deltas.
+
+### Ordinary SQL `IN` / `ANY`
+
+A separate table uses one `bigint` primary key. The mapped and stock servers
+receive the same prepared 32-key statement:
+
+```sql
+SELECT *
+FROM public.pg_local_cache_whole_row_select_in_comparison
+WHERE id IN ((:key_0)::bigint, ..., (:key_31)::bigint);
+```
+
+Each generated statement uses distinct contiguous keys. The report therefore
+counts resolved key rows as `batch TPS × pipeline × keys per statement` and
+also records statements/s. Before timing, the complete mapped keyspace must
+produce one hit per row with no misses, fills, or bypasses. The measured mapped
+window has the same strict counter contract. Any mixed hit/miss statement is a
+correctness case, not a warm-throughput sample: the executor runs the complete
+PostgreSQL child plan instead of merging partial results.
 
 Run the SQL-only comparison for prepared and unnamed extended protocols:
 
@@ -99,6 +123,7 @@ tests rather than folded into warm-cache throughput.
 - Treat CI smoke runs as regression checks, not hardware-independent rankings.
 - Publish the raw JSON, source revision, image identities, CPU model, resource
   limits, duration, repetitions, and coefficient of variation.
-- Compare throughput only within the same protocol and workload.
+- Compare throughput only within the same protocol and workload; do not
+  compare SQL `IN` key ops/s directly with scalar statements/s.
 - Compare latency from the dedicated scalar-key pass; batch latency is not
   single-key latency.

@@ -82,7 +82,9 @@ class PagesSourceContracts(unittest.TestCase):
         )
         self.assertIn("SELECT local_cache.mget(", hero)
         self.assertIn("$1::bigint[]", hero)
-        self.assertNotIn("SELECT * FROM public.items", hero)
+        self.assertIn(
+            "SELECT * FROM public.items WHERE id = ANY($1::bigint[]);", hero
+        )
         key_array = "ARRAY[" + ", ".join(
             f":key_{index}" for index in range(32)
         ) + "]::bigint[]"
@@ -133,6 +135,8 @@ class PagesSourceContracts(unittest.TestCase):
             "SELECT payload, metadata, id, tenant_id FROM public."
             "pg_local_cache_whole_row_comparison WHERE id = :key AND "
             "tenant_id = 7;",
+                   "SELECT * FROM public.pg_local_cache_whole_row_select_in_comparison "
+            "WHERE id IN ((:key_0)::bigint, (:key_1)::bigint, (:key_2)::bigint, (:key_3)::bigint, (:key_4)::bigint, (:key_5)::bigint, (:key_6)::bigint, (:key_7)::bigint, (:key_8)::bigint, (:key_9)::bigint, (:key_10)::bigint, (:key_11)::bigint, (:key_12)::bigint, (:key_13)::bigint, (:key_14)::bigint, (:key_15)::bigint, (:key_16)::bigint, (:key_17)::bigint, (:key_18)::bigint, (:key_19)::bigint, (:key_20)::bigint, (:key_21)::bigint, (:key_22)::bigint, (:key_23)::bigint, (:key_24)::bigint, (:key_25)::bigint, (:key_26)::bigint, (:key_27)::bigint, (:key_28)::bigint, (:key_29)::bigint, (:key_30)::bigint, (:key_31)::bigint);",
         )
         key_array = "ARRAY[" + ", ".join(
             f":key_{index}" for index in range(32)
@@ -196,6 +200,34 @@ class PagesSourceContracts(unittest.TestCase):
             '{"id":1,"tenant_id":7}',
             benchmarks,
         )
+
+    def test_docs_explain_transparent_select_in_and_its_benchmark(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        technical = (ROOT / "docs" / "TECHNICAL.md").read_text(
+            encoding="utf-8"
+        )
+        benchmarks = (ROOT / "docs" / "BENCHMARKS.md").read_text(
+            encoding="utf-8"
+        )
+        scenarios = (ROOT / "benchmarks" / "SCENARIOS.md").read_text(
+            encoding="utf-8"
+        )
+        homepage = (ROOT / "index.html").read_text(encoding="utf-8")
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+        for source in (readme, technical, homepage):
+            self.assertIn("id = ANY($1::bigint[])", source)
+        for source in (benchmarks, scenarios, ci):
+            self.assertIn("PGLC_BENCH_ROW_SQL_IN_KEYS", source)
+            self.assertIn("PGLC_BENCH_ROW_SQL_IN_MIN_OPS", source)
+        for source in (readme, technical, benchmarks, scenarios):
+            self.assertIn("1,024", source)
+        self.assertIn("all-or-nothing", readme)
+        self.assertIn("never merges a partial cache result", technical)
+        self.assertIn("Mapped key ops/s", (ROOT / "benchmarks" / "whole_row.py").read_text())
+        self.assertIn("schema version 3", benchmarks)
 
     def test_public_pages_use_browser_release_downloads(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
