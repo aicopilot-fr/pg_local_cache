@@ -18,7 +18,7 @@ primary-key fast path, not a general query cache.
 
 | Capability | Behavior |
 |---|---|
-| Native tuple API | Ordinary primary-key `SELECT` returns the table row type and supports normal SQL projection. |
+| Native tuple API | Ordinary primary-key `SELECT` returns the table row type; single-column `IN`/`ANY` batches keep normal SQL row-set semantics. |
 | Batch JSON API | `local_cache.get()` and `local_cache.mget()` provide ordered whole-row JSON for KV-style callers. |
 | Whole rows | Each entry stores one versioned PostgreSQL composite row. |
 | Transactional invalidation | `INSERT`, `UPDATE`, `DELETE`, and `TRUNCATE` fence affected entries before commit visibility. |
@@ -72,10 +72,17 @@ the caller:
 SELECT * FROM public.items WHERE id = $1::bigint;
 
 SELECT value, metadata FROM public.items WHERE id = $1::bigint;
+
+SELECT * FROM public.items WHERE id IN (1, 7, 42);
+
+SELECT value, metadata
+FROM public.items
+WHERE id = ANY($1::bigint[]);
 ```
 
-Supported exact-primary-key reads can use `Custom Scan (pg_local_cache_sql)`;
-the row shape and zero-or-one-row semantics remain ordinary PostgreSQL:
+Supported exact-primary-key reads and bounded single-column primary-key
+batches can use `Custom Scan (pg_local_cache_sql)`; result rows and projection
+remain ordinary PostgreSQL:
 
 ```sql
 EXPLAIN (ANALYZE, COSTS OFF)
@@ -111,6 +118,22 @@ SELECT * FROM public.tenant_items
 WHERE item_id = 42::bigint AND tenant_id = 'tenant-a';
 ```
 
+For a single-column primary key, ordinary SQL can read a set of keys without
+calling a cache function:
+
+```sql
+SELECT * FROM public.items WHERE id IN (42, 7, 99);
+
+SELECT id, value
+FROM public.items
+WHERE id = ANY($1::bigint[]);
+```
+
+This remains a PostgreSQL row set: duplicate and `NULL` array elements do not
+create duplicate rows, ordering is not implied, and a missing key contributes
+no row. Use `local_cache.mget()` only when the caller needs an ordered JSON
+array aligned with its input positions.
+
 KV-style callers can opt into the JSON scalar and ordered batch functions:
 
 ```sql
@@ -131,12 +154,18 @@ The SQL fast path accepts:
 
 - one attached permanent table without inheritance, partitioning, or RLS;
 - equality predicates for every primary-key column, including composite keys;
-- constants or external parameters;
+- or `IN` / `= ANY(array)` on a single-column primary key;
+- constants or external parameters, including an external array parameter;
 - `SELECT *` or direct column projections, including aliases and reordered
   projections;
-- no limit, or a constant `LIMIT 1`.
+- no limit, or a constant `LIMIT 1` for scalar lookup; array lookup has no `LIMIT`.
 
-Unsupported query shapes use PostgreSQL's normal plan. So do
+The transparent array path is deliberately all-or-nothing. It accepts at most
+1,024 input elements and 16 MiB of query-local copied tuple data. If any key is
+missing, snapshot-ineligible, malformed, or outside those bounds, PostgreSQL
+executes the original full `IN`/`ANY` index plan. Cached and source rows are
+never merged partially. Composite tuple `IN`, additional filters, `ALL`, and
+non-equality operators use PostgreSQL's normal plan. So do
 `REPEATABLE READ`, `SERIALIZABLE`, recovery, and reads after the current
 transaction writes an attached table. A nonexistent key returns the normal
 empty SQL result after consulting the source table.
@@ -215,6 +244,13 @@ passed every current regression gate. Exact primary-key `SELECT` measured
 measured 64,954 prepared and 66,156 unnamed-extended key ops/s: 10.30x and
 10.39x the stock batch query in that profile.
 
+New `benchmarks/run.sh` executions also compare an identical 32-key ordinary
+`SELECT ... IN (...)` on mapped and stock PostgreSQL. The report publishes both
+key ops/s and statements/s and rejects a mapped result unless every returned key
+is a cache hit with zero timed misses, fills, or bypasses. The preserved
+`fe2d23c` evidence predates that lane and remains the source for the numeric
+results above.
+
 These shared-runner smokes detect regressions; they are not capacity claims.
 See the [benchmark methodology and exact commands](docs/BENCHMARKS.md), the
 [scenario definitions](benchmarks/SCENARIOS.md), and the preserved
@@ -242,6 +278,8 @@ Older reviewed versions remain available on the
 - Permanent, non-partitioned tables with a supported primary key; no views,
   inheritance, or RLS.
 - Encoded cache entries are limited to 8 KiB; oversized rows use PostgreSQL.
+- Transparent single-column `IN`/`ANY` accepts at most 1,024 elements and 16 MiB
+  of query-local tuple copies; larger or mixed-safe batches use PostgreSQL.
 - At most 128 mappings and 16 primary-key columns per mapping.
 - No TTL, Redis Cluster, Lua, Pub/Sub, multi-primary, or standby cache serving.
 - RESP authentication is a shared-token boundary, not PostgreSQL user

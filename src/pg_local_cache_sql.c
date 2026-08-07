@@ -64,6 +64,7 @@ PG_FUNCTION_INFO_V1(pg_local_cache_sql_mget);
  * This is intentionally a narrow transparent fast path.  It recognizes only
  *
  *     SELECT <direct columns> FROM mapped_table WHERE primary_key = Const/$1
+ *     SELECT <direct columns> FROM mapped_table WHERE primary_key = ANY(array)
  *
  * and wraps the exact primary-key IndexPath PostgreSQL would otherwise use.
  * The original IndexScan remains a child and is used for every miss or safety
@@ -77,6 +78,8 @@ PG_FUNCTION_INFO_V1(pg_local_cache_sql_mget);
 #define PGLC_SQL_ROW_CACHE_ENTRIES \
 	(PGLC_SQL_ROW_CACHE_SETS * PGLC_SQL_ROW_CACHE_WAYS)
 #define PGLC_SQL_ROW_CACHE_DATA_BYTES (16 * 1024 * 1024)
+#define PGLC_SQL_ARRAY_MAX_KEYS 1024
+#define PGLC_SQL_ARRAY_DATA_BYTES (16 * 1024 * 1024)
 
 #define PGLC_PRIVATE_NAMESPACE 0
 #define PGLC_PRIVATE_RELATION 1
@@ -89,8 +92,33 @@ PG_FUNCTION_INFO_V1(pg_local_cache_sql_mget);
 #define PGLC_PRIVATE_ROW_NATTS 8
 #define PGLC_PRIVATE_ROW_FINGERPRINT 9
 #define PGLC_PRIVATE_RELATION_VALIDATION 10
-#define PGLC_PRIVATE_KEY_EXPRS 11
-#define PGLC_PRIVATE_PLAN_ITEMS 11
+#define PGLC_PRIVATE_KEY_MODE 11
+#define PGLC_PRIVATE_KEY_EXPRS 12
+#define PGLC_PRIVATE_PLAN_ITEMS 12
+
+typedef enum PgLocalCacheSqlKeyMode
+{
+	PGLC_SQL_KEY_SCALAR = 1,
+	PGLC_SQL_KEY_ARRAY = 2
+} PgLocalCacheSqlKeyMode;
+
+typedef enum PgLocalCacheSqlArrayLookup
+{
+	PGLC_SQL_ARRAY_HIT = 1,
+	PGLC_SQL_ARRAY_MISS,
+	PGLC_SQL_ARRAY_BYPASS
+} PgLocalCacheSqlArrayLookup;
+
+typedef struct PgLocalCacheSqlArrayKey
+{
+	char	   *canonical_key;
+	Size		canonical_key_len;
+	Datum		composite;
+	PgLocalCacheReadToken token;
+	uint64		load_id;
+	bool		cached;
+	bool		claimable;
+} PgLocalCacheSqlArrayKey;
 
 typedef struct PgLocalCacheSqlMeta
 {
@@ -119,6 +147,7 @@ typedef struct PgLocalCacheSqlScanState
 	int			child_eflags;
 	List	   *key_exprs;
 	TupleTableSlot *latest_slot;
+	TupleTableSlot *array_payload_slot;
 	char	   *cache_buffer;
 	PgLocalCacheMapping mapping;
 	FmgrInfo	key_outputs[PGLC_MAX_KEY_COLUMNS];
@@ -134,6 +163,14 @@ typedef struct PgLocalCacheSqlScanState
 	int			child_payload_resno;
 	int			child_ctid_resno;
 	int			child_xmin_resno;
+	PgLocalCacheSqlKeyMode key_mode;
+	MemoryContext array_context;
+	PgLocalCacheSqlArrayKey *array_keys;
+	Size		array_data_used;
+	int			array_key_count;
+	int			array_result_index;
+	bool		array_initialized;
+	bool		array_use_child;
 	bool		runtime_valid;
 	bool		done;
 	uint64		hits;
@@ -227,6 +264,7 @@ static void pglc_sql_rescan(CustomScanState *node);
 static void pglc_sql_explain(CustomScanState *node, List *ancestors,
 								 ExplainState *es);
 static void pglc_sql_relcache_invalidation(Datum argument, Oid relation_oid);
+static Node *pglc_sql_strip_relabels(Node *node);
 
 static const CustomPathMethods pglc_sql_path_methods = {
 	.CustomName = PGLC_SQL_CUSTOM_NAME,
@@ -1283,6 +1321,50 @@ pglc_sql_coerce_key_expr(Expr *expression, Oid key_type, int32 key_typmod)
 	return (Expr *) coerced;
 }
 
+static bool
+pglc_sql_array_expr_supported(Node *node)
+{
+	ListCell   *cell;
+
+	node = pglc_sql_strip_relabels(node);
+	if (IsA(node, Const))
+		return true;
+	if (IsA(node, Param))
+		return ((Param *) node)->paramkind == PARAM_EXTERN;
+	if (!IsA(node, ArrayExpr))
+		return false;
+
+	foreach(cell, ((ArrayExpr *) node)->elements)
+	{
+		Node	   *element = pglc_sql_strip_relabels((Node *) lfirst(cell));
+
+		if (IsA(element, Const))
+			continue;
+		if (IsA(element, Param) &&
+			((Param *) element)->paramkind == PARAM_EXTERN)
+			continue;
+		return false;
+	}
+	return true;
+}
+
+static Expr *
+pglc_sql_coerce_array_expr(Expr *expression, Oid key_type)
+{
+	Oid			source_type = exprType((Node *) expression);
+	Oid			target_type = get_array_type(key_type);
+	Node	   *coerced;
+
+	if (!OidIsValid(target_type))
+		return NULL;
+	if (source_type == target_type)
+		return expression;
+	coerced = coerce_to_target_type(NULL, (Node *) expression,
+								 source_type, target_type, -1,
+								 COERCION_IMPLICIT, COERCE_IMPLICIT_CAST, -1);
+	return (Expr *) coerced;
+}
+
 static Node *
 pglc_sql_strip_relabels(Node *node)
 {
@@ -1318,11 +1400,54 @@ pglc_sql_key_var(Node *operand, Index rti, const PgLocalCacheSqlMeta *meta)
 static bool
 pglc_sql_match_clauses(RelOptInfo *rel, Index rti,
 					   const PgLocalCacheSqlMeta *meta,
-					   RestrictInfo **restrict_infos, List **key_exprs)
+					   RestrictInfo **restrict_infos, List **key_exprs,
+					   PgLocalCacheSqlKeyMode *key_mode)
 {
 	ListCell   *cell;
 	Expr	   *ordered_exprs[PGLC_MAX_KEY_COLUMNS];
 	int			key_index;
+
+	if (meta->key_count == 1 && list_length(rel->baserestrictinfo) == 1)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) linitial(rel->baserestrictinfo);
+
+		if (IsA(rinfo, RestrictInfo) && !rinfo->pseudoconstant &&
+			IsA(rinfo->clause, ScalarArrayOpExpr))
+		{
+			ScalarArrayOpExpr *operator =
+				(ScalarArrayOpExpr *) rinfo->clause;
+			Node	   *left;
+			Expr	   *array_expr;
+			Expr	   *coerced_array;
+			Oid			array_type;
+			Oid			element_type;
+
+			if (!operator->useOr || list_length(operator->args) != 2)
+				return false;
+			left = (Node *) linitial(operator->args);
+			array_expr = (Expr *) lsecond(operator->args);
+			if (pglc_sql_key_var(left, rti, meta) != 0 ||
+				!pglc_sql_array_expr_supported((Node *) array_expr))
+				return false;
+
+			array_type = exprType((Node *) array_expr);
+			element_type = get_element_type(array_type);
+			if (!OidIsValid(element_type) ||
+				!pglc_sql_key_input_supported(meta->key_types[0], element_type))
+				return false;
+			coerced_array = pglc_sql_coerce_array_expr(
+				array_expr, meta->key_types[0]);
+			if (coerced_array == NULL)
+				return false;
+
+			MemSet(restrict_infos, 0,
+					sizeof(RestrictInfo *) * PGLC_MAX_KEY_COLUMNS);
+			restrict_infos[0] = rinfo;
+			*key_exprs = list_make1(coerced_array);
+			*key_mode = PGLC_SQL_KEY_ARRAY;
+			return true;
+		}
+	}
 
 	if (list_length(rel->baserestrictinfo) != meta->key_count)
 		return false;
@@ -1388,6 +1513,7 @@ pglc_sql_match_clauses(RelOptInfo *rel, Index rti,
 			return false;
 		*key_exprs = lappend(*key_exprs, ordered_exprs[key_index]);
 	}
+	*key_mode = PGLC_SQL_KEY_SCALAR;
 	return true;
 }
 
@@ -1427,48 +1553,64 @@ pglc_sql_primary_index_path(PlannerInfo *root, RelOptInfo *rel,
 		for (key_index = 0; key_index < meta->key_count; key_index++)
 		{
 			RestrictInfo *rinfo = restrict_infos[key_index];
-			RestrictInfo *indexqual_rinfo;
-			OpExpr	  *operator = (OpExpr *) rinfo->clause;
-			Node	  *left = (Node *) linitial(operator->args);
-			Node	  *right = (Node *) lsecond(operator->args);
-			Oid			index_operator;
+			RestrictInfo *indexqual_rinfo = rinfo;
+			Oid			index_operator = InvalidOid;
+			Oid			input_collation = InvalidOid;
 			IndexClause *index_clause;
 
 			if (!OidIsValid(meta->key_btree_opfamilies[key_index]) ||
 				index_info->indexkeys[key_index] !=
 					meta->key_attnos[key_index] ||
 				index_info->opfamily[key_index] !=
-					meta->key_btree_opfamilies[key_index] ||
-				(index_info->indexcollations[key_index] != InvalidOid &&
-				 index_info->indexcollations[key_index] !=
-				 operator->inputcollid))
+					meta->key_btree_opfamilies[key_index])
 			{
 				matches = false;
 				break;
 			}
 
-			if (match_index_to_operand(left, key_index, index_info))
+			if (IsA(rinfo->clause, OpExpr))
 			{
-				index_operator = operator->opno;
-				indexqual_rinfo = rinfo;
+				OpExpr	  *operator = (OpExpr *) rinfo->clause;
+				Node	  *left = (Node *) linitial(operator->args);
+				Node	  *right = (Node *) lsecond(operator->args);
+
+				input_collation = operator->inputcollid;
+				if (match_index_to_operand(left, key_index, index_info))
+					index_operator = operator->opno;
+				else if (match_index_to_operand(right, key_index, index_info))
+				{
+					index_operator = get_commutator(operator->opno);
+					if (OidIsValid(index_operator))
+						indexqual_rinfo = commute_restrictinfo(
+							rinfo, index_operator);
+				}
 			}
-			else if (match_index_to_operand(right, key_index, index_info))
+			else if (IsA(rinfo->clause, ScalarArrayOpExpr))
 			{
-				index_operator = get_commutator(operator->opno);
-				if (!OidIsValid(index_operator))
+				ScalarArrayOpExpr *operator =
+					(ScalarArrayOpExpr *) rinfo->clause;
+				Node	  *left = (Node *) linitial(operator->args);
+
+				if (meta->key_count != 1 || key_index != 0 ||
+					!operator->useOr || !index_info->amsearcharray ||
+					!match_index_to_operand(left, key_index, index_info))
 				{
 					matches = false;
 					break;
 				}
-				indexqual_rinfo = commute_restrictinfo(rinfo,
-												 index_operator);
+				index_operator = operator->opno;
+				input_collation = operator->inputcollid;
 			}
 			else
 			{
 				matches = false;
 				break;
 			}
-			if (get_op_opfamily_strategy(index_operator,
+
+			if (!OidIsValid(index_operator) ||
+				(index_info->indexcollations[key_index] != InvalidOid &&
+				 index_info->indexcollations[key_index] != input_collation) ||
+				get_op_opfamily_strategy(index_operator,
 									 meta->key_btree_opfamilies[key_index]) !=
 				BTEqualStrategyNumber)
 			{
@@ -1535,6 +1677,7 @@ pglc_sql_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	List	   *key_attnos = NIL;
 	List	   *key_types = NIL;
 	List	   *key_typmods = NIL;
+	PgLocalCacheSqlKeyMode key_mode;
 	uint64		relation_validation_token;
 	int			key_index;
 
@@ -1560,7 +1703,9 @@ pglc_sql_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	}
 	if (!pglc_sql_targets_supported(root->parse, rti, relation) ||
 		!pglc_sql_match_clauses(rel, rti, &meta, restrict_infos,
-							   &key_exprs))
+							   &key_exprs, &key_mode) ||
+		(key_mode == PGLC_SQL_KEY_ARRAY &&
+		 root->parse->limitCount != NULL))
 	{
 		table_close(relation, NoLock);
 		return;
@@ -1596,6 +1741,7 @@ pglc_sql_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	private = lappend(private, pglc_sql_int8_const(meta.row_fingerprint));
 	private = lappend(private,
 		pglc_sql_int8_const(relation_validation_token));
+	private = lappend(private, makeInteger((int) key_mode));
 	private = lappend(private, key_exprs);
 
 	custom_path = makeNode(CustomPath);
@@ -1609,7 +1755,9 @@ pglc_sql_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	custom_path->path.rows = index_path->path.rows;
 	custom_path->path.startup_cost = 0;
 	custom_path->path.total_cost = Min(index_path->path.total_cost,
-									 cpu_operator_cost + cpu_tuple_cost);
+									 cpu_operator_cost +
+									 Max(1.0, index_path->path.rows) *
+									 cpu_tuple_cost);
 	custom_path->path.pathkeys = NIL;
 	custom_path->flags = 0;
 	custom_path->custom_paths = list_make1(index_path);
@@ -1862,6 +2010,11 @@ pglc_sql_begin(CustomScanState *node, EState *estate, int eflags)
 									   PGLC_PRIVATE_KEY_COUNT));
 	Assert(state->key_count >= 1 &&
 		   state->key_count <= PGLC_MAX_KEY_COLUMNS);
+	state->key_mode = (PgLocalCacheSqlKeyMode)
+		intVal(list_nth(scan->custom_private, PGLC_PRIVATE_KEY_MODE));
+	Assert(state->key_mode == PGLC_SQL_KEY_SCALAR ||
+		   state->key_mode == PGLC_SQL_KEY_ARRAY);
+	Assert(state->key_mode != PGLC_SQL_KEY_ARRAY || state->key_count == 1);
 	Assert(list_length(scan->custom_exprs) == state->key_count);
 	state->row_type_oid = pglc_sql_private_oid(scan->custom_private,
 										 PGLC_PRIVATE_ROW_TYPE);
@@ -1940,9 +2093,20 @@ pglc_sql_begin(CustomScanState *node, EState *estate, int eflags)
 		state->key_exprs = lappend(state->key_exprs,
 			ExecInitExpr((Expr *) lfirst(cell), &state->css.ss.ps));
 	state->latest_slot = NULL;
+	state->array_payload_slot = NULL;
+	state->array_context = NULL;
+	if (state->key_mode == PGLC_SQL_KEY_ARRAY)
+		state->array_context = AllocSetContextCreate(
+			estate->es_query_cxt, "pg_local_cache SQL IN keys",
+			ALLOCSET_DEFAULT_SIZES);
+	state->array_keys = NULL;
+	state->array_data_used = 0;
+	state->array_key_count = 0;
+	state->array_result_index = 0;
+	state->array_initialized = false;
+	state->array_use_child = false;
 	state->runtime_valid = pglc_sql_validate_runtime(state, scan);
 	state->done = false;
-	(void) estate;
 }
 
 static bool
@@ -2655,6 +2819,23 @@ pglc_sql_init_latest_slot(PgLocalCacheSqlScanState *state)
 	return state->latest_slot;
 }
 
+static TupleTableSlot *
+pglc_sql_init_array_payload_slot(PgLocalCacheSqlScanState *state)
+{
+	if (state->array_payload_slot == NULL)
+	{
+		MemoryContext old_context;
+
+		Assert(state->key_mode == PGLC_SQL_KEY_ARRAY);
+		old_context = MemoryContextSwitchTo(
+			state->css.ss.ps.state->es_query_cxt);
+		state->array_payload_slot = MakeSingleTupleTableSlot(
+			state->mapping.row_desc, &TTSOpsVirtual);
+		MemoryContextSwitchTo(old_context);
+	}
+	return state->array_payload_slot;
+}
+
 static bool
 pglc_sql_maybe_store(PgLocalCacheSqlScanState *state,
 					 const char *canonical_key,
@@ -2777,6 +2958,442 @@ pglc_sql_run_child(PgLocalCacheSqlScanState *state, const char *canonical_key,
 	return (TupleTableSlot *) result;
 }
 
+static int
+pglc_sql_array_key_compare(const void *left, const void *right)
+{
+	const PgLocalCacheSqlArrayKey *left_key =
+		(const PgLocalCacheSqlArrayKey *) left;
+	const PgLocalCacheSqlArrayKey *right_key =
+		(const PgLocalCacheSqlArrayKey *) right;
+
+	return strcmp(left_key->canonical_key, right_key->canonical_key);
+}
+
+static PgLocalCacheSqlArrayKey *
+pglc_sql_array_find_key(PgLocalCacheSqlScanState *state,
+						const char *canonical_key)
+{
+	int			low = 0;
+	int			high = state->array_key_count;
+
+	while (low < high)
+	{
+		int			middle = low + (high - low) / 2;
+		int			comparison = strcmp(
+			canonical_key, state->array_keys[middle].canonical_key);
+
+		if (comparison < 0)
+			high = middle;
+		else if (comparison > 0)
+			low = middle + 1;
+		else
+			return &state->array_keys[middle];
+	}
+	return NULL;
+}
+
+static void
+pglc_sql_array_release_loads(PgLocalCacheSqlScanState *state)
+{
+	int			key_index;
+
+	for (key_index = 0; key_index < state->array_key_count; key_index++)
+	{
+		PgLocalCacheSqlArrayKey *key = &state->array_keys[key_index];
+
+		if (key->load_id == 0)
+			continue;
+		pglc_cache_release_load(
+			&state->mapping, key->canonical_key, &key->token, key->load_id);
+		key->load_id = 0;
+	}
+}
+
+static void
+pglc_sql_array_reset(PgLocalCacheSqlScanState *state)
+{
+	if (state->key_mode != PGLC_SQL_KEY_ARRAY)
+		return;
+	pglc_sql_array_release_loads(state);
+	if (state->array_context != NULL)
+		MemoryContextReset(state->array_context);
+	state->array_keys = NULL;
+	state->array_data_used = 0;
+	state->array_key_count = 0;
+	state->array_result_index = 0;
+	state->array_initialized = false;
+	state->array_use_child = false;
+}
+
+static Datum
+pglc_sql_array_copy_composite(PgLocalCacheSqlScanState *state,
+							  Datum composite)
+{
+	HeapTupleHeader source;
+	HeapTupleHeader copy;
+	Size		length;
+
+	if (composite == (Datum) 0)
+		return (Datum) 0;
+	source = DatumGetHeapTupleHeader(composite);
+	if (!PointerIsValid(source) || !VARATT_IS_4B_U(source) ||
+		(source->t_infomask & HEAP_HASEXTERNAL) != 0)
+		return (Datum) 0;
+	length = HeapTupleHeaderGetDatumLength(source);
+	if (length < SizeofHeapTupleHeader ||
+		state->array_data_used >= PGLC_SQL_ARRAY_DATA_BYTES ||
+		length > PGLC_SQL_ARRAY_DATA_BYTES - state->array_data_used)
+		return (Datum) 0;
+	copy = (HeapTupleHeader) MemoryContextAllocExtended(
+		state->array_context, length, MCXT_ALLOC_NO_OOM);
+	if (copy == NULL)
+		return (Datum) 0;
+	memcpy(copy, source, length);
+	state->array_data_used += length;
+	return PointerGetDatum(copy);
+}
+
+static PgLocalCacheSqlArrayLookup
+pglc_sql_array_lookup_key(PgLocalCacheSqlScanState *state,
+						  PgLocalCacheSqlArrayKey *key)
+{
+	uint64		data_epoch = pglc_data_epoch();
+	uint64		row_cache_hash = pglc_sql_row_cache_hash(
+		pglc_sql_row_cache_hash_seed(&state->mapping), key->canonical_key,
+		key->canonical_key_len);
+	PgLocalCacheSqlRowCacheEntry *row_cache_entry;
+	PgLocalCacheSourceVisibility visibility = PGLC_SOURCE_SNAPSHOT_REJECTED;
+	Size		cached_len;
+	bool		negative = false;
+	TransactionId source_xmin = InvalidTransactionId;
+	PgLocalCacheReadToken token;
+	bool		hit = false;
+	int			lookup_attempt;
+
+	key->cached = false;
+	key->claimable = false;
+	row_cache_entry = pglc_sql_row_cache_lookup(
+		&state->mapping, key->canonical_key, key->canonical_key_len,
+		row_cache_hash, data_epoch);
+	if (row_cache_entry != NULL)
+	{
+		visibility = pglc_sql_source_visibility(
+			row_cache_entry->source_xmin,
+			row_cache_entry->source_observed_full_xid,
+			state->css.ss.ps.state->es_snapshot);
+		if (visibility == PGLC_SOURCE_VISIBLE &&
+			row_cache_entry->composite != (Datum) 0)
+		{
+			key->composite = pglc_sql_array_copy_composite(
+				state, row_cache_entry->composite);
+			if (key->composite == (Datum) 0)
+				return PGLC_SQL_ARRAY_BYPASS;
+			key->cached = true;
+			return PGLC_SQL_ARRAY_HIT;
+		}
+		/* A JSON-only local entry cannot satisfy an ordinary tuple SELECT. */
+		if (visibility == PGLC_SOURCE_VISIBLE ||
+			visibility == PGLC_SOURCE_AGE_EXPIRED)
+			pglc_sql_row_cache_discard(row_cache_entry);
+	}
+
+	for (lookup_attempt = 0; lookup_attempt < 2; lookup_attempt++)
+	{
+		hit = pglc_cache_lookup_quiet(
+			&state->mapping, key->canonical_key,
+			state->cache_buffer, PGLC_VALUE_MAX, &cached_len,
+			&negative, &source_xmin, &token);
+		key->token = token;
+		if (!hit || negative)
+			break;
+
+		visibility = pglc_sql_source_visibility(
+			source_xmin, token.source_observed_full_xid,
+			state->css.ss.ps.state->es_snapshot);
+		if (visibility == PGLC_SOURCE_VISIBLE)
+		{
+			PgLocalCacheRowPayloadView view;
+			Datum		composite = (Datum) 0;
+
+			if (!pglc_sql_row_cache_store(
+					&state->mapping,
+					RelationGetDescr(state->css.ss.ss_currentRelation),
+					state->row_fingerprint, key->canonical_key,
+					key->canonical_key_len, row_cache_hash,
+					state->cache_buffer, cached_len, source_xmin, &token,
+					false, &composite) &&
+				pglc_row_payload_decode_in_place(
+					state->cache_buffer, cached_len,
+					RelationGetDescr(state->css.ss.ss_currentRelation),
+					state->row_fingerprint, &view))
+				composite = view.composite;
+			if (composite != (Datum) 0)
+			{
+				/* Later batch probes may evict the local entry; keep a query copy. */
+				key->composite = pglc_sql_array_copy_composite(
+					state, composite);
+				if (key->composite == (Datum) 0)
+					return PGLC_SQL_ARRAY_BYPASS;
+				key->cached = true;
+				return PGLC_SQL_ARRAY_HIT;
+			}
+			/* Corruption or stale row shape is never exposed to SQL. */
+		}
+		if (lookup_attempt != 0 ||
+			(visibility != PGLC_SOURCE_AGE_EXPIRED &&
+			 visibility != PGLC_SOURCE_VISIBLE))
+			break;
+
+		(void) pglc_cache_retire_positive(
+			&state->mapping, key->canonical_key, &token, source_xmin);
+	}
+
+	key->claimable = !hit;
+	return PGLC_SQL_ARRAY_MISS;
+}
+
+static void
+pglc_sql_array_bypass(PgLocalCacheSqlScanState *state)
+{
+	state->array_use_child = true;
+	state->bypasses++;
+	pglc_note_sql_cache_bypass();
+}
+
+static void
+pglc_sql_array_initialize(PgLocalCacheSqlScanState *state)
+{
+	ExprContext *econtext = state->css.ss.ps.ps_ExprContext;
+	ExprState  *array_expr;
+	Datum		array_datum;
+	bool		array_isnull;
+	ArrayType  *array;
+	Datum	   *elements;
+	bool	   *nulls;
+	int			element_count;
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+	MemoryContext old_context;
+	int			read_index;
+	int			write_index;
+	bool		all_cached = true;
+
+	Assert(state->key_mode == PGLC_SQL_KEY_ARRAY);
+	Assert(state->key_count == 1);
+	Assert(list_length(state->key_exprs) == 1);
+	Assert(state->array_context != NULL);
+	state->array_initialized = true;
+
+	if (!pglc_sql_can_use_cache(state))
+	{
+		pglc_sql_array_bypass(state);
+		return;
+	}
+
+	array_expr = (ExprState *) linitial(state->key_exprs);
+	array_datum = ExecEvalExprSwitchContext(
+		array_expr, econtext, &array_isnull);
+	if (array_isnull)
+		return;
+
+	old_context = MemoryContextSwitchTo(state->array_context);
+	array = DatumGetArrayTypeP(array_datum);
+	element_count = ArrayGetNItems(ARR_NDIM(array), ARR_DIMS(array));
+	if (ARR_ELEMTYPE(array) != state->key_types[0] ||
+		element_count > PGLC_SQL_ARRAY_MAX_KEYS)
+	{
+		MemoryContextSwitchTo(old_context);
+		pglc_sql_array_bypass(state);
+		return;
+	}
+	get_typlenbyvalalign(state->key_types[0], &typlen, &typbyval, &typalign);
+	deconstruct_array(array, state->key_types[0], typlen, typbyval, typalign,
+					  &elements, &nulls, &element_count);
+	if (element_count > 0)
+		state->array_keys = palloc0(
+			mul_size(sizeof(PgLocalCacheSqlArrayKey), (Size) element_count));
+
+	for (read_index = 0; read_index < element_count; read_index++)
+	{
+		char		canonical_key[PGLC_KEY_MAX];
+		Size		canonical_key_len;
+		bool		key_isnull = false;
+		PgLocalCacheSqlArrayKey *key;
+
+		if (nulls[read_index])
+			continue;
+		if (!pglc_canonical_key_typed(
+				&elements[read_index], &key_isnull, 1,
+				state->key_types, state->key_outputs,
+				canonical_key, sizeof(canonical_key), &canonical_key_len) ||
+			canonical_key_len == 0)
+		{
+			MemoryContextSwitchTo(old_context);
+			pglc_sql_array_bypass(state);
+			return;
+		}
+		key = &state->array_keys[state->array_key_count++];
+		key->canonical_key = pstrdup(canonical_key);
+		key->canonical_key_len = canonical_key_len;
+	}
+
+	if (state->array_key_count > 1)
+		qsort(state->array_keys, state->array_key_count,
+			  sizeof(PgLocalCacheSqlArrayKey), pglc_sql_array_key_compare);
+	write_index = 0;
+	for (read_index = 0; read_index < state->array_key_count; read_index++)
+	{
+		PgLocalCacheSqlArrayKey *key = &state->array_keys[read_index];
+
+		if (write_index > 0 &&
+			strcmp(state->array_keys[write_index - 1].canonical_key,
+				   key->canonical_key) == 0)
+		{
+			pfree(key->canonical_key);
+			continue;
+		}
+		if (write_index != read_index)
+			state->array_keys[write_index] = *key;
+		write_index++;
+	}
+	state->array_key_count = write_index;
+
+	for (read_index = 0; read_index < state->array_key_count; read_index++)
+	{
+		PgLocalCacheSqlArrayLookup lookup = pglc_sql_array_lookup_key(
+			state, &state->array_keys[read_index]);
+
+		if (lookup == PGLC_SQL_ARRAY_BYPASS)
+		{
+			MemoryContextSwitchTo(old_context);
+			pglc_sql_array_bypass(state);
+			return;
+		}
+		if (lookup == PGLC_SQL_ARRAY_MISS)
+			all_cached = false;
+	}
+	if (all_cached)
+	{
+		MemoryContextSwitchTo(old_context);
+		return;
+	}
+
+	state->array_use_child = true;
+	PG_TRY();
+	{
+		for (read_index = 0; read_index < state->array_key_count; read_index++)
+		{
+			PgLocalCacheSqlArrayKey *key = &state->array_keys[read_index];
+
+			if (key->cached)
+				continue;
+			state->misses++;
+			pglc_note_sql_cache_miss();
+			if (key->claimable &&
+				pglc_cache_claim_load(
+					&state->mapping, key->canonical_key, &key->token,
+					&key->load_id) != PGLC_LOAD_OWNER)
+				key->load_id = 0;
+		}
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(old_context);
+		pglc_sql_array_release_loads(state);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(old_context);
+}
+
+static bool
+pglc_sql_array_payload_key(PgLocalCacheSqlScanState *state, Datum payload,
+						   char *canonical_key, Size *canonical_key_len)
+{
+	TupleTableSlot *slot = pglc_sql_init_array_payload_slot(state);
+	Datum		key;
+	bool		key_isnull;
+
+	Assert(state->key_count == 1);
+	ExecClearTuple(slot);
+	ExecStoreHeapTupleDatum(payload, slot);
+	key = slot_getattr(slot, state->key_attnos[0], &key_isnull);
+	if (key_isnull)
+		return false;
+	return pglc_canonical_key_typed(
+		&key, &key_isnull, 1, state->key_types, state->key_outputs,
+		canonical_key, PGLC_KEY_MAX, canonical_key_len);
+}
+
+static TupleTableSlot *
+pglc_sql_array_run_child(PgLocalCacheSqlScanState *state)
+{
+	volatile TupleTableSlot *result = NULL;
+
+	PG_TRY();
+	{
+		PlanState  *child = pglc_sql_init_child(state);
+		TupleTableSlot *child_slot = ExecProcNode(child);
+
+		if (TupIsNull(child_slot))
+			pglc_sql_array_release_loads(state);
+		else
+		{
+			Datum		payload;
+			bool		payload_isnull;
+
+			payload = slot_getattr(
+				child_slot, state->child_payload_resno, &payload_isnull);
+			if (!payload_isnull)
+			{
+				char		canonical_key[PGLC_KEY_MAX];
+				Size		canonical_key_len;
+				PgLocalCacheSqlArrayKey *key = NULL;
+
+				if (pglc_sql_array_payload_key(
+						state, payload, canonical_key, &canonical_key_len) &&
+					canonical_key_len > 0)
+					key = pglc_sql_array_find_key(state, canonical_key);
+				if (key != NULL && key->load_id != 0)
+				{
+					if (pglc_sql_maybe_store(
+							state, key->canonical_key, &key->token,
+							key->load_id, child_slot))
+						pglc_note_sql_cache_fill();
+					pglc_cache_release_load(
+						&state->mapping, key->canonical_key,
+						&key->token, key->load_id);
+					key->load_id = 0;
+				}
+				result = pglc_sql_form_row_tuple(state, payload);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		pglc_sql_array_release_loads(state);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return (TupleTableSlot *) result;
+}
+
+static TupleTableSlot *
+pglc_sql_array_access(PgLocalCacheSqlScanState *state)
+{
+	if (!state->array_initialized)
+		pglc_sql_array_initialize(state);
+	if (state->array_use_child)
+		return pglc_sql_array_run_child(state);
+	if (state->array_result_index >= state->array_key_count)
+		return NULL;
+	state->hits++;
+	pglc_note_sql_cache_hit();
+	return pglc_sql_form_row_tuple(
+		state, state->array_keys[state->array_result_index++].composite);
+}
+
 static TupleTableSlot *
 pglc_sql_access(ScanState *scan_state)
 {
@@ -2800,6 +3417,9 @@ pglc_sql_access(ScanState *scan_state)
 	MemoryContext old_context;
 	ListCell   *cell;
 	int			key_index = 0;
+
+	if (state->key_mode == PGLC_SQL_KEY_ARRAY)
+		return pglc_sql_array_access(state);
 
 	if (state->done)
 		return NULL;
@@ -2846,13 +3466,15 @@ pglc_sql_access(ScanState *scan_state)
 			row_cache_entry->source_xmin,
 			row_cache_entry->source_observed_full_xid,
 			state->css.ss.ps.state->es_snapshot);
-		if (visibility == PGLC_SOURCE_VISIBLE)
+		if (visibility == PGLC_SOURCE_VISIBLE &&
+			row_cache_entry->composite != (Datum) 0)
 		{
 			state->hits++;
 			pglc_note_sql_cache_hit();
 			return pglc_sql_form_row_tuple(state, row_cache_entry->composite);
 		}
-		if (visibility == PGLC_SOURCE_AGE_EXPIRED)
+		if (visibility == PGLC_SOURCE_VISIBLE ||
+			visibility == PGLC_SOURCE_AGE_EXPIRED)
 			pglc_sql_row_cache_discard(row_cache_entry);
 	}
 
@@ -2932,6 +3554,20 @@ pglc_sql_end(CustomScanState *node)
 {
 	PgLocalCacheSqlScanState *state = (PgLocalCacheSqlScanState *) node;
 
+	if (state->key_mode == PGLC_SQL_KEY_ARRAY)
+	{
+		pglc_sql_array_release_loads(state);
+		if (state->array_payload_slot != NULL)
+		{
+			ExecDropSingleTupleTableSlot(state->array_payload_slot);
+			state->array_payload_slot = NULL;
+		}
+		if (state->array_context != NULL)
+		{
+			MemoryContextDelete(state->array_context);
+			state->array_context = NULL;
+		}
+	}
 	if (state->child != NULL)
 		ExecEndNode(state->child);
 }
@@ -2941,10 +3577,13 @@ pglc_sql_rescan(CustomScanState *node)
 {
 	PgLocalCacheSqlScanState *state = (PgLocalCacheSqlScanState *) node;
 
+	pglc_sql_array_reset(state);
 	state->done = false;
 	ExecScanReScan(&state->css.ss);
 	if (state->latest_slot != NULL)
 		ExecClearTuple(state->latest_slot);
+	if (state->array_payload_slot != NULL)
+		ExecClearTuple(state->array_payload_slot);
 	if (state->child != NULL)
 		ExecReScan(state->child);
 }
@@ -2959,7 +3598,12 @@ pglc_sql_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 		(void) pglc_sql_init_child(state);
 	ExplainPropertyText("Cache Namespace", state->mapping.nspace, es);
 	ExplainPropertyText("Cache Policy", "positive MVCC-safe entries", es);
-	ExplainPropertyText("On Miss", "unique index scan", es);
+	ExplainPropertyText("Lookup Mode",
+		state->key_mode == PGLC_SQL_KEY_ARRAY ? "primary-key array" :
+		"single primary key", es);
+	ExplainPropertyText("On Miss",
+		state->key_mode == PGLC_SQL_KEY_ARRAY ?
+		"primary-key array index scan" : "unique index scan", es);
 	if (es->analyze)
 	{
 		ExplainPropertyInteger("Cache Hits", NULL, (int64) state->hits, es);

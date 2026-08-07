@@ -1,7 +1,7 @@
 ---
 layout: doc
 title: PostgreSQL cache benchmarks
-description: Reproducible measurements of SQL GET/MGET, ordinary exact-key SELECT and RESP GET against stock PostgreSQL, Valkey and Redis.
+description: Reproducible measurements of SQL GET/MGET, ordinary exact-key and IN/ANY SELECT, and RESP GET against stock PostgreSQL, Valkey and Redis.
 section: Benchmarks
 permalink: /docs/BENCHMARKS.html
 ---
@@ -13,9 +13,11 @@ The published tables cover all read interfaces exercised by the current CI:
 - SQL `local_cache.get()` and `local_cache.mget()` through the PostgreSQL
   protocol;
 - ordinary exact-primary-key `SELECT` through the PostgreSQL protocol;
+- ordinary single-column primary-key `IN`/`ANY` through the PostgreSQL
+  protocol;
 - whole-row RESP2 `GET` against the same PostgreSQL-backed rows.
 
-The three suites measure different operations and are reported separately.
+The suites measure different operations and are reported separately.
 Write, rollback, DDL, and invalidation semantics are verified by integration
 tests instead of being inferred from read throughput.
 
@@ -24,7 +26,9 @@ tests instead of being inferred from read throughput.
 [CI run 30803546805](https://github.com/profundium/pg_local_cache/actions/runs/30803546805)
 measured [source `fe2d23c`](https://github.com/profundium/pg_local_cache/commit/fe2d23c87ddc7e523ada2951376ebcb7d8570fb1)
 and passed every independent gate. Both exact artifacts are preserved with raw
-JSON and rendered Markdown:
+JSON and rendered Markdown. That preserved run predates the transparent
+`IN`/`ANY` lane; new `whole-row.json` reports use schema version 3 and include
+that lane in addition to the tables below:
 
 | Current API suites | Evidence | Actions artifact | SHA-256 |
 |---|---|---:|---|
@@ -111,6 +115,34 @@ and failed batches remained zero. CI gates the 10,000 mapped ops/s floor,
 result integrity, and counter accounting. The mapped/stock ratios are displayed
 for context and do not decide the gate.
 
+
+### Ordinary SQL `IN` / `ANY`
+
+New comparison runs add a separate single-column-primary-key table and send the
+same prepared SQL text to mapped and stock PostgreSQL. The default report width
+is 32 distinct keys per statement:
+
+```sql
+SELECT *
+FROM public.pg_local_cache_whole_row_select_in_comparison
+WHERE id IN ((:key_0)::bigint, (:key_1)::bigint, (:key_2)::bigint, (:key_3)::bigint, (:key_4)::bigint, (:key_5)::bigint, (:key_6)::bigint, (:key_7)::bigint, (:key_8)::bigint, (:key_9)::bigint, (:key_10)::bigint, (:key_11)::bigint, (:key_12)::bigint, (:key_13)::bigint, (:key_14)::bigint, (:key_15)::bigint, (:key_16)::bigint, (:key_17)::bigint, (:key_18)::bigint, (:key_19)::bigint, (:key_20)::bigint, (:key_21)::bigint, (:key_22)::bigint, (:key_23)::bigint, (:key_24)::bigint, (:key_25)::bigint, (:key_26)::bigint, (:key_27)::bigint, (:key_28)::bigint, (:key_29)::bigint, (:key_30)::bigint, (:key_31)::bigint);
+```
+
+The pgbench script chooses a contiguous unique key window for every statement,
+so the number of returned keys is known exactly. `key ops/s` is
+`batch TPS × pipeline depth × keys per statement`; the report also publishes
+SQL statements/s. Before timing, a complete-keyspace pass must show exactly one
+hit per row and zero misses, fills, and bypasses. During the mapped timing
+window, successful returned keys must equal the `sql_cache_hits` delta exactly;
+any miss, fill, bypass, failed batch, or row-set mismatch fails the lane.
+
+This lane intentionally measures the all-hit transparent path. Correctness tests
+separately prove that a mixed hit/miss array falls back as one PostgreSQL
+statement and never combines partial cached rows with source rows. The width and
+independent key-throughput floor are configured with
+`PGLC_BENCH_ROW_SQL_IN_KEYS` and `PGLC_BENCH_ROW_SQL_IN_MIN_OPS`. The
+configured width is capped at the transparent executor limit of 1,024 keys.
+
 ### RESP2 GET
 
 The same RESP2 command bytes and expected row bytes were used for all three
@@ -140,8 +172,9 @@ effective settings:
 | CPU quotas | 2 client CPUs; 2 CPUs per server target |
 | Memory limits | 3 GiB client; 1 GiB per server target |
 | Clients | 4 |
-| Pipeline depth | 8, up to 32 operations in flight |
-| Keys / cache entries | 128 / 128 |
+| Pipeline depth | 8 statements per batch |
+| Ordinary `IN` width | 32 unique keys per statement in new schema-v3 runs |
+| Keys per attached table / cache entries | 128 / 256 |
 | Row text payload | 128 bytes |
 | Timed repetitions | one 1-second smoke repetition |
 | Timed warmup | 0 seconds after explicit full-working-set stabilization |
@@ -192,9 +225,16 @@ Before timing, the runner:
    miss or database read;
 4. resets counters immediately before each measured lane.
 
-During each mapped SQL lane, successful operations must equal the
+During each mapped scalar SQL lane, successful operations must equal the
 `sql_cache_hits` delta exactly. Any miss, fill, safety bypass, failed batch, or
 result mismatch fails the run instead of producing a publishable rate.
+
+The `IN`/`ANY` lane uses a separate table with a single `bigint` primary key.
+Mapped and stock servers receive identical 32-key `IN` statements through the
+prepared protocol. The runner validates a sample row set on both servers, warms
+the complete mapped keyspace until it observes an exact all-hit pass, excludes
+warmup from measured counters, and records both key ops/s and statements/s.
+Its independent default floor is 10,000 mapped key ops/s.
 
 ## RESP methodology
 
@@ -250,13 +290,15 @@ PGLC_BENCH_REPETITIONS=1 \
 PGLC_BENCH_CONCURRENCY=4 \
 PGLC_BENCH_PIPELINE=8 \
 PGLC_BENCH_KEYS=128 \
-PGLC_BENCH_CACHE_ENTRIES=128 \
+PGLC_BENCH_CACHE_ENTRIES=256 \
 PGLC_BENCH_PG_LOCAL_CACHE_WORKERS=1 \
 PGLC_BENCH_SERVER_CPUS=2 \
 PGLC_BENCH_CLIENT_CPUS=2 \
 PGLC_BENCH_SERVER_MEMORY=1g \
 PGLC_BENCH_ROW_RESP_MIN_OPS=10000 \
 PGLC_BENCH_ROW_SQL_MIN_OPS=10000 \
+PGLC_BENCH_ROW_SQL_IN_KEYS=32 \
+PGLC_BENCH_ROW_SQL_IN_MIN_OPS=10000 \
 PGLC_BENCH_ROW_WIDTH_MIN_OPS=0 \
 PGLC_BENCH_OUTPUT_DIR="$PWD/benchmark-results/comparison" \
 bash benchmarks/run.sh
@@ -264,8 +306,9 @@ bash benchmarks/run.sh
 
 The comparison output directory receives:
 
-- `whole-row.json`: source revision, exact commands, environment, image
-  identities, configuration, every repetition, counter deltas, and gates;
+- `whole-row.json`: schema version 3, source revision, exact scalar and
+  32-key `IN` commands, environment, image identities, configuration, every
+  repetition, counter deltas, and gates;
 - `whole-row.md`: a rendered summary of the same run;
 - a structured failure report if the runner stops before satisfying its
   correctness contract.

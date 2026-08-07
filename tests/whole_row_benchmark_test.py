@@ -75,6 +75,8 @@ class WholeRowDefinitionTests(unittest.TestCase):
             parsed = whole_row.WholeRowConfig.from_environment()
         self.assertEqual(parsed.resp_min_ops, 10_000.0)
         self.assertEqual(parsed.sql_min_ops, 10_000.0)
+        self.assertEqual(parsed.sql_in_keys, 32)
+        self.assertEqual(parsed.sql_in_min_ops, 10_000.0)
         self.assertEqual(parsed.width_min_ops, 0.0)
         self.assertEqual(parsed.payload_sizes, (64, 512, 2048))
         self.assertEqual(parsed.base.duration, 120.0)
@@ -89,6 +91,8 @@ class WholeRowDefinitionTests(unittest.TestCase):
                 "PGLC_BENCH_PG_PASSWORD": "test-password",
                 "PGLC_BENCH_ROW_RESP_MIN_OPS": "11000",
                 "PGLC_BENCH_ROW_SQL_MIN_OPS": "12000",
+                "PGLC_BENCH_ROW_SQL_IN_KEYS": "16",
+                "PGLC_BENCH_ROW_SQL_IN_MIN_OPS": "13000",
                 "PGLC_BENCH_ROW_WIDTH_MIN_OPS": "9000",
                 "PGLC_BENCH_ROW_PAYLOAD_SIZES": "64, 512,64,2048",
             },
@@ -97,6 +101,8 @@ class WholeRowDefinitionTests(unittest.TestCase):
             parsed = whole_row.WholeRowConfig.from_environment()
         self.assertEqual(parsed.resp_min_ops, 11_000.0)
         self.assertEqual(parsed.sql_min_ops, 12_000.0)
+        self.assertEqual(parsed.sql_in_keys, 16)
+        self.assertEqual(parsed.sql_in_min_ops, 13_000.0)
         self.assertEqual(parsed.width_min_ops, 9_000.0)
         self.assertEqual(parsed.payload_sizes, (64, 512, 2048))
 
@@ -104,6 +110,21 @@ class WholeRowDefinitionTests(unittest.TestCase):
         for raw in ("64,,512", "0", "3001", "wide"):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 whole_row.parse_payload_sizes(raw)
+
+    def test_mapped_setup_requires_capacity_for_both_keyspaces(self) -> None:
+        cfg = config(keys=8)
+        with mock.patch.object(whole_row, "setup_role"), mock.patch.object(
+            compare, "psql", side_effect=["", "15"]
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "room for both attached benchmark keyspaces"
+            ):
+                whole_row.setup_mapped_postgres(cfg, 64)
+
+        with mock.patch.object(whole_row, "setup_role"), mock.patch.object(
+            compare, "psql", side_effect=["", "16"]
+        ):
+            self.assertEqual(whole_row.setup_mapped_postgres(cfg, 64), 16)
 
     def test_kvik_keys_reverse_json_fields_but_keep_composite_values(self) -> None:
         key = whole_row.row_key(42)
@@ -219,6 +240,71 @@ class WholeRowDefinitionTests(unittest.TestCase):
         self.assertIn("\\startpipeline", script)
         self.assertIn("\\endpipeline", script)
 
+    def test_sql_in_script_uses_unique_keys_and_key_accounting(self) -> None:
+        cfg = config(keys=8, pipeline=2)
+        query = whole_row.sql_in_query([":key_0", ":key_1"])
+        self.assertIn("WHERE id IN", query)
+        self.assertIn("(:key_0)::bigint", query)
+
+        script = whole_row.sql_in_lookup_script(cfg, 4)
+        self.assertEqual(script.count(f"SELECT * FROM public.{whole_row.SQL_IN_TABLE}"), 2)
+        self.assertIn("\\set in_base_0 random(1, 5)", script)
+        self.assertIn("\\set in_key_0_3 :in_base_0 + 3", script)
+        self.assertIn("\\startpipeline", script)
+        self.assertIn("\\endpipeline", script)
+
+        parsed = whole_row.scenarios.parse_pgbench_output(
+            "number of transactions actually processed: 10\n"
+            "latency average = 1.000 ms\n"
+            "tps = 5.000 (without initial connection time)\n",
+            cfg.pipeline * 4,
+        )
+        self.assertEqual(parsed["successful_operations"], 80)
+        self.assertEqual(parsed["operations_per_second"], 40.0)
+
+    def test_sql_in_stabilization_requires_an_exact_full_key_hit_pass(self) -> None:
+        cfg = config(keys=8)
+        snapshots = [
+            {
+                "sql_cache_hits": 0,
+                "sql_cache_misses": 0,
+                "sql_cache_fills": 0,
+                "sql_cache_bypasses": 0,
+            },
+            {
+                "sql_cache_hits": 0,
+                "sql_cache_misses": 8,
+                "sql_cache_fills": 8,
+                "sql_cache_bypasses": 0,
+            },
+            {
+                "sql_cache_hits": 0,
+                "sql_cache_misses": 8,
+                "sql_cache_fills": 8,
+                "sql_cache_bypasses": 0,
+            },
+            {
+                "sql_cache_hits": 8,
+                "sql_cache_misses": 8,
+                "sql_cache_fills": 8,
+                "sql_cache_bypasses": 0,
+            },
+        ]
+        with mock.patch.object(compare, "psql") as psql, mock.patch.object(
+            compare, "read_pglc_stats", side_effect=snapshots
+        ), mock.patch.object(whole_row, "sql_in_full_keyspace_pass") as warm:
+            result = whole_row.stabilize_sql_in_cache(cfg, max_passes=2)
+        self.assertEqual(result["passes"], 2)
+        self.assertEqual(result["sql_cache_hits_before_stable"], 8)
+        self.assertEqual(result["sql_cache_misses_before_stable"], 8)
+        self.assertEqual(result["sql_cache_fills_before_stable"], 8)
+        self.assertEqual(result["sql_cache_bypasses_before_stable"], 0)
+        self.assertEqual(warm.call_count, 2)
+        psql.assert_called_once_with(
+            cfg,
+            f"SELECT local_cache.invalidate('{whole_row.SQL_IN_NAMESPACE}')",
+        )
+
     def test_runner_executes_only_the_whole_row_suite(self) -> None:
         runner = (ROOT / "benchmarks" / "run.sh").read_text()
         self.assertEqual(
@@ -238,6 +324,8 @@ class WholeRowReportingTests(unittest.TestCase):
             payload_sizes=(64, 512),
             resp_min_ops=10_000.0,
             sql_min_ops=10_000.0,
+            sql_in_keys=4,
+            sql_in_min_ops=10_000.0,
             width_min_ops=0.0,
         )
         environment = {
@@ -300,6 +388,24 @@ class WholeRowReportingTests(unittest.TestCase):
                 }
                 for name in whole_row.SQL_LANES
             },
+            "ordinary_sql_in": {
+                "keys_per_statement": 4,
+                "mapped_postgres": {
+                    **sql_result,
+                    "summary": {
+                        **summary,
+                        "median_statements_per_second": 2_500.0,
+                    },
+                },
+                "stock_postgres": {
+                    **sql_result,
+                    "summary": {
+                        **summary,
+                        "median_statements_per_second": 2_500.0,
+                    },
+                },
+                "mapped_to_stock_throughput_ratio": 1.0,
+            },
             "resp_payload_width_sweep": {
                 "64": {
                     "payload_text_bytes": 64,
@@ -318,6 +424,8 @@ class WholeRowReportingTests(unittest.TestCase):
             markdown = (output / "whole-row.md").read_text()
             self.assertIn("Full-row RESP GET", markdown)
             self.assertIn("Ordinary SQL whole-row/projection lanes", markdown)
+            self.assertIn("Ordinary SQL SELECT IN", markdown)
+            self.assertIn("Mapped key ops/s", markdown)
             self.assertIn("response-width sweep", markdown)
             self.assertTrue((output / "whole-row.json").is_file())
             self.assertFalse((output / ".whole-row.json.tmp").exists())
