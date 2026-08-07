@@ -26,7 +26,7 @@ jobs:
           ref: feat/ordinary-select-in
           fetch-depth: 0
 
-      - name: Materialize exact patches
+      - name: Apply and validate documentation and benchmarks
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -40,20 +40,42 @@ jobs:
 
           git show "${source_commit}:.agent/select-in-docs.patch" \
             > /tmp/select-in-patches/docs.patch
+
           sed -i 's/^ diff --git /diff --git /' \
             /tmp/select-in-patches/benchmark.patch
+          sed -i \
+            's/^-the row shape and zero-or-one-row semantics remain ordinary PostgreSQL;$/-the row shape and zero-or-one-row semantics remain ordinary PostgreSQL:/' \
+            /tmp/select-in-patches/docs.patch
 
-      - name: Upload exact patches
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: select-in-patches
-          path: /tmp/select-in-patches/*.patch
-          if-no-files-found: error
-          retention-days: 1
+          git apply --check /tmp/select-in-patches/docs.patch
+          git apply /tmp/select-in-patches/docs.patch
+          git apply --check /tmp/select-in-patches/benchmark.patch
+          git apply /tmp/select-in-patches/benchmark.patch
 
-      - name: Validate patch applicability
+          rm -f .github/workflows/apply-select-in-clean.yml
+
+          python3 -m py_compile \
+            benchmarks/scenarios.py \
+            benchmarks/whole_row.py \
+            scripts/validate_benchmark_evidence.py \
+            tests/release_evidence_test.py \
+            tests/whole_row_benchmark_test.py \
+            tests/pages_contract_test.py
+          make source-test source-sanitize benchmark-test
+          python3 -m unittest -v \
+            tests/release_evidence_test.py \
+            tests/pages_contract_test.py
+          git diff --check
+
+      - name: Commit clean files
         shell: bash
         run: |
           set -Eeuo pipefail
-          git apply --check /tmp/select-in-patches/docs.patch
-          git apply --check /tmp/select-in-patches/benchmark.patch
+          git config user.name 'OpenAI Codex'
+          git config user.email 'noreply@openai.com'
+          git add -A
+          test ! -e .agent
+          test ! -e .github/workflows/apply-select-in-clean.yml
+          git diff --cached --check
+          git commit -m 'docs: document and benchmark ordinary SELECT IN'
+          git push origin HEAD:feat/ordinary-select-in
