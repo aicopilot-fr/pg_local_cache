@@ -2,7 +2,7 @@ name: Apply SELECT IN documentation and benchmarks
 
 on:
   pull_request_target:
-    types: [edited]
+    types: [opened]
 
 permissions:
   contents: write
@@ -14,11 +14,10 @@ concurrency:
 jobs:
   apply:
     if: >-
-      github.event.pull_request.number == 3 &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.ref == 'feat/ordinary-select-in'
+      github.event.pull_request.head.ref == 'agent/apply-select-in-final'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Check out the feature branch
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -26,16 +25,15 @@ jobs:
           ref: feat/ordinary-select-in
           fetch-depth: 0
 
-      - name: Apply and validate documentation and benchmark patches
+      - name: Decode, apply, and validate the patches
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          cat .agent/select-in-benchmark.patch.* > /tmp/select-in-benchmark.patch
-          sed -i 's/^ diff --git /diff --git /' /tmp/select-in-benchmark.patch
+          cat .agent/benchmark.b64.* | tr -d '\n' | base64 -d > /tmp/select-in-benchmark.patch
           echo 'fbaa92798768e834e81b5a3b9321e1ee29c1a41aae77ef16a8b385937ceadc0c  /tmp/select-in-benchmark.patch' | sha256sum -c -
 
-          cat .agent/select-in-docs.patch.* > /tmp/select-in-docs.patch
+          cat .agent/docs.b64.* | tr -d '\n' | base64 -d > /tmp/select-in-docs.patch
           echo '68a289dba8943adaf60792de9f8c9a7de1df2fe2799aea896f04a53d94a3110b  /tmp/select-in-docs.patch' | sha256sum -c -
 
           git apply --check /tmp/select-in-benchmark.patch
