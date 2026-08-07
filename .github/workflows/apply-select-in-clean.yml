@@ -1,0 +1,74 @@
+name: Apply SELECT IN docs and benchmarks cleanly
+
+on:
+  push:
+    branches:
+      - feat/ordinary-select-in
+    paths:
+      - .github/workflows/apply-select-in-clean.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-select-in-clean
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: github.repository == 'aicopilot-fr/pg_local_cache'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: feat/ordinary-select-in
+          fetch-depth: 0
+
+      - name: Apply documentation and benchmark patches
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source_commit='adf0b9cf1c5bce1c19d8811d9620bc34fbe00e5c'
+
+          for suffix in 00 01 02 03 04; do
+            git show "${source_commit}:.agent/benchmark.b64.${suffix}"
+          done | tr -d '\r\n' | base64 -d > /tmp/select-in-benchmark.patch
+
+          git show "${source_commit}:.agent/select-in-docs.patch" \
+            > /tmp/select-in-docs.patch
+
+          sed -i 's/^ diff --git /diff --git /' /tmp/select-in-benchmark.patch
+          git apply --check /tmp/select-in-benchmark.patch
+          git apply /tmp/select-in-benchmark.patch
+          git apply --check /tmp/select-in-docs.patch
+          git apply /tmp/select-in-docs.patch
+
+          rm -f .github/workflows/apply-select-in-clean.yml
+
+          python3 -m py_compile \
+            benchmarks/scenarios.py \
+            benchmarks/whole_row.py \
+            scripts/validate_benchmark_evidence.py \
+            tests/release_evidence_test.py \
+            tests/whole_row_benchmark_test.py \
+            tests/pages_contract_test.py
+          make source-test source-sanitize benchmark-test
+          python3 -m unittest -v \
+            tests/release_evidence_test.py \
+            tests/pages_contract_test.py
+          git diff --check
+
+      - name: Commit clean files
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'OpenAI Codex'
+          git config user.email 'noreply@openai.com'
+          git add -A
+          test ! -e .agent
+          test ! -e .github/workflows/apply-select-in-clean.yml
+          git diff --cached --check
+          git commit -m 'docs: document and benchmark ordinary SELECT IN'
+          git push origin HEAD:feat/ordinary-select-in
