@@ -5,6 +5,7 @@ on:
     branches:
       - feat/ordinary-select-in
     paths:
+      - .agent/apply-select-in-benchmark.trigger
       - .github/workflows/apply-select-in-benchmark.yml
 
 permissions:
@@ -35,6 +36,7 @@ jobs:
           git apply --check /tmp/select-in-benchmark.patch
           git apply /tmp/select-in-benchmark.patch
           rm -f .agent/select-in-benchmark.patch.*
+          rm -f .agent/apply-select-in-benchmark.trigger
           rmdir .agent 2>/dev/null || true
           rm -f .github/workflows/apply-select-in-benchmark.yml
 
