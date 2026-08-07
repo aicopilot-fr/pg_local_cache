@@ -1,7 +1,7 @@
 ---
 layout: doc
 title: PostgreSQL shared-memory cache technical reference
-description: Architecture, consistency, memory limits, SQL fast path, security and operations for pg_local_cache.
+description: Product boundary, architecture, consistency, memory limits, SQL fast path, security and operations for pg_local_cache.
 section: Technical
 permalink: /docs/TECHNICAL.html
 ---
@@ -17,6 +17,26 @@ instructions, use these guides:
 - [Benchmark and latency methodology]({{ '/docs/BENCHMARKS.html' | relative_url }})
 - [Monitoring and OOM signals]({{ '/docs/MONITORING.html' | relative_url }})
 - [Benchmark scenario definitions](https://github.com/profundium/pg_local_cache/blob/master/benchmarks/SCENARIOS.md)
+
+## Product boundary
+
+`pg_local_cache` is an in-process PostgreSQL row cache, not a general query
+result cache. It stores complete table rows addressed by a validated primary
+key. The planner substitutes only narrow exact-key or bounded single-column
+`IN`/`ANY` shapes and retains the original PostgreSQL index path as the fallback
+child plan.
+
+It does not cache joins, ranges, aggregates, arbitrary predicates, or full-table
+results. It does not provide TTLs, pub/sub, clustering, multi-primary cache
+coordination, or standby cache serving. The optional RESP endpoint exposes the
+same rows for trusted internal clients, but the product is not positioned as a
+raw-throughput replacement for Redis or Valkey.
+
+The trade-off is operational: applications can keep ordinary PostgreSQL SQL,
+row types, ACLs, drivers, and ORM mappings, but the database operator must load a
+shared library at postmaster startup, reserve bounded shared memory, perform one
+controlled restart for first activation, attach eligible tables, and monitor the
+additional in-process state.
 
 The extension and its GUC prefix are named `pg_local_cache`. User-facing SQL
 objects are in the `local_cache` schema, and the default RESP worker role is
