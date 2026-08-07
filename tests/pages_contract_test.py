@@ -103,13 +103,21 @@ class PagesSourceContracts(unittest.TestCase):
             f"{key_array});",
             source,
         )
-        self.assertIn("64,954", source)
-        self.assertIn("66,156", source)
-        self.assertIn("10.30x", source)
-        self.assertIn("10.39x", source)
-        self.assertIn("raw evidence ZIP", source)
-        self.assertIn("Current SQL MGET benchmark", source)
-        self.assertIn("30803546805", source)
+        for marker in (
+            "Measured trade-offs",
+            "1.84–1.88x",
+            "865,201",
+            "328,282",
+            "2.64x",
+            "143,104",
+            "197,522",
+            "0.72x Redis",
+            "31172234073",
+            "71b0aa3",
+            "raw JSON",
+        ):
+            self.assertIn(marker, source)
+        self.assertIn("separate SQL MGET profile", source)
         self.assertNotIn("Reference SQL KV snapshot", source)
         self.assertNotIn("ee221410", source)
         self.assertNotIn("30796269395", source)
@@ -172,7 +180,7 @@ class PagesSourceContracts(unittest.TestCase):
             scalar_stock_command,
         ):
             self.assertIn(re.sub(r"\s+", "", command), compact_benchmarks)
-        throughput_commands = benchmarks.split("### SQL GET/MGET", 1)[1].split(
+        throughput_commands = benchmarks.split("## SQL GET/MGET results", 1)[1].split(
             "Latency was measured", 1
         )[0]
         self.assertNotIn("| Lane | Exact throughput command |", throughput_commands)
@@ -189,6 +197,12 @@ class PagesSourceContracts(unittest.TestCase):
             self.assertIn("local_cache.mget", source)
             self.assertIn("64,954", source)
             self.assertIn("66,156", source)
+            self.assertIn("31172234073", source)
+            self.assertIn("71b0aa3", source)
+            self.assertIn("865,201", source)
+            self.assertIn("328,282", source)
+            self.assertIn("143,104", source)
+            self.assertIn("197,522", source)
             self.assertNotIn("Reference SQL", source)
             self.assertNotIn("ee221410", source)
             self.assertNotIn("30796269395", source)
@@ -228,6 +242,25 @@ class PagesSourceContracts(unittest.TestCase):
         self.assertIn("never merges a partial cache result", technical)
         self.assertIn("Mapped key ops/s", (ROOT / "benchmarks" / "whole_row.py").read_text())
         self.assertIn("schema version 3", benchmarks)
+
+    def test_product_positioning_states_scope_and_tradeoffs(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        homepage = (ROOT / "index.html").read_text(encoding="utf-8")
+        technical = (ROOT / "docs" / "TECHNICAL.md").read_text(
+            encoding="utf-8"
+        )
+        benchmarks = (ROOT / "docs" / "BENCHMARKS.md").read_text(
+            encoding="utf-8"
+        )
+        combined = "\n".join((readme, homepage, technical))
+        self.assertIn("PostgreSQL remains the source of truth", combined)
+        self.assertIn("not a general query", combined)
+        self.assertIn("universal Redis", combined)
+        self.assertIn("one controlled restart", combined)
+        self.assertIn("source-plan fallback", (ROOT / "_config.yml").read_text())
+        self.assertIn("0.72x", benchmarks)
+        self.assertIn("1.36–1.38x faster", benchmarks)
+        self.assertIn("not a production capacity", benchmarks)
 
     def test_public_pages_use_browser_release_downloads(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -270,8 +303,9 @@ class PagesSourceContracts(unittest.TestCase):
         self.assertIn('"operatingSystem": "Linux amd64 (glibc or musl)"', combined)
         self.assertIn("PostgreSQL 14–18", (ROOT / "_config.yml").read_text())
 
-    def test_published_assets_keep_only_current_benchmark_and_social_files(self) -> None:
+    def test_published_assets_keep_source_pinned_benchmark_evidence(self) -> None:
         self.assertTrue((ROOT / "assets" / "benchmark-evidence" / "fe2d23c").is_dir())
+        self.assertTrue((ROOT / "assets" / "benchmark-evidence" / "71b0aa3").is_dir())
         self.assertFalse((ROOT / "assets" / "benchmark-evidence" / "ee221410").exists())
         self.assertTrue((ROOT / "assets" / "social-card.png").is_file())
         self.assertFalse((ROOT / "assets" / "social-card.svg").exists())
@@ -319,6 +353,33 @@ class PagesSourceContracts(unittest.TestCase):
             ["summary"]["median_operations_per_second"],
             66155.7912,
         )
+        latest_evidence = ROOT / "assets" / "benchmark-evidence" / "71b0aa3"
+        latest_json = latest_evidence / "whole-row.json"
+        latest_markdown = latest_evidence / "whole-row.txt"
+        self.assertEqual(
+            hashlib.sha256(latest_json.read_bytes()).hexdigest(),
+            "a36f7da08e916d9956d67ec83687f60fa6b0694bce347ed14ae774bbc5270b27",
+        )
+        self.assertEqual(
+            hashlib.sha256(latest_markdown.read_bytes()).hexdigest(),
+            "1eeef1563aeb7e3694f28ed364cbfc40553e7f8ac51d37fa02191099dcfbff54",
+        )
+        latest_report = json.loads(latest_json.read_text(encoding="utf-8"))
+        self.assertEqual(
+            latest_report["environment"]["source_revision"],
+            "71b0aa3a27c5c009b7ba08bbaa660147f078bde8",
+        )
+        self.assertEqual(latest_report["gate"]["status"], "PASS")
+        self.assertAlmostEqual(
+            latest_report["ordinary_sql_in"]["mapped_to_stock_throughput_ratio"],
+            2.6355428738438844,
+        )
+        self.assertAlmostEqual(
+            latest_report["resp_full_row"]["targets"]["pg_local_cache"]
+            ["summary"]["median_operations_per_second"],
+            143103.72639565344,
+        )
+
         self.assertEqual(
             {lane["query"] for lane in report["ordinary_sql"].values()},
             {
