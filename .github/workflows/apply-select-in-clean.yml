@@ -1,11 +1,9 @@
 name: Apply SELECT IN docs and benchmarks cleanly
 
 on:
-  push:
+  pull_request:
     branches:
-      - feat/ordinary-select-in
-    paths:
-      - .github/workflows/apply-select-in-clean.yml
+      - master
 
 permissions:
   contents: write
@@ -16,7 +14,9 @@ concurrency:
 
 jobs:
   apply:
-    if: github.repository == 'aicopilot-fr/pg_local_cache'
+    if: >-
+      github.repository == 'aicopilot-fr/pg_local_cache' &&
+      github.head_ref == 'feat/ordinary-select-in'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
