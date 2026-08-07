@@ -1,0 +1,167 @@
+, '{ROW_NAMESPACE}');"
++        + f"SELECT local_cache.attach_table("
++        f"'public.{SQL_IN_TABLE}'::regclass, false, '{SQL_IN_NAMESPACE}');",
+     )
+     capacity = int(compare.psql(config, "SHOW pg_local_cache.cache_entries"))
+     if config.keys > capacity:
+@@ -183,7 +221,8 @@ def setup_plain_postgres(config: compare.Config, payload_size: int) -> None:
+     setup_role(config, compare.PLAIN_PG_HOST)
+     compare.psql(
+         config,
+-        row_table_sql(config.keys, payload_size),
++        row_table_sql(config.keys, payload_size)
++        + sql_in_table_sql(config.keys, payload_size),
+         host=compare.PLAIN_PG_HOST,
+     )
+ 
+@@ -742,6 +781,221 @@ def sql_lanes(
+     return lanes, failures
+ 
+ 
++def sql_in_query(values: list[str]) -> str:
++    if not values:
++        raise ValueError("ordinary SELECT IN requires at least one key")
++    keys = ", ".join(f"({value})::bigint" for value in values)
++    return f"SELECT * FROM public.{SQL_IN_TABLE} WHERE id IN ({keys});"
++
++
++def sql_in_lookup_script(config: compare.Config, keys_per_statement: int) -> str:
++    if not 1 <= keys_per_statement <= config.keys:
++        raise ValueError("SELECT IN width must be between one and the key count")
++    lines = ["\\startpipeline"]
++    maximum_start = config.keys - keys_per_statement + 1
++    for statement_index in range(config.pipeline):
++        base = f"in_base_{statement_index}"
++        lines.append(f"\\set {base} random(1, {maximum_start})")
++        variables: list[str] = []
++        for offset in range(keys_per_statement):
++            variable = f"in_key_{statement_index}_{offset}"
++            expression = f":{base}" if offset == 0 else f":{base} + {offset}"
++            lines.append(f"\\set {variable} {expression}")
++            variables.append(f":{variable}")
++        lines.append(sql_in_query(variables))
++    lines.append("\\endpipeline")
++    return "\n".join(lines) + "\n"
++
++
++def validate_sql_in_value(
++    config: compare.Config, host: str, keys_per_statement: int
++) -> list[str]:
++    values = [str(index) for index in range(1, keys_per_statement + 1)]
++    rows = compare.psql(config, sql_in_query(values), host=host).splitlines()
++    return sorted(rows)
++
++
++def sql_in_full_keyspace_pass(
++    config: compare.Config,
++    chunk_size: int = MAX_TRANSPARENT_SQL_ARRAY_KEYS,
++) -> None:
++    if chunk_size < 1 or chunk_size > MAX_TRANSPARENT_SQL_ARRAY_KEYS:
++        raise ValueError("invalid SELECT IN stabilization chunk size")
++    for start in range(1, config.keys + 1, chunk_size):
++        stop = min(start + chunk_size, config.keys + 1)
++        values = [str(value) for value in range(start, stop)]
++        query = (
++            f"SELECT id FROM public.{SQL_IN_TABLE} WHERE id IN ("
++            + ", ".join(f"({value})::bigint" for value in values)
++            + ");"
++        )
++        returned = compare.psql(config, query).splitlines()
++        expected = [str(value) for value in range(start, stop)]
++        if sorted(returned, key=int) != expected:
++            raise RuntimeError(
++                "ordinary SELECT IN stabilization returned incomplete rows"
++            )
++
++
++def stabilize_sql_in_cache(
++    config: compare.Config, max_passes: int = 4
++) -> dict[str, int]:
++    if max_passes < 1:
++        raise ValueError("max_passes must be positive")
++    compare.psql(
++        config, f"SELECT local_cache.invalidate('{SQL_IN_NAMESPACE}')"
++    )
++    totals = {
++        "sql_cache_hits_before_stable": 0,
++        "sql_cache_misses_before_stable": 0,
++        "sql_cache_fills_before_stable": 0,
++        "sql_cache_bypasses_before_stable": 0,
++    }
++    last: dict[str, int] = {}
++    for pass_number in range(1, max_passes + 1):
++        before = compare.read_pglc_stats(compare.TARGETS[0], config)
++        sql_in_full_keyspace_pass(config)
++        after = compare.read_pglc_stats(compare.TARGETS[0], config)
++        last = scenarios.counter_delta(
++            before,
++            after,
++            "sql_cache_hits",
++            "sql_cache_misses",
++            "sql_cache_fills",
++            "sql_cache_bypasses",
++        )
++        for name, value in last.items():
++            totals[name.replace("_during_measurement", "_before_stable")] += value
++        if (
++            last["sql_cache_hits_during_measurement"] == config.keys
++            and last["sql_cache_misses_during_measurement"] == 0
++            and last["sql_cache_fills_during_measurement"] == 0
++            and last["sql_cache_bypasses_during_measurement"] == 0
++        ):
++            return {"passes": pass_number, **totals}
++    raise RuntimeError(
++        "ordinary SELECT IN did not reach a fully warm pass: "
++        + ", ".join(f"{name}={value}" for name, value in sorted(last.items()))
++    )
++
++
++def sql_in_lane(
++    whole: WholeRowConfig, config: compare.Config
++) -> tuple[dict[str, Any], list[str]]:
++    keys_per_statement = whole.sql_in_keys
++    mapped_value = validate_sql_in_value(
++        config, compare.PG_HOST, keys_per_statement
++    )
++    stock_value = validate_sql_in_value(
++        config, compare.PLAIN_PG_HOST, keys_per_statement
++    )
++    if mapped_value != stock_value or len(mapped_value) != keys_per_statement:
++        raise RuntimeError(
++            "ordinary SELECT IN returned different mapped/plain row sets"
++        )
++
++    stabilization = stabilize_sql_in_cache(config)
++    variables = [f":key_{index}" for index in range(keys_per_statement)]
++    query = sql_in_query(variables)
++    script = sql_in_lookup_script(config, keys_per_statement)
++    timed_config = replace(config, warmup_seconds=0)
++    if config.warmup_seconds > 0:
++        warm_config = replace(
++            config,
++            duration=config.warmup_seconds,
++            warmup_seconds=0,
++            repetitions=1,
++        )
++        scenarios.run_pgbench_repetitions(
++            warm_config,
++            compare.PG_HOST,
++            script,
++            50900,
++            operations_per_statement=keys_per_statement,
++        )
++        scenarios.run_pgbench_repetitions(
++            warm_config,
++            compare.PLAIN_PG_HOST,
++            script,
++            60900,
++            operations_per_statement=keys_per_statement,
++        )
++    before = compare.read_pglc_stats(compare.TARGETS[0], config)
++    mapped = scenarios.run_pgbench_repetitions(
++        timed_config,
++        compare.PG_HOST,
++        script,
++        51000,
++        operations_per_statement=keys_per_statement,
++
