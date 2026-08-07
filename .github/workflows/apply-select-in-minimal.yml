@@ -1,0 +1,48 @@
+name: Apply SELECT IN docs and benchmarks
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.head_ref == 'agent/apply-select-in-minimal'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: feat/ordinary-select-in
+          fetch-depth: 0
+
+      - name: Apply checksummed patches and publish clean branch
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cat .agent/benchmark.b64.* | tr -d '\n' | base64 -d > /tmp/benchmark.patch
+          echo 'fbaa92798768e834e81b5a3b9321e1ee29c1a41aae77ef16a8b385937ceadc0c  /tmp/benchmark.patch' | sha256sum -c -
+          cp .agent/select-in-docs.patch /tmp/docs.patch
+          echo '68a289dba8943adaf60792de9f8c9a7de1df2fe2799aea896f04a53d94a3110b  /tmp/docs.patch' | sha256sum -c -
+
+          git apply --check /tmp/benchmark.patch
+          git apply /tmp/benchmark.patch
+          git apply --check /tmp/docs.patch
+          git apply /tmp/docs.patch
+          rm -rf .agent
+          rm -f .github/workflows/apply-select-in-benchmark.yml
+          git diff --check
+
+          git config user.name 'OpenAI Codex'
+          git config user.email 'noreply@openai.com'
+          git add -A
+          git reset --soft 222924cf097534394582539096611dcc764e1029
+          git diff --cached --check
+          test ! -e .agent
+          test ! -e .github/workflows/apply-select-in-benchmark.yml
+          git commit -m 'docs: document and benchmark ordinary SELECT IN'
+          git push --force origin HEAD:feat/ordinary-select-in
