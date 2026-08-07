@@ -99,6 +99,8 @@ jobs:
           PGLC_BENCH_SERVER_MEMORY: "1g"
           PGLC_BENCH_ROW_RESP_MIN_OPS: "10000"
           PGLC_BENCH_ROW_SQL_MIN_OPS: "10000"
+          PGLC_BENCH_ROW_SQL_IN_KEYS: "32"
+          PGLC_BENCH_ROW_SQL_IN_MIN_OPS: "10000"
           PGLC_BENCH_ROW_WIDTH_MIN_OPS: "0"
           PGLC_BENCH_OUTPUT_DIR: ${{ runner.temp }}/comparison-smoke
         run: bash benchmarks/run.sh
