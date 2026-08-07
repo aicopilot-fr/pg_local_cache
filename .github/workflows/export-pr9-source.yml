@@ -6,12 +6,16 @@ on:
       - agent/export-pr9-source
     paths:
       - .github/workflows/export-pr9-source.yml
+  pull_request:
+    branches:
+      - master
 
 permissions:
   contents: read
 
 jobs:
   export:
+    if: github.head_ref == 'agent/export-pr9-source' || github.ref_name == 'agent/export-pr9-source'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
