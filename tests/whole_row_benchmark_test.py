@@ -111,6 +111,21 @@ class WholeRowDefinitionTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 whole_row.parse_payload_sizes(raw)
 
+    def test_mapped_setup_requires_capacity_for_both_keyspaces(self) -> None:
+        cfg = config(keys=8)
+        with mock.patch.object(whole_row, "setup_role"), mock.patch.object(
+            compare, "psql", side_effect=["", "15"]
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "room for both attached benchmark keyspaces"
+            ):
+                whole_row.setup_mapped_postgres(cfg, 64)
+
+        with mock.patch.object(whole_row, "setup_role"), mock.patch.object(
+            compare, "psql", side_effect=["", "16"]
+        ):
+            self.assertEqual(whole_row.setup_mapped_postgres(cfg, 64), 16)
+
     def test_kvik_keys_reverse_json_fields_but_keep_composite_values(self) -> None:
         key = whole_row.row_key(42)
         self.assertEqual(

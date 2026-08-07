@@ -174,7 +174,7 @@ effective settings:
 | Clients | 4 |
 | Pipeline depth | 8 statements per batch |
 | Ordinary `IN` width | 32 unique keys per statement in new schema-v3 runs |
-| Keys / cache entries | 128 / 128 |
+| Keys per attached table / cache entries | 128 / 256 |
 | Row text payload | 128 bytes |
 | Timed repetitions | one 1-second smoke repetition |
 | Timed warmup | 0 seconds after explicit full-working-set stabilization |
@@ -290,7 +290,7 @@ PGLC_BENCH_REPETITIONS=1 \
 PGLC_BENCH_CONCURRENCY=4 \
 PGLC_BENCH_PIPELINE=8 \
 PGLC_BENCH_KEYS=128 \
-PGLC_BENCH_CACHE_ENTRIES=128 \
+PGLC_BENCH_CACHE_ENTRIES=256 \
 PGLC_BENCH_PG_LOCAL_CACHE_WORKERS=1 \
 PGLC_BENCH_SERVER_CPUS=2 \
 PGLC_BENCH_CLIENT_CPUS=2 \

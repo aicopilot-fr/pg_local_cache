@@ -210,9 +210,12 @@ def setup_mapped_postgres(
         f"'public.{SQL_IN_TABLE}'::regclass, false, '{SQL_IN_NAMESPACE}');",
     )
     capacity = int(compare.psql(config, "SHOW pg_local_cache.cache_entries"))
-    if config.keys > capacity:
+    required_capacity = config.keys * 2
+    if required_capacity > capacity:
         raise ValueError(
-            f"whole-row keyspace {config.keys} exceeds cache capacity {capacity}"
+            "whole-row comparison needs room for both attached benchmark "
+            f"keyspaces ({required_capacity} entries), but cache capacity is "
+            f"{capacity}"
         )
     return capacity
 
