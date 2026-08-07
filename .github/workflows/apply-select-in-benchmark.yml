@@ -1,21 +1,22 @@
-name: Apply SELECT IN benchmark patch
+name: Apply SELECT IN documentation and benchmarks
 
 on:
-  push:
-    branches:
-      - feat/ordinary-select-in
-    paths:
-      - .agent/apply-select-in-benchmark.trigger
+  pull_request_target:
+    types: [edited]
 
 permissions:
   contents: write
 
 concurrency:
-  group: apply-select-in-benchmark
+  group: apply-select-in-documentation-benchmarks
   cancel-in-progress: true
 
 jobs:
   apply:
+    if: >-
+      github.event.pull_request.number == 3 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'feat/ordinary-select-in'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -25,18 +26,24 @@ jobs:
           ref: feat/ordinary-select-in
           fetch-depth: 0
 
-      - name: Apply and validate the benchmark patch
+      - name: Apply and validate documentation and benchmark patches
         shell: bash
         run: |
           set -Eeuo pipefail
+
           cat .agent/select-in-benchmark.patch.* > /tmp/select-in-benchmark.patch
           sed -i 's/^ diff --git /diff --git /' /tmp/select-in-benchmark.patch
           echo 'fbaa92798768e834e81b5a3b9321e1ee29c1a41aae77ef16a8b385937ceadc0c  /tmp/select-in-benchmark.patch' | sha256sum -c -
+
+          cat .agent/select-in-docs.patch.* > /tmp/select-in-docs.patch
+          echo '68a289dba8943adaf60792de9f8c9a7de1df2fe2799aea896f04a53d94a3110b  /tmp/select-in-docs.patch' | sha256sum -c -
+
           git apply --check /tmp/select-in-benchmark.patch
           git apply /tmp/select-in-benchmark.patch
-          rm -f .agent/select-in-benchmark.patch.*
-          rm -f .agent/apply-select-in-benchmark.trigger
-          rmdir .agent 2>/dev/null || true
+          git apply --check /tmp/select-in-docs.patch
+          git apply /tmp/select-in-docs.patch
+
+          rm -rf .agent
           rm -f .github/workflows/apply-select-in-benchmark.yml
 
           python3 -m py_compile \
@@ -44,12 +51,15 @@ jobs:
             benchmarks/whole_row.py \
             scripts/validate_benchmark_evidence.py \
             tests/release_evidence_test.py \
-            tests/whole_row_benchmark_test.py
-          make benchmark-test
-          python3 -m unittest -v tests/release_evidence_test.py
+            tests/whole_row_benchmark_test.py \
+            tests/pages_contract_test.py
+          make source-test source-sanitize benchmark-test
+          python3 -m unittest -v \
+            tests/release_evidence_test.py \
+            tests/pages_contract_test.py
           git diff --check
 
-      - name: Publish one clean benchmark commit
+      - name: Publish one clean commit
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -60,5 +70,5 @@ jobs:
           git diff --cached --check
           test ! -e .agent
           test ! -e .github/workflows/apply-select-in-benchmark.yml
-          git commit -m 'bench: measure ordinary SELECT IN'
+          git commit -m 'docs: document and benchmark ordinary SELECT IN'
           git push --force-with-lease origin HEAD:feat/ordinary-select-in
