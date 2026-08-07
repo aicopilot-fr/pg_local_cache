@@ -1,0 +1,169 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 5a50b0a..c251450 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -99,6 +99,8 @@ jobs:
+           PGLC_BENCH_SERVER_MEMORY: "1g"
+           PGLC_BENCH_ROW_RESP_MIN_OPS: "10000"
+           PGLC_BENCH_ROW_SQL_MIN_OPS: "10000"
++          PGLC_BENCH_ROW_SQL_IN_KEYS: "32"
++          PGLC_BENCH_ROW_SQL_IN_MIN_OPS: "10000"
+           PGLC_BENCH_ROW_WIDTH_MIN_OPS: "0"
+           PGLC_BENCH_OUTPUT_DIR: ${{ runner.temp }}/comparison-smoke
+         run: bash benchmarks/run.sh
+diff --git a/benchmarks/scenarios.py b/benchmarks/scenarios.py
+index 54d539a..a959396 100644
+--- a/benchmarks/scenarios.py
++++ b/benchmarks/scenarios.py
+@@ -117,9 +117,12 @@ def run_pgbench_once(
+     seed: int,
+     setup_sql: str | None = None,
+     query_protocol: str = "prepared",
++    operations_per_statement: int = 1,
+ ) -> dict[str, Any]:
+     if query_protocol not in SQL_QUERY_PROTOCOLS:
+         raise ValueError("SQL query protocol must be 'prepared' or 'extended'")
++    if operations_per_statement < 1:
++        raise ValueError("operations_per_statement must be positive")
+     environment = os.environ.copy()
+     environment["PGPASSWORD"] = config.pg_password
+     environment["PGCONNECT_TIMEOUT"] = "10"
+@@ -158,8 +161,12 @@ def run_pgbench_once(
+         env=environment,
+         timeout=max(90, math.ceil(duration) + 60),
+     )
+-    parsed = parse_pgbench_output(result.stdout, config.pipeline)
++    parsed = parse_pgbench_output(
++        result.stdout, config.pipeline * operations_per_statement
++    )
+     parsed["query_protocol"] = query_protocol
++    parsed["statements_per_batch"] = config.pipeline
++    parsed["operations_per_statement"] = operations_per_statement
+     return parsed
+ 
+ 
+@@ -169,6 +176,7 @@ def run_pgbench_repetitions(
+     script: str,
+     seed_base: int,
+     setup_sql: str | None = None,
++    operations_per_statement: int = 1,
+ ) -> dict[str, Any]:
+     with tempfile.NamedTemporaryFile(
+         mode="w", prefix="pglc_whole_row_", suffix=".sql", delete=False
+@@ -184,6 +192,7 @@ def run_pgbench_repetitions(
+                 config.warmup_seconds,
+                 seed_base - 1,
+                 setup_sql,
++                operations_per_statement=operations_per_statement,
+             )
+         runs = [
+             run_pgbench_once(
+@@ -193,6 +202,7 @@ def run_pgbench_repetitions(
+                 config.duration,
+                 seed_base + index,
+                 setup_sql,
++                operations_per_statement=operations_per_statement,
+             )
+             for index in range(config.repetitions)
+         ]
+@@ -201,7 +211,9 @@ def run_pgbench_repetitions(
+     return {
+         "runs": runs,
+         "summary": compare.summarize_throughput_runs(runs),
+-        "operations_per_batch": config.pipeline,
++        "operations_per_batch": config.pipeline * operations_per_statement,
++        "statements_per_batch": config.pipeline,
++        "operations_per_statement": operations_per_statement,
+     }
+ 
+ 
+ diff --git a/benchmarks/whole_row.py b/benchmarks/whole_row.py
+index 1fb3aae..0457859 100644
+--- a/benchmarks/whole_row.py
++++ b/benchmarks/whole_row.py
+@@ -9,7 +9,7 @@ the same SELECT text against mapped and stock PostgreSQL.
+ from __future__ import annotations
+ 
+ from array import array
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ from datetime import datetime, timezone
+ import json
+ import math
+@@ -34,12 +34,17 @@ import scenarios
+ ROW_NAMESPACE = "whole_row_comparison"
+ ROW_TABLE = "pg_local_cache_whole_row_comparison"
+ ROW_TENANT = 7
++SQL_IN_NAMESPACE = "whole_row_select_in_comparison"
++SQL_IN_TABLE = "pg_local_cache_whole_row_select_in_comparison"
+ ROW_VALUE_SIZE_ENV = "PGLC_BENCH_ROW_VALUE_SIZE"
+ ROW_PAYLOAD_SIZES_ENV = "PGLC_BENCH_ROW_PAYLOAD_SIZES"
+ ROW_RESP_MIN_OPS_ENV = "PGLC_BENCH_ROW_RESP_MIN_OPS"
+ ROW_SQL_MIN_OPS_ENV = "PGLC_BENCH_ROW_SQL_MIN_OPS"
++ROW_SQL_IN_KEYS_ENV = "PGLC_BENCH_ROW_SQL_IN_KEYS"
++ROW_SQL_IN_MIN_OPS_ENV = "PGLC_BENCH_ROW_SQL_IN_MIN_OPS"
+ ROW_WIDTH_MIN_OPS_ENV = "PGLC_BENCH_ROW_WIDTH_MIN_OPS"
+ MAX_CACHEABLE_TEXT_SIZE = 3000
++MAX_TRANSPARENT_SQL_ARRAY_KEYS = 1024
+ 
+ SQL_LANES = {
+     "select_star": (
+@@ -66,6 +71,8 @@ class WholeRowConfig:
+     payload_sizes: tuple[int, ...]
+     resp_min_ops: float
+     sql_min_ops: float
++    sql_in_keys: int
++    sql_in_min_ops: float
+     width_min_ops: float
+ 
+     @classmethod
+@@ -90,6 +97,15 @@ class WholeRowConfig:
+             sql_min_ops=compare.env_float(
+                 ROW_SQL_MIN_OPS_ENV, 10_000, 0, 1e12
+             ),
++            sql_in_keys=compare.env_int(
++                ROW_SQL_IN_KEYS_ENV,
++                min(32, base.keys),
++                1,
++                min(MAX_TRANSPARENT_SQL_ARRAY_KEYS, base.keys),
++            ),
++            sql_in_min_ops=compare.env_float(
++                ROW_SQL_IN_MIN_OPS_ENV, 10_000, 0, 1e12
++            ),
+             width_min_ops=compare.env_float(
+                 ROW_WIDTH_MIN_OPS_ENV, 0, 0, 1e12
+             ),
+@@ -161,6 +177,25 @@ def row_table_sql(keys: int, payload_size: int) -> str:
+     )
+ 
+ 
++def sql_in_table_sql(keys: int, payload_size: int) -> str:
++    return (
++        f"DROP TABLE IF EXISTS public.{SQL_IN_TABLE};"
++        f"CREATE TABLE public.{SQL_IN_TABLE} ("
++        "id bigint PRIMARY KEY, tenant_id bigint NOT NULL, "
++        "payload text NOT NULL, amount numeric(18,2), "
++        "enabled boolean NOT NULL, metadata jsonb NOT NULL, note text);"
++        f"INSERT INTO public.{SQL_IN_TABLE} "
++        "SELECT g, 7, repeat('x', "
++        f"{payload_size}), (g % 10000)::numeric / 100, (g % 2 = 0), "
++        "pg_catalog.jsonb_build_object('bucket', g % 16, 'active', g % 2 = 0), "
++        "CASE WHEN g % 3 = 0 THEN NULL ELSE 'note-' || g::text END "
++        f"FROM pg_catalog.generate_series(1, {keys}) AS g;"
++        f"GRANT SELECT, INSERT, UPDATE, DELETE ON public.{SQL_IN_TABLE} "
++        f"TO {compare.PG_APP_USER};"
++        f"ANALYZE public.{SQL_IN_TABLE};"
++    )
++
++
+ def setup_mapped_postgres(
+     config: compare.Config, payload_size: int
+ ) -> int:
+@@ -168,8 +203,11 @@ def setup_mapped_postgres(
+     compare.psql(
+         config,
+         row_table_sql(config.keys, payload_size)
++        + sql_in_table_sql(config.keys, payload_size)
+         + f"SELECT local_cache.attach_table("
+-        f"'public.{ROW_TABLE}'::regclass, false, '{ROW_NAMESPACE}');",
++        f"'public.{ROW_TABLE}'::regclass, false, '{ROW_NAMESPACE}');"
