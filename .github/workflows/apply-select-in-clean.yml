@@ -26,10 +26,17 @@ jobs:
           ref: feat/ordinary-select-in
           fetch-depth: 0
 
-      - name: Apply and validate documentation and benchmarks
+      - name: Apply, validate, and publish non-workflow files
         shell: bash
         run: |
           set -Eeuo pipefail
+
+          if grep -Fq 'PGLC_BENCH_ROW_SQL_IN_KEYS' benchmarks/whole_row.py && \
+             grep -Fq 'single-column `IN`/`ANY`' README.md; then
+            echo 'SELECT IN documentation and benchmarks are already applied'
+            exit 0
+          fi
+
           source_commit='adf0b9cf1c5bce1c19d8811d9620bc34fbe00e5c'
           mkdir -p /tmp/select-in-patches
 
@@ -52,8 +59,6 @@ jobs:
           git apply --check /tmp/select-in-patches/benchmark.patch
           git apply /tmp/select-in-patches/benchmark.patch
 
-          rm -f .github/workflows/apply-select-in-clean.yml
-
           python3 -m py_compile \
             benchmarks/scenarios.py \
             benchmarks/whole_row.py \
@@ -67,15 +72,14 @@ jobs:
             tests/pages_contract_test.py
           git diff --check
 
-      - name: Commit clean files
-        shell: bash
-        run: |
-          set -Eeuo pipefail
+          # The Actions token may not update workflow files. The validated CI
+          # change is committed separately through the GitHub connector.
+          git checkout -- .github/workflows/ci.yml
+
           git config user.name 'OpenAI Codex'
           git config user.email 'noreply@openai.com'
           git add -A
           test ! -e .agent
-          test ! -e .github/workflows/apply-select-in-clean.yml
           git diff --cached --check
           git commit -m 'docs: document and benchmark ordinary SELECT IN'
           git push origin HEAD:feat/ordinary-select-in
