@@ -1,25 +1,39 @@
 # pg_local_cache
 
-`pg_local_cache` is a PostgreSQL 14–18 extension that turns attached tables into a
-transaction-aware SQL key-value store. Applications keep using parameterized
-`SELECT` through libpq, JDBC, Npgsql, psycopg, or an ORM. No cache server, token,
-cache-specific driver, or proprietary SQL syntax is required.
+`pg_local_cache` is a PostgreSQL 14–18 extension for repeated primary-key reads.
+It keeps hot whole rows in bounded PostgreSQL shared memory and can transparently
+accelerate supported ordinary `SELECT` statements after a table is attached.
 
-Attached tables use transaction-aware invalidation. Source writes fence affected
-entries before commit visibility, and rollback never exposes uncommitted row
-data. PostgreSQL remains authoritative: a missing, unsafe, malformed, or
-oversized entry runs the normal source plan.
+PostgreSQL remains the source of truth. A cache miss, unsupported query shape,
+unsafe transaction state, malformed entry, or oversized row runs the original
+primary-key index plan. Source writes publish transaction-aware invalidation
+fences before commit visibility, and rollback never exposes uncommitted data.
 
-The current implementation supports PostgreSQL 14–18 on Linux amd64 (glibc and
-musl), one configured database, and one writable primary. It is a narrow
-primary-key fast path, not a general query cache.
+Applications keep their existing PostgreSQL driver or ORM. The transparent SQL
+path needs no separate cache process, token, cache client, or proprietary query
+syntax. Installation is not zero-touch: the extension uses
+`shared_preload_libraries`, allocates a bounded cache at postmaster startup, and
+requires one controlled restart for first activation.
+
+## Product boundary
+
+| Good fit | Not the product |
+|---|---|
+| Repeated exact-primary-key reads whose hot working set fits the configured cache. | A general query or result cache for joins, ranges, aggregates, arbitrary predicates, or full-table scans. |
+| Applications that should keep ordinary PostgreSQL row types, ACLs, drivers, and ORM queries. | A universal Redis/Valkey replacement, distributed cache, pub/sub system, TTL store, or multi-primary coordination layer. |
+| A single writable primary where transaction-aware invalidation is more valuable than maximum standalone cache throughput. | A way to avoid PostgreSQL operations: preload, restart planning, memory sizing, monitoring, and table attachment are still required. |
+
+Unsupported or unsafe reads fall back to PostgreSQL rather than returning a
+partial cached answer. Current packaged builds target PostgreSQL 14–18 on Linux
+amd64 (glibc or musl), one configured database, and one writable primary.
 
 ## Capabilities
 
 | Capability | Behavior |
 |---|---|
-| Native tuple API | Ordinary primary-key `SELECT` returns the table row type; single-column `IN`/`ANY` batches keep normal SQL row-set semantics. |
-| Batch JSON API | `local_cache.get()` and `local_cache.mget()` provide ordered whole-row JSON for KV-style callers. |
+| Transparent SQL fast path | Supported exact-primary-key and bounded single-column `IN`/`ANY` reads preserve ordinary row, projection, and ACL semantics. |
+| Explicit JSON API | `local_cache.get()` and `local_cache.mget()` provide whole-row JSON for callers that want a cache-shaped API. |
+| Source-plan fallback | Unsupported, unsafe, missing, malformed, or oversized entries execute PostgreSQL's retained source plan. |
 | Whole rows | Each entry stores one versioned PostgreSQL composite row. |
 | Transactional invalidation | `INSERT`, `UPDATE`, `DELETE`, and `TRUNCATE` fence affected entries before commit visibility. |
 | Bounded extension memory | Entry capacity, client slots, and deterministic extension allocations are fixed at startup. |
@@ -237,24 +251,47 @@ miss. Writable mappings expose PostgreSQL-backed `SET` and `DEL`. See the
 
 ## Benchmarks
 
-[CI run 30803546805](https://github.com/profundium/pg_local_cache/actions/runs/30803546805)
+The project reports different interfaces separately. A key resolved inside a
+32-key batch is not presented as one SQL statement, and RESP throughput is not
+used to imply ordinary-SQL throughput.
+
+### Ordinary SQL and RESP comparative smoke
+
+[CI run 31172234073](https://github.com/profundium/pg_local_cache/actions/runs/31172234073)
+for [source `71b0aa3`](https://github.com/profundium/pg_local_cache/commit/71b0aa3a27c5c009b7ba08bbaa660147f078bde8)
+passed every gate after full-working-set stabilization:
+
+| Measured lane | pg_local_cache | Comparison target | Relative result |
+|---|---:|---:|---:|
+| Ordinary `SELECT *` by complete primary key | 123,707 statements/s | 65,867 stock PostgreSQL statements/s | 1.88x |
+| Reordered direct-column projection | 118,679 statements/s | 63,952 stock PostgreSQL statements/s | 1.86x |
+| Reordered composite-PK predicates | 126,550 statements/s | 68,746 stock PostgreSQL statements/s | 1.84x |
+| Ordinary 32-key `SELECT ... IN (...)` | 865,201 key ops/s; 27,038 statements/s | 328,282 key ops/s; 10,259 statements/s | 2.64x |
+| Warm RESP2 `GET` | 143,104 ops/s | 194,910 Valkey; 197,522 Redis ops/s | 0.72x Redis |
+
+The RESP row is intentional rather than hidden: in this run, dedicated Valkey
+and Redis were 1.36–1.38x faster on raw warm `GET`. The product's differentiator
+is transaction-aware PostgreSQL integration and ordinary SQL compatibility, not
+a claim to beat a dedicated in-memory server at its native protocol.
+
+This was a one-second, one-repetition shared-runner regression smoke with four
+clients, pipeline depth eight, 128 keys per attached table, 256 cache entries,
+and two CPU cores per server target. It is evidence that the fast paths work and
+remain faster in that exact profile, not a production capacity estimate.
+
+### Explicit SQL GET/MGET profile
+
+A separate [CI run 30803546805](https://github.com/profundium/pg_local_cache/actions/runs/30803546805)
 for [source `fe2d23c`](https://github.com/profundium/pg_local_cache/commit/fe2d23c87ddc7e523ada2951376ebcb7d8570fb1)
-passed every current regression gate. Exact primary-key `SELECT` measured
-1.84–1.94x stock PostgreSQL in the ordinary-SQL smoke. `local_cache.mget()`
-measured 64,954 prepared and 66,156 unnamed-extended key ops/s: 10.30x and
-10.39x the stock batch query in that profile.
+measured `local_cache.mget()` at 64,954 prepared and 66,156 unnamed-extended
+key ops/s: 10.30x and 10.39x the stock PostgreSQL batch query in that specific
+32-key JSON workload. This explicit API and workload are not directly
+comparable with ordinary `SELECT`, statements/s, or RESP `GET`.
 
-New `benchmarks/run.sh` executions also compare an identical 32-key ordinary
-`SELECT ... IN (...)` on mapped and stock PostgreSQL. The report publishes both
-key ops/s and statements/s and rejects a mapped result unless every returned key
-is a cache hit with zero timed misses, fills, or bypasses. The preserved
-`fe2d23c` evidence predates that lane and remains the source for the numeric
-results above.
-
-These shared-runner smokes detect regressions; they are not capacity claims.
 See the [benchmark methodology and exact commands](docs/BENCHMARKS.md), the
-[scenario definitions](benchmarks/SCENARIOS.md), and the preserved
-[evidence manifest](assets/benchmark-evidence/fe2d23c/README.md).
+[scenario definitions](benchmarks/SCENARIOS.md), the latest
+[raw ordinary-SQL/RESP evidence](assets/benchmark-evidence/71b0aa3/README.md),
+and the preserved [SQL GET/MGET evidence](assets/benchmark-evidence/fe2d23c/README.md).
 
 ## Monitoring
 

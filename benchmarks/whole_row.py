@@ -1072,43 +1072,80 @@ def fmt(value: object, digits: int = 0) -> str:
 
 def render_markdown(report: dict[str, Any]) -> str:
     resp = report["resp_full_row"]
+    environment = report.get("environment", {})
+    workload = report.get("workload", {})
+    source_revision = environment.get("source_revision", "unknown")
+    redis_rate = float(
+        resp["targets"]["redis"]["summary"]["median_operations_per_second"]
+    )
+
     lines = [
-        "# pg_local_cache whole-row benchmark",
+        "# pg_local_cache comparative benchmark",
         "",
         f"Generated: `{report['generated_at_utc']}`",
+        f"Source revision: `{source_revision}`",
         "",
-        "Every RESP target receives the same key stream and byte-identical "
-        "per-key row JSON values.",
+        "This is a warm-cache regression smoke, not a production capacity "
+        "claim. Ratios compare only identical operations inside this run.",
+        "",
+        "## Profile",
+        "",
+        "| Setting | Value |",
+        "|---|---:|",
+        f"| Duration / repetitions | {workload.get('duration_seconds', 'unknown')} s / {workload.get('repetitions', 'unknown')} |",
+        f"| Clients / pgbench jobs | {workload.get('concurrency', 'unknown')} / {workload.get('pgbench_jobs', 'unknown')} |",
+        f"| Pipeline depth | {workload.get('pipeline', 'unknown')} statements |",
+        f"| Keys per attached table / cache entries | {workload.get('keys', 'unknown')} / {workload.get('cache_capacity', 'unknown')} |",
+        f"| Client / server CPU quotas | {workload.get('client_cpus', 'unknown')} / {workload.get('server_cpus_per_target', 'unknown')} cores |",
+        f"| Row text payload | {workload.get('row_text_bytes', 'unknown')} bytes |",
         "",
         "## Full-row RESP GET",
         "",
-        "| Target | Median ops/s | Min-max ops/s | p99 | Errors |",
-        "|---|---:|---:|---:|---:|",
+        "| Target | Median ops/s | Min-max ops/s | p99 | Relative to Redis | Errors |",
+        "|---|---:|---:|---:|---:|---:|",
     ]
     for name in ("pg_local_cache", "valkey", "redis"):
         target = resp["targets"][name]
         summary = target["summary"]
+        rate = float(summary["median_operations_per_second"])
+        relative = rate / redis_rate if redis_rate > 0 else math.nan
         errors = sum(int(run["errors"]) for run in target["runs"])
         lines.append(
-            f"| {name} | {fmt(summary['median_operations_per_second'])} | "
+            f"| {name} | {fmt(rate)} | "
             f"{fmt(summary['minimum_operations_per_second'])}-"
             f"{fmt(summary['maximum_operations_per_second'])} | "
-            f"{fmt(summary['median_p99_ms'], 3)} ms | {errors} |"
+            f"{fmt(summary['median_p99_ms'], 3)} ms | "
+            f"{relative:.2f}x | {errors} |"
         )
+    pglc_resp_rate = float(
+        resp["targets"]["pg_local_cache"]["summary"][
+            "median_operations_per_second"
+        ]
+    )
+    redis_advantage = redis_rate / pglc_resp_rate if pglc_resp_rate > 0 else math.nan
     lines.extend(
         (
             "",
+            "Dedicated Redis and Valkey are included as the raw RESP throughput "
+            "baseline. A result below 1.00x is reported rather than hidden; in "
+            f"this run Redis was {redis_advantage:.2f}x faster than pg_local_cache.",
+            "",
             "## Ordinary SQL whole-row/projection lanes",
             "",
-            "| Lane | Mapped PostgreSQL median ops/s | Stock PostgreSQL median ops/s |",
-            "|---|---:|---:|",
+            "| Lane | Mapped PostgreSQL median statements/s | Stock PostgreSQL median statements/s | Mapped/stock |",
+            "|---|---:|---:|---:|",
         )
     )
     for name, lane in report["ordinary_sql"].items():
+        mapped = float(
+            lane["mapped_postgres"]["summary"]["median_operations_per_second"]
+        )
+        stock = float(
+            lane["stock_postgres"]["summary"]["median_operations_per_second"]
+        )
+        ratio = mapped / stock if stock > 0 else math.nan
         lines.append(
-            f"| {name} | "
-            f"{fmt(lane['mapped_postgres']['summary']['median_operations_per_second'])} | "
-            f"{fmt(lane['stock_postgres']['summary']['median_operations_per_second'])} |"
+            f"| {name} | {fmt(mapped)} | {fmt(stock)} | {ratio:.2f}x |"
         )
     sql_in = report["ordinary_sql_in"]
     lines.extend(
@@ -1150,10 +1187,15 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"Overall gate: **{report['gate']['status']}** — "
             f"{report['gate']['message']}",
             "",
-            "RESP values are PostgreSQL `row_to_json` bytes. Valkey and Redis "
+            "## Interpretation limits",
+            "",
+            "- Warm positive hits are measured after explicit stabilization.",
+            "- SQL key ops/s, SQL statements/s, and RESP requests/s are separate units.",
+            "- This run does not establish write, miss, failover, storage, or end-to-end application capacity.",
+            "- RESP values are PostgreSQL `row_to_json` bytes. Valkey and Redis "
             "store exactly those bytes; pg_local_cache derives them from the "
             "authoritative table and maintains transactional invalidation.",
-            "SQL values are validated before timing. Prepared/pipelined pgbench "
+            "- SQL values are validated before timing. Prepared/pipelined pgbench "
             "uses identical SELECT text against mapped and stock PostgreSQL.",
             "",
         )

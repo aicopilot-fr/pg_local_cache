@@ -1,7 +1,7 @@
 ---
 layout: doc
 title: PostgreSQL cache benchmarks
-description: Reproducible measurements of SQL GET/MGET, ordinary exact-key and IN/ANY SELECT, and RESP GET against stock PostgreSQL, Valkey and Redis.
+description: Reproducible, source-pinned measurements of ordinary PostgreSQL SELECT, SQL GET/MGET, and RESP GET, including both gains and observed trade-offs.
 section: Benchmarks
 permalink: /docs/BENCHMARKS.html
 ---
@@ -21,21 +21,58 @@ The suites measure different operations and are reported separately.
 Write, rollback, DDL, and invalidation semantics are verified by integration
 tests instead of being inferred from read throughput.
 
-## Current CI result (`fe2d23c`)
+A published number is meaningful only with its operation definition. In
+particular, 32-key `key ops/s`, SQL `statements/s`, and RESP requests/s are not
+interchangeable. Ratios below compare only the same command shape, protocol,
+working set, and run.
 
-[CI run 30803546805](https://github.com/profundium/pg_local_cache/actions/runs/30803546805)
-measured [source `fe2d23c`](https://github.com/profundium/pg_local_cache/commit/fe2d23c87ddc7e523ada2951376ebcb7d8570fb1)
-and passed every independent gate. Both exact artifacts are preserved with raw
-JSON and rendered Markdown. That preserved run predates the transparent
-`IN`/`ANY` lane; new `whole-row.json` reports use schema version 3 and include
-that lane in addition to the tables below:
+## Evidence snapshots
 
-| Current API suites | Evidence | Actions artifact | SHA-256 |
-|---|---|---:|---|
-| SQL GET/MGET | [`sql-only-benchmark-smoke.zip`](../assets/benchmark-evidence/fe2d23c/sql-only-benchmark-smoke.zip) | `8851940541` | `22be445d210138be086da186bdbe4c7fb1e3543b4a26b3f98b90c8099e929d02` |
-| Ordinary SELECT and RESP2 GET | [`comparison-smoke.zip`](../assets/benchmark-evidence/fe2d23c/comparison-smoke.zip) | `8851825673` | `fc624e7ebed11b10c8470d11e7d2a91855813e04f9fb809e62e4f0852f7c8a76` |
+Two source-pinned snapshots are kept because they exercise different public
+interfaces:
 
-### SQL GET/MGET
+| Snapshot | Source and CI | Raw evidence | Scope |
+|---|---|---|---|
+| Ordinary SQL, 32-key `IN`, RESP GET | [`71b0aa3`](https://github.com/profundium/pg_local_cache/commit/71b0aa3a27c5c009b7ba08bbaa660147f078bde8), [run 31172234073](https://github.com/profundium/pg_local_cache/actions/runs/31172234073) | [`whole-row.json`](../assets/benchmark-evidence/71b0aa3/whole-row.json), [`whole-row.txt`](../assets/benchmark-evidence/71b0aa3/whole-row.txt) | Latest transparent SQL and RESP comparison; schema version 3. |
+| SQL GET/MGET and scalar latency | [`fe2d23c`](https://github.com/profundium/pg_local_cache/commit/fe2d23c87ddc7e523ada2951376ebcb7d8570fb1), [run 30803546805](https://github.com/profundium/pg_local_cache/actions/runs/30803546805) | [`sql-only-benchmark-smoke.zip`](../assets/benchmark-evidence/fe2d23c/sql-only-benchmark-smoke.zip), [`comparison-smoke.zip`](../assets/benchmark-evidence/fe2d23c/comparison-smoke.zip) | Explicit JSON GET/MGET plus the earlier ordinary-SQL/RESP snapshot. |
+
+### Latest ordinary SQL, `IN`/`ANY`, and RESP smoke (`71b0aa3`)
+
+The latest green comparison used PostgreSQL 16.14, four clients, pipeline depth
+eight, 128 deterministic rows per attached table, 256 cache entries, two CPU
+cores per server target, and one timed second after explicit full-working-set
+stabilization.
+
+| Ordinary SQL lane | Mapped PostgreSQL | Stock PostgreSQL | Mapped/stock |
+|---|---:|---:|---:|
+| `SELECT *` by complete composite PK | 123,707 statements/s | 65,867 statements/s | 1.88x |
+| Reordered direct-column projection | 118,679 statements/s | 63,952 statements/s | 1.86x |
+| Reordered composite-PK predicates | 126,550 statements/s | 68,746 statements/s | 1.84x |
+
+| Ordinary 32-key `SELECT IN` | Mapped PostgreSQL | Stock PostgreSQL | Mapped/stock |
+|---|---:|---:|---:|
+| Key throughput | 865,201 key ops/s | 328,282 key ops/s | 2.64x |
+| Statement throughput | 27,038 statements/s | 10,259 statements/s | 2.64x |
+
+| Warm RESP2 target | Ops/s | p99 | Relative to Redis |
+|---|---:|---:|---:|
+| pg_local_cache | 143,104 | 0.415 ms | 0.72x |
+| Valkey 9.1.1 | 194,910 | 0.266 ms | 0.99x |
+| Redis 8.8.1 | 197,522 | 0.269 ms | 1.00x |
+
+The SQL lanes show the benefit of avoiding repeated PostgreSQL index and tuple
+work for this warm primary-key profile. The RESP lane shows the opposite side
+of the trade-off: dedicated Valkey and Redis were 1.36–1.38x faster at raw warm
+`GET`. pg_local_cache is therefore positioned around transaction-aware source
+integration and ordinary SQL compatibility, not maximum standalone cache
+throughput.
+
+The smoke had one short repetition, so it is a regression and correctness
+signal. This is not a production capacity claim. Every timed mapped SQL key was
+matched to one cache-hit counter increment with zero misses, fills, bypasses, or
+failed batches.
+
+## SQL GET/MGET results (separate snapshot)
 
 The strict throughput profile used 16 connections and a 32-key array. These
 are the complete SQL commands after pgbench created the 32 key variables; both
@@ -96,6 +133,8 @@ limit. PostgreSQL 16.14 used 4,096 incompressible 3,000-byte rows, two seconds
 of warmup, four pgbench jobs, and three rotated five-second repetitions. Every
 timed cached key produced exactly one hit with zero misses, fills, or bypasses.
 
+## Ordinary SQL and RESP results (latest snapshot)
+
 ### Ordinary SQL
 
 Both PostgreSQL targets used the complete prepared command template shown
@@ -105,9 +144,9 @@ extension.
 
 | Command template | Mapped cache ops/s | Stock PostgreSQL ops/s | Mapped/stock |
 |---|---:|---:|---:|
-| `SELECT * FROM public.pg_local_cache_whole_row_comparison WHERE tenant_id = 7 AND id = :key;` | 126,710 | 65,257 | 1.94x |
-| `SELECT metadata, payload, enabled, amount, note, id, tenant_id FROM public.pg_local_cache_whole_row_comparison WHERE tenant_id = 7 AND id = :key;` | 123,051 | 65,236 | 1.89x |
-| `SELECT payload, metadata, id, tenant_id FROM public.pg_local_cache_whole_row_comparison WHERE id = :key AND tenant_id = 7;` | 131,017 | 71,398 | 1.84x |
+| `SELECT * FROM public.pg_local_cache_whole_row_comparison WHERE tenant_id = 7 AND id = :key;` | 123,707 | 65,867 | 1.88x |
+| `SELECT metadata, payload, enabled, amount, note, id, tenant_id FROM public.pg_local_cache_whole_row_comparison WHERE tenant_id = 7 AND id = :key;` | 118,679 | 63,952 | 1.86x |
+| `SELECT payload, metadata, id, tenant_id FROM public.pg_local_cache_whole_row_comparison WHERE id = :key AND tenant_id = 7;` | 126,550 | 68,746 | 1.84x |
 
 The mapped working set was filled and stabilized before measurement. Each
 timed mapped operation produced one exact cache hit; misses, fills, bypasses,
@@ -129,12 +168,18 @@ WHERE id IN ((:key_0)::bigint, (:key_1)::bigint, (:key_2)::bigint, (:key_3)::big
 ```
 
 The pgbench script chooses a contiguous unique key window for every statement,
-so the number of returned keys is known exactly. `key ops/s` is
-`batch TPS × pipeline depth × keys per statement`; the report also publishes
-SQL statements/s. Before timing, a complete-keyspace pass must show exactly one
-hit per row and zero misses, fills, and bypasses. During the mapped timing
-window, successful returned keys must equal the `sql_cache_hits` delta exactly;
-any miss, fill, bypass, failed batch, or row-set mismatch fails the lane.
+so the number of returned keys is known exactly. The latest result was:
+
+| Keys / statement | Mapped key ops/s | Stock key ops/s | Mapped statements/s | Stock statements/s | Mapped/stock |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 865,201 | 328,282 | 27,038 | 10,259 | 2.64x |
+
+`key ops/s` is `batch TPS × pipeline depth × keys per statement`; the report
+also publishes SQL statements/s. Before timing, a complete-keyspace pass must
+show exactly one hit per row and zero misses, fills, and bypasses. During the
+mapped timing window, successful returned keys must equal the `sql_cache_hits`
+delta exactly; any miss, fill, bypass, failed batch, or row-set mismatch fails
+the lane.
 
 This lane intentionally measures the all-hit transparent path. Correctness tests
 separately prove that a mixed hit/miss array falls back as one PostgreSQL
@@ -151,9 +196,9 @@ key stream; subsequent operations changed only the `id` value.
 
 | Target | Command | Ops/s | p50 | p95 | p99 | Errors |
 |---|---|---:|---:|---:|---:|---:|
-| pg_local_cache | `GET CRUD:benchmark.public.pg_local_cache_whole_row_comparison:{"id":1,"tenant_id":7}` | 150,569 | 0.176 ms | 0.324 ms | 0.394 ms | 0 |
-| Valkey 9.1.1 | `GET CRUD:benchmark.public.pg_local_cache_whole_row_comparison:{"id":1,"tenant_id":7}` | 201,248 | 0.137 ms | 0.205 ms | 0.281 ms | 0 |
-| Redis 8.8.1 | `GET CRUD:benchmark.public.pg_local_cache_whole_row_comparison:{"id":1,"tenant_id":7}` | 205,430 | 0.134 ms | 0.200 ms | 0.271 ms | 0 |
+| pg_local_cache | `GET CRUD:benchmark.public.pg_local_cache_whole_row_comparison:{"id":1,"tenant_id":7}` | 143,104 | 0.176 ms | 0.325 ms | 0.415 ms | 0 |
+| Valkey 9.1.1 | `GET CRUD:benchmark.public.pg_local_cache_whole_row_comparison:{"id":1,"tenant_id":7}` | 194,910 | 0.137 ms | 0.205 ms | 0.266 ms | 0 |
+| Redis 8.8.1 | `GET CRUD:benchmark.public.pg_local_cache_whole_row_comparison:{"id":1,"tenant_id":7}` | 197,522 | 0.134 ms | 0.200 ms | 0.269 ms | 0 |
 
 Valkey and Redis persistence was disabled because this lane measures warm cache
 reads, not durable writes. Every response was decoded and compared byte-for-byte
@@ -182,6 +227,11 @@ effective settings:
 This short shared-runner run is useful as a correctness and regression smoke.
 One repetition is not a capacity study, and the displayed relative ratios must
 not be generalized to different rows, concurrency, hardware, or storage.
+
+It does not measure write throughput, commit latency under invalidation load,
+cold-miss latency, standby behavior, failover, application-to-database network
+latency, or unsupported query shapes. Those require separate workload-specific
+experiments.
 
 ## SQL GET/MGET methodology
 

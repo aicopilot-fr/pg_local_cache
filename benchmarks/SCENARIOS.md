@@ -125,5 +125,10 @@ tests rather than folded into warm-cache throughput.
   limits, duration, repetitions, and coefficient of variation.
 - Compare throughput only within the same protocol and workload; do not
   compare SQL `IN` key ops/s directly with scalar statements/s.
+- Report unfavorable comparisons as well as favorable ones. In particular, the
+  RESP lane is a raw protocol comparison against dedicated Valkey and Redis,
+  while the SQL lanes measure integration inside PostgreSQL.
 - Compare latency from the dedicated scalar-key pass; batch latency is not
   single-key latency.
+- Size `PGLC_BENCH_CACHE_ENTRIES` for both attached benchmark keyspaces. The
+  harness fails before timing when the configured capacity cannot hold them.
