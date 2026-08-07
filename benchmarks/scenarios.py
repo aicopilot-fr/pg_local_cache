@@ -117,9 +117,12 @@ def run_pgbench_once(
     seed: int,
     setup_sql: str | None = None,
     query_protocol: str = "prepared",
+    operations_per_statement: int = 1,
 ) -> dict[str, Any]:
     if query_protocol not in SQL_QUERY_PROTOCOLS:
         raise ValueError("SQL query protocol must be 'prepared' or 'extended'")
+    if operations_per_statement < 1:
+        raise ValueError("operations_per_statement must be positive")
     environment = os.environ.copy()
     environment["PGPASSWORD"] = config.pg_password
     environment["PGCONNECT_TIMEOUT"] = "10"
@@ -158,8 +161,12 @@ def run_pgbench_once(
         env=environment,
         timeout=max(90, math.ceil(duration) + 60),
     )
-    parsed = parse_pgbench_output(result.stdout, config.pipeline)
+    parsed = parse_pgbench_output(
+        result.stdout, config.pipeline * operations_per_statement
+    )
     parsed["query_protocol"] = query_protocol
+    parsed["statements_per_batch"] = config.pipeline
+    parsed["operations_per_statement"] = operations_per_statement
     return parsed
 
 
@@ -169,6 +176,7 @@ def run_pgbench_repetitions(
     script: str,
     seed_base: int,
     setup_sql: str | None = None,
+    operations_per_statement: int = 1,
 ) -> dict[str, Any]:
     with tempfile.NamedTemporaryFile(
         mode="w", prefix="pglc_whole_row_", suffix=".sql", delete=False
@@ -184,6 +192,7 @@ def run_pgbench_repetitions(
                 config.warmup_seconds,
                 seed_base - 1,
                 setup_sql,
+                operations_per_statement=operations_per_statement,
             )
         runs = [
             run_pgbench_once(
@@ -193,6 +202,7 @@ def run_pgbench_repetitions(
                 config.duration,
                 seed_base + index,
                 setup_sql,
+                operations_per_statement=operations_per_statement,
             )
             for index in range(config.repetitions)
         ]
@@ -201,7 +211,9 @@ def run_pgbench_repetitions(
     return {
         "runs": runs,
         "summary": compare.summarize_throughput_runs(runs),
-        "operations_per_batch": config.pipeline,
+        "operations_per_batch": config.pipeline * operations_per_statement,
+        "statements_per_batch": config.pipeline,
+        "operations_per_statement": operations_per_statement,
     }
 
 

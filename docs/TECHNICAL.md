@@ -131,10 +131,17 @@ database connection:
 ```sql
 SELECT * FROM public.items WHERE id = $1::bigint;
 SELECT value FROM public.items WHERE id = $1::bigint;
+
+SELECT * FROM public.items WHERE id IN (1, 7, 42);
+
+SELECT id, value
+FROM public.items
+WHERE id = ANY($1::bigint[]);
 ```
 
 This returns the table's normal tuple type with PostgreSQL's normal projection,
-ACL, prepared-statement, and zero-or-one-row behavior. No result-type witness,
+ACL, prepared-statement, scalar zero-or-one-row behavior, and batch row-set
+semantics. No result-type witness,
 column definition list, custom driver, or rewritten result decoder is involved.
 The planner and executor fast path below is an implementation detail.
 
@@ -175,13 +182,17 @@ adds `Custom Scan (pg_local_cache_sql)` only when all of these conditions hold:
 - PostgreSQL is not in recovery or parallel execution;
 - the current transaction has not modified an attached mapping;
 - the query contains exactly one attached base table;
-- every restriction is primary-key equality against a constant or external
+- scalar lookup uses primary-key equality against a constant or external
   parameter, with every PK column present exactly once;
+- batch lookup uses equality `IN` / `= ANY(array)` on the complete
+  single-column primary key; its array is a constant, external parameter, or an
+  array built only from constants and external parameters;
 - the primary key is backed by the validated immediate B-tree primary index;
 - every selected expression is a direct column reference;
 - the query has no joins, CTEs, subqueries, aggregates, windows, grouping,
   distinct, ordering, offset, row lock, or set operation;
-- the query has no limit, or has a constant `LIMIT 1`.
+- scalar lookup has no limit or constant `LIMIT 1`; batch lookup has no
+  `LIMIT`.
 
 Examples that can use the path:
 
@@ -196,6 +207,12 @@ LIMIT 1;
 SELECT *
 FROM public.tenant_items
 WHERE item_id = $1 AND tenant_id = $2;
+
+SELECT * FROM public.items WHERE id IN (1, 7, 42);
+
+SELECT id, value
+FROM public.items
+WHERE id = ANY($1::bigint[]);
 ```
 
 Predicate order does not need to match composite-key order. Parameters must be
@@ -204,7 +221,7 @@ representation and lossless widening from `int2` to `int4`/`int8` or from
 `int4` to `int8`; other cross-type forms use the normal planner.
 
 The custom path retains the ordinary primary-key index path as its child.
-Execution follows this sequence:
+Scalar execution follows this sequence:
 
 1. Revalidate mapping generation, relation shape, triggers, isolation level,
    snapshot type, and transaction state.
@@ -217,7 +234,18 @@ Execution follows this sequence:
 6. Fill only after a latest-snapshot visibility proof and only if the read token
    still matches all relevant generations.
 
-Unsupported query shapes use normal PostgreSQL paths. Runtime safety failures
+For `IN`/`ANY`, the executor evaluates the array once, ignores `NULL` elements,
+canonicalizes and deduplicates at most 1,024 keys, and copies at most 16 MiB of
+validated composite data into query-local memory. It returns cached rows only
+when every distinct key is a safe positive hit. One miss, negative entry,
+snapshot rejection, malformed payload, or budget overflow switches the entire
+statement to the retained PostgreSQL scalar-array index plan. The executor
+never merges a partial cache result with source rows, so PostgreSQL's duplicate,
+`NULL`, and missing-key semantics are preserved. Rows returned by a cold child
+scan can refill their individual keys after the normal latest-snapshot proof.
+
+Composite tuple `IN`, `ALL`, extra predicates, array queries with `LIMIT`, and
+arrays containing unsupported expressions use normal PostgreSQL paths. Runtime safety failures
 use the retained child plan. A missing row is fetched through that plan and
 returns zero rows.
 The SQL path does not trust negative RESP entries as authoritative for an
@@ -467,6 +495,8 @@ against the deployment.
   constraints, triggers, and commit.
 - A network failure before a RESP write reply leaves the commit outcome
   unknown to the client.
+- Transparent `IN`/`ANY` is bounded to 1,024 elements and 16 MiB of
+  query-local tuple copies; exceeding either bound executes PostgreSQL.
 - The cache is not a durability layer. PostgreSQL remains the source of truth.
 - Mappings are not automatically recreated for a new relation that reuses a
   dropped table's name.

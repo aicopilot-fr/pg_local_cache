@@ -1,7 +1,7 @@
 ---
 layout: default
 title: Transactional SQL cache for PostgreSQL 14–18
-description: Install a PostgreSQL 14–18 Linux extension that accelerates exact-primary-key SELECT and SQL GET/MGET with transaction-aware invalidation.
+description: Install a PostgreSQL 14–18 Linux extension that accelerates exact-primary-key and IN/ANY SELECT plus SQL GET/MGET with transaction-aware invalidation.
 home: true
 permalink: /
 ---
@@ -9,7 +9,7 @@ permalink: /
   <section id="sql-api" class="page-section hero" aria-labelledby="hero-title">
     <div class="hero-copy">
       <h1 id="hero-title">A transactional cache for PostgreSQL 14–18</h1>
-      <p>Keep using ordinary primary-key SELECT, or call SQL GET/MGET through the same PostgreSQL driver. Ordinary DML fences affected entries before commit visibility.</p>
+      <p>Keep using ordinary primary-key SELECT—including single-column IN/ANY batches—or call SQL GET/MGET through the same PostgreSQL driver. Ordinary DML fences affected entries before commit visibility.</p>
       <div class="hero-actions">
         <a class="button primary" href="https://github.com/profundium/pg_local_cache/releases/latest/download/pg_local_cache-pg18-linux-glibc-amd64.tar.gz">Download PG18 glibc <span aria-hidden="true">→</span></a>
         <a class="button" href="{{ '/docs/INSTALL_EXISTING.html' | relative_url }}">Install guide <span aria-hidden="true">→</span></a>
@@ -17,6 +17,8 @@ permalink: /
       <div class="mini-code">
         <button class="copy-button" type="button" data-copy="hero-sql">Copy</button>
         <pre id="hero-sql"><code>SELECT local_cache.attach_table('public.items'::regclass);
+
+SELECT * FROM public.items WHERE id = ANY($1::bigint[]);
 
 SELECT local_cache.get('public.items'::regclass, $1::bigint);
 SELECT local_cache.mget(
@@ -64,7 +66,7 @@ COMMIT
         <div class="section-rule"></div>
         <h2 id="benchmark-title">Current SQL MGET benchmark</h2>
         <p>PostgreSQL 16.14, 4,096 incompressible 3,000-byte rows, 16 connections, 32 keys per MGET, two seconds of warmup, and three rotated five-second repetitions.</p>
-        <a href="{{ '/docs/BENCHMARKS.html' | relative_url }}">See ordinary SQL, GET/MGET and RESP results →</a>
+        <a href="{{ '/docs/BENCHMARKS.html' | relative_url }}">See ordinary scalar SQL, IN/ANY, GET/MGET and RESP methodology →</a>
       </div>
       <div>
         <div class="benchmark-summary" aria-label="Current SQL MGET benchmark summary">
@@ -120,7 +122,7 @@ sudo ./install.sh install --database app --mode sql-only</code></pre>
     <div class="docs-list">
       <a class="docs-link" href="{{ '/docs/INSTALL_EXISTING.html' | relative_url }}"><strong>Existing database</strong><span>Preflight, staging, restart, verification and rollback.</span><b>→</b></a>
       <a class="docs-link" href="{{ '/docs/TECHNICAL.html' | relative_url }}#architecture"><strong>Architecture</strong><span>Shared memory, hooks, workers and invalidation.</span><b>→</b></a>
-      <a class="docs-link" href="{{ '/#sql-api' | relative_url }}"><strong>SQL API</strong><span>Attach a table and use ordinary exact-primary-key SELECT or SQL GET/MGET.</span><b>→</b></a>
+      <a class="docs-link" href="{{ '/#sql-api' | relative_url }}"><strong>SQL API</strong><span>Attach a table and use ordinary exact-key or single-column IN/ANY SELECT, or SQL GET/MGET.</span><b>→</b></a>
       <a class="docs-link" href="{{ '/docs/BENCHMARKS.html' | relative_url }}"><strong>Benchmark methodology</strong><span>Workloads, limits, latency and downloadable evidence.</span><b>→</b></a>
       <a class="docs-link" href="{{ '/docs/MONITORING.html' | relative_url }}"><strong>Monitoring &amp; OOM</strong><span>Prometheus metrics, alerts, budgets and health checks.</span><b>→</b></a>
       <a class="docs-link" href="{{ '/docs/TECHNICAL.html' | relative_url }}#security-boundary"><strong>Security</strong><span>Privileges, token boundary, RLS and fail-closed checks.</span><b>→</b></a>

@@ -34,6 +34,29 @@ def measured_result() -> dict[str, object]:
     }
 
 
+def measured_in_result(keys_per_statement: int = 32) -> dict[str, object]:
+    successful_operations = keys_per_statement * 10
+    return {
+        "summary": {
+            "median_operations_per_second": 20_000,
+            "median_statements_per_second": 20_000 / keys_per_statement,
+        },
+        "runs": [
+            {
+                "operations_per_second": 20_000,
+                "errors": 0,
+                "failed_batches": 0,
+                "successful_operations": successful_operations,
+                "operations_per_statement": keys_per_statement,
+            }
+        ],
+        "sql_cache_hits_during_measurement": successful_operations,
+        "sql_cache_misses_during_measurement": 0,
+        "sql_cache_fills_during_measurement": 0,
+        "sql_cache_bypasses_during_measurement": 0,
+    }
+
+
 def whole_row_report() -> dict[str, object]:
     images = {
         name: {
@@ -63,7 +86,7 @@ def whole_row_report() -> dict[str, object]:
         )
     }
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "environment": {
             "source_revision": REVISION,
             "harness_sha256": HARNESS,
@@ -91,6 +114,7 @@ def whole_row_report() -> dict[str, object]:
             "pgbench_jobs": 2,
             "client_memory": "1g",
             "server_memory_per_target": "2g",
+            "ordinary_sql_in_keys_per_statement": 32,
         },
         "resp_full_row": {
             "gate": {
@@ -107,6 +131,17 @@ def whole_row_report() -> dict[str, object]:
             "minimum_mapped_ops_per_second": 10_000,
         },
         "ordinary_sql": sql_lanes,
+        "ordinary_sql_in_gate": {
+            "status": "PASS",
+            "minimum_mapped_key_ops_per_second": 10_000,
+            "keys_per_statement": 32,
+        },
+        "ordinary_sql_in": {
+            "keys_per_statement": 32,
+            "mapped_postgres": measured_in_result(),
+            "stock_postgres": measured_in_result(),
+            "mapped_to_stock_throughput_ratio": 1.0,
+        },
         "width_gate": {"status": "PASS"},
         "resp_payload_width_sweep": {"64": measured_result()},
         "gate": {"status": "PASS"},
@@ -190,6 +225,16 @@ class ReleaseEvidenceTests(unittest.TestCase):
         self.write_report(self.whole_path, report)
 
         with self.assertRaisesRegex(ValueError, "median does not match"):
+            VALIDATOR.validate_whole_row(self.whole_path, REVISION)
+
+    def test_rejects_select_in_cache_hit_accounting_mismatch(self) -> None:
+        report = whole_row_report()
+        report["ordinary_sql_in"]["mapped_postgres"][
+            "sql_cache_hits_during_measurement"
+        ] = 1
+        self.write_report(self.whole_path, report)
+
+        with self.assertRaisesRegex(ValueError, "cache-hit accounting"):
             VALIDATOR.validate_whole_row(self.whole_path, REVISION)
 
     def test_rejects_ineffective_client_cgroup_limit(self) -> None:
