@@ -40,10 +40,10 @@ jobs:
             > /tmp/select-in-docs.patch
 
           sed -i 's/^ diff --git /diff --git /' /tmp/select-in-benchmark.patch
-          git apply --check /tmp/select-in-benchmark.patch
-          git apply /tmp/select-in-benchmark.patch
           git apply --check /tmp/select-in-docs.patch
           git apply /tmp/select-in-docs.patch
+          git apply --check /tmp/select-in-benchmark.patch
+          git apply /tmp/select-in-benchmark.patch
 
           rm -f .github/workflows/apply-select-in-clean.yml
 
