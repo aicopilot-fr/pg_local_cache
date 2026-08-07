@@ -1,0 +1,63 @@
+name: Apply SELECT IN benchmark patch
+
+on:
+  push:
+    branches:
+      - feat/ordinary-select-in
+    paths:
+      - .github/workflows/apply-select-in-benchmark.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-select-in-benchmark
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the feature branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: feat/ordinary-select-in
+          fetch-depth: 0
+
+      - name: Apply and validate the benchmark patch
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat .agent/select-in-benchmark.patch.* > /tmp/select-in-benchmark.patch
+          sed -i 's/^ diff --git /diff --git /' /tmp/select-in-benchmark.patch
+          echo 'fbaa92798768e834e81b5a3b9321e1ee29c1a41aae77ef16a8b385937ceadc0c  /tmp/select-in-benchmark.patch' | sha256sum -c -
+          git apply --check /tmp/select-in-benchmark.patch
+          git apply /tmp/select-in-benchmark.patch
+          rm -f .agent/select-in-benchmark.patch.*
+          rmdir .agent 2>/dev/null || true
+          rm -f .github/workflows/apply-select-in-benchmark.yml
+
+          python3 -m py_compile \
+            benchmarks/scenarios.py \
+            benchmarks/whole_row.py \
+            scripts/validate_benchmark_evidence.py \
+            tests/release_evidence_test.py \
+            tests/whole_row_benchmark_test.py
+          make benchmark-test
+          python3 -m unittest -v tests/release_evidence_test.py
+          git diff --check
+
+      - name: Publish one clean benchmark commit
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'OpenAI Codex'
+          git config user.email 'noreply@openai.com'
+          git add -A
+          git reset --soft 222924cf097534394582539096611dcc764e1029
+          git diff --cached --check
+          test ! -e .agent
+          test ! -e .github/workflows/apply-select-in-benchmark.yml
+          git commit -m 'bench: measure ordinary SELECT IN'
+          git push --force-with-lease origin HEAD:feat/ordinary-select-in
