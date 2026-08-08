@@ -1,0 +1,151 @@
+name: PGXN package
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/pgxn.yml"
+      - ".gitignore"
+      - "LICENSE"
+      - "META.json"
+      - "Makefile"
+      - "PGXN.md"
+      - "README.md"
+      - "pg_local_cache.control"
+      - "scripts/build_pgxn_dist.py"
+      - "scripts/validate_pgxn_meta.py"
+      - "sql/**"
+      - "src/pg_local_cache_worker.c"
+      - "tests/pgxn_contract_test.py"
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/pgxn.yml"
+      - ".gitignore"
+      - "LICENSE"
+      - "META.json"
+      - "Makefile"
+      - "PGXN.md"
+      - "README.md"
+      - "pg_local_cache.control"
+      - "scripts/build_pgxn_dist.py"
+      - "scripts/validate_pgxn_meta.py"
+      - "sql/**"
+      - "src/pg_local_cache_worker.c"
+      - "tests/pgxn_contract_test.py"
+  workflow_run:
+    workflows: ["Release PostgreSQL 14-18 Linux artifacts"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to package
+        required: false
+        default: master
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pgxn-package-${{ github.event_name }}-${{ github.event.workflow_run.id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.event_name != 'workflow_run'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate metadata and build PGXN ZIP
+        run: make pgxn-check dist
+
+      - name: Upload review artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pgxn-distribution
+          path: dist/pg_local_cache-*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'master' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Check out released source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build exact PGXN distribution
+        run: make pgxn-check dist
+
+      - name: Attach ZIP to immutable releases
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          version="$(python3 scripts/validate_pgxn_meta.py --print-version)"
+          asset="dist/pg_local_cache-${version}.zip"
+          test -f "$asset"
+
+          sha="$(git rev-parse HEAD)"
+          [[ "$sha" == "$RELEASE_SHA" ]]
+          commit_tag="master-${sha:0:12}"
+          stable_tag="v${version}"
+
+          upload_exact_asset() {
+            local tag="$1" name existing temporary
+            name="$(basename "$asset")"
+            gh release view "$tag" >/dev/null
+            existing="$(
+              gh release view "$tag" --json assets --jq '.assets[].name'
+            )"
+            if grep -Fxq "$name" <<<"$existing"; then
+              temporary="$(mktemp -d)"
+              gh release download "$tag" \
+                --pattern "$name" \
+                --dir "$temporary"
+              cmp --silent "$asset" "$temporary/$name" || {
+                echo "::error::${tag}/${name} already exists with different bytes"
+                return 1
+              }
+              echo "::notice::${tag}/${name} already matches"
+            else
+              gh release upload "$tag" "$asset"
+            fi
+          }
+
+          upload_exact_asset "$commit_tag"
+
+          stable_sha=""
+          if stable_sha="$(
+            gh api "repos/${GITHUB_REPOSITORY}/commits/${stable_tag}" \
+              --jq .sha 2>/dev/null
+          )"; then
+            if [[ "$stable_sha" == "$sha" ]]; then
+              upload_exact_asset "$stable_tag"
+            else
+              echo "::notice::${stable_tag} points to ${stable_sha}; not attaching an archive built from ${sha}"
+            fi
+          else
+            echo "::notice::${stable_tag} does not exist yet"
+          fi
