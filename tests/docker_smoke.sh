@@ -1133,7 +1133,11 @@ extension_version="$(
         --command \
         "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_local_cache'"
 )"
-[[ "$extension_version" == "1.1.0" ]]
+expected_extension_version="$(
+    sed -n "s/^default_version = '\([^']*\)'$/\1/p" pg_local_cache.control
+)"
+[[ -n "$expected_extension_version" ]]
+[[ "$extension_version" == "$expected_extension_version" ]]
 
 worker_count="$(
     compose exec -T postgres \

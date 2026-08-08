@@ -1,12 +1,113 @@
-# PGXN packaging and installation
+# PGXN packaging, automatic versions, and publishing
 
 `pg_local_cache` is packaged as a regular PGXS extension. The repository ships
-PGXN 1.0 metadata, a repository validator, and a deterministic
-`pg_local_cache-<version>.zip` builder.
+PGXN 1.0 metadata, a deterministic source bundle, automatic semantic
+versioning, and an authenticated release workflow.
 
-The package becomes available through `pgxn install pg_local_cache` only after a
-maintainer uploads a release archive to PGXN Manager. Until then, use the
-GitHub release assets documented in `README.md`.
+After the one-time PGXN credentials are configured, merging a release-worthy
+change to `master` is enough. The repository prepares the next version, runs the
+full CI and binary release pipelines, and uploads the exact stable ZIP to PGXN.
+No per-release PGXN Manager upload is required.
+
+## One-time repository setup
+
+1. Create and approve the maintainer account in PGXN Manager.
+2. Add these GitHub Actions repository secrets:
+
+   - `PGXN_USERNAME`
+   - `PGXN_PASSWORD`
+
+3. Allow GitHub Actions `contents: write` and `actions: write`. If `master` has a
+   branch protection rule, allow the repository Actions identity to create the
+   generated release commit, or replace the checkout credential with a narrowly
+   scoped repository token that has that permission.
+
+The workflow writes the credentials to a mode-`0600` temporary `.netrc` on
+the ephemeral runner and sends the ZIP to PGXN Manager's authenticated
+`POST /upload` endpoint as multipart field `archive`. The credentials are not
+written to the distribution, GitHub release, or repository. GitHub masks
+repository-secret values in workflow output.
+
+## Automatic release sequence
+
+A human push or merged pull request to `master` starts
+`.github/workflows/auto-version.yml`.
+
+1. `scripts/auto_version.py` finds the highest reachable stable `vX.Y.Z` tag.
+2. It classifies all commits since that tag.
+3. When a release is required, it updates every version-bearing source file and
+   creates the PostgreSQL install and upgrade SQL for the new version.
+4. The workflow commits the result as
+   `chore(release): prepare vX.Y.Z [skip version]`.
+5. Because GitHub does not recursively trigger workflows for a push made with
+   `GITHUB_TOKEN`, the workflow explicitly dispatches `ci.yml` for the new
+   version-bearing `master` commit.
+6. The existing release workflow builds and verifies PostgreSQL 14–18 artifacts
+   and creates immutable GitHub releases.
+7. The `PGXN package` workflow rebuilds the ZIP from the exact stable release
+   SHA, verifies that `vX.Y.Z` points to that SHA, and uploads it directly to
+   PGXN Manager over HTTPS.
+
+A rerun is idempotent. Before and after upload, the workflow downloads the
+published PGXN archive and byte-compares it with the stable GitHub release
+asset. An existing equal archive is accepted; different bytes fail closed.
+PGXN versions are immutable and are never overwritten.
+
+## Semantic version rules
+
+The latest stable Git tag is the baseline. Conventional Commit messages select
+the highest required bump:
+
+| Change since the stable tag | Version bump |
+|---|---|
+| `type!:` or a `BREAKING CHANGE:` footer | major |
+| `feat:` | minor |
+| `fix:`, `perf:`, `refactor:`, `build:`, `revert:`, `security:` | patch |
+| only `docs:`, `test:`, `ci:`, `chore:`, or `style:` | no stable release |
+| an unclassified non-merge production commit | patch, as a fail-safe |
+
+The generated release commit contains `[skip version]`, so it never asks for a
+second bump. Re-running the planner before the stable tag is created also stays
+idempotent: if the calculated version is already present, no files change.
+
+Inspect the plan locally:
+
+```bash
+make version-next
+python3 scripts/auto_version.py --json
+```
+
+Apply it locally for review:
+
+```bash
+make version-bump
+```
+
+Normal development does not need to run `version-bump`; the master workflow
+owns the release commit.
+
+## PostgreSQL upgrade SQL
+
+Released install files are immutable. The version planner compares the current
+install SQL with the same file from the latest stable tag.
+
+For a C-only release, it creates:
+
+- a new full install file, for example `pg_local_cache--1.2.0.sql`;
+- an explicit no-op upgrade file, for example
+  `pg_local_cache--1.1.0--1.2.0.sql`.
+
+When a change modifies extension SQL objects, commit the final full install SQL
+and also put only the incremental migration statements in:
+
+```text
+sql/pg_local_cache--unreleased.sql
+```
+
+The planner consumes that fragment into the generated `old--new` upgrade file,
+removes the fragment, and restores the released old install file from its tag.
+It fails closed if install SQL changed without an explicit migration, or if a
+migration fragment exists while the install SQL is unchanged.
 
 ## Install from PGXN
 
@@ -50,8 +151,7 @@ SQL objects without the preloaded module cannot initialize the shared cache.
 
 ## Validate and build the distribution
 
-The local validator checks the PGXN 1.0 required fields plus repository-specific
-version contracts:
+Validate the metadata and repository version contracts:
 
 ```bash
 make pgxn-check
@@ -69,51 +169,26 @@ The output is:
 dist/pg_local_cache-<version>.zip
 ```
 
-The builder:
+The builder packages the exact committed revision with one
+`pg_local_cache-<version>/` root, validates required metadata and source files,
+rejects dirty or unsafe release inputs, and prints the archive SHA-256 digest.
 
-- packages the exact committed revision with `git archive`;
-- places every file under `pg_local_cache-<version>/`;
-- verifies that `META.json`, the control file, current SQL file, C sources,
-  license, and documentation are present;
-- rejects dirty release inputs, unsafe archive paths, duplicate entries, and
-  private build directories;
-- prints the archive SHA-256 digest.
+## Recovery and manual verification
 
-PGXN Manager performs its own metadata validation on upload. A maintainer with
-the PGXN client installed can also run the official validator:
+Automatic publishing intentionally stops before PGXN when any invariant is not
+proven: missing credentials, a moving `master`, a stable tag pointing to another
+commit, metadata drift, a failed CI/release job, or an existing GitHub asset
+with different bytes.
+
+The generated ZIP is retained as a GitHub Actions artifact and attached to the
+immutable GitHub release. A maintainer can inspect it with:
 
 ```bash
-pgxn validate-meta
+VERSION="$(python3 scripts/validate_pgxn_meta.py --print-version)"
+unzip -t "dist/pg_local_cache-${VERSION}.zip"
+sha256sum "dist/pg_local_cache-${VERSION}.zip"
 ```
 
-## Maintainer release checklist
-
-1. Update the extension version in all version-bearing files.
-2. Run the full CI matrix.
-3. Create an immutable `v<version>` tag at the exact release commit.
-4. Confirm that the tag and current commit are identical:
-
-   ```bash
-   VERSION="$(python3 scripts/validate_pgxn_meta.py --print-version)"
-   test "$(git rev-parse "v${VERSION}^{commit}")" = "$(git rev-parse HEAD)"
-   ```
-
-5. Build and inspect the distribution:
-
-   ```bash
-   make dist
-   unzip -t "dist/pg_local_cache-${VERSION}.zip"
-   sha256sum "dist/pg_local_cache-${VERSION}.zip"
-   ```
-
-6. Upload that exact ZIP through PGXN Manager.
-
-Never reuse an existing semantic version for a different commit. If
-`v<version>` already points elsewhere, bump the extension and distribution
-version before uploading to PGXN.
-
-The `PGXN package` GitHub workflow validates pull requests and, after the main
-release workflow succeeds, adds the ZIP to the immutable commit release. It adds
-the same asset to `v<version>` only when that stable tag points to the exact
-release commit. PGXN credentials are intentionally not stored in GitHub Actions;
-the final PGXN Manager upload remains an explicit maintainer action.
+Never reuse an existing semantic version for a different commit. Fix the
+release input and produce a higher version instead of attempting to replace an
+immutable PGXN distribution.

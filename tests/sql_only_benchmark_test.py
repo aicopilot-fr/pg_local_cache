@@ -7,6 +7,7 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,14 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CONTROL = (ROOT / "pg_local_cache.control").read_text(encoding="utf-8")
+CURRENT_VERSION_MATCH = re.search(
+    r"^default_version = '([^']+)'$", CONTROL, flags=re.MULTILINE
+)
+if CURRENT_VERSION_MATCH is None:
+    raise RuntimeError("could not determine pg_local_cache version")
+CURRENT_VERSION = CURRENT_VERSION_MATCH.group(1)
+
 SPEC = importlib.util.spec_from_file_location(
     "pg_local_cache_sql_only_benchmark",
     ROOT / "benchmarks" / "sql_only.py",
@@ -232,7 +241,7 @@ def valid_report() -> dict[str, object]:
         "generated_at_utc": "2026-08-02T00:00:00+00:00",
         "server": {
             "pg_local_cache_port": 0,
-            "extension_version": "1.1.0",
+            "extension_version": CURRENT_VERSION,
             "server_version_num": 160014,
         },
         "stock_server": {
@@ -792,7 +801,7 @@ class ParserAndWorkloadTests(unittest.TestCase):
 class DatabaseContractTests(unittest.TestCase):
     def test_discovery_requires_expected_major_extension_and_port_zero(self) -> None:
         cfg = config()
-        discovery = "160014|1.1.0|0|app|16384|postgres|f"
+        discovery = f"160014|{CURRENT_VERSION}|0|app|16384|postgres|f"
         with mock.patch.object(
             sql_only, "psql", return_value=discovery
         ), mock.patch.object(sql_only, "read_stats", return_value=counters()):
@@ -801,8 +810,8 @@ class DatabaseContractTests(unittest.TestCase):
         self.assertEqual(result["cache_capacity"], 16_384)
 
         for bad, message in (
-            ("160014|1.1.0|6380|app|16384|postgres|f", "port=0"),
-            ("150014|1.1.0|0|app|16384|postgres|f", "PostgreSQL 16"),
+            (f"160014|{CURRENT_VERSION}|6380|app|16384|postgres|f", "port=0"),
+            (f"150014|{CURRENT_VERSION}|0|app|16384|postgres|f", "PostgreSQL 16"),
             ("160014||0|app|16384|postgres|f", "CREATE EXTENSION"),
         ):
             with self.subTest(bad=bad), mock.patch.object(
