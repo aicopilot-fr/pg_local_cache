@@ -1,0 +1,63 @@
+{
+  "name": "pg_local_cache",
+  "abstract": "Transaction-aware cache for PostgreSQL primary-key reads",
+  "description": "pg_local_cache keeps hot whole rows in bounded PostgreSQL shared memory and transparently accelerates supported ordinary primary-key SELECT and single-column IN/ANY reads. PostgreSQL remains authoritative: unsafe, unsupported, missing, malformed, or oversized entries run the original source plan, while writes publish transaction-aware invalidation fences before commit visibility.",
+  "version": "1.1.0",
+  "maintainer": [
+    "Maksim Bronnikov"
+  ],
+  "license": "mit",
+  "release_status": "stable",
+  "prereqs": {
+    "runtime": {
+      "requires": {
+        "PostgreSQL": ">= 14.0.0, < 19.0.0"
+      }
+    }
+  },
+  "provides": {
+    "pg_local_cache": {
+      "abstract": "Transaction-aware cache for ordinary PostgreSQL primary-key reads",
+      "file": "sql/pg_local_cache--1.1.0.sql",
+      "docfile": "README.md",
+      "version": "1.1.0"
+    }
+  },
+  "resources": {
+    "homepage": "https://profundium.github.io/pg_local_cache/",
+    "bugtracker": {
+      "web": "https://github.com/profundium/pg_local_cache/issues"
+    },
+    "repository": {
+      "url": "https://github.com/profundium/pg_local_cache.git",
+      "web": "https://github.com/profundium/pg_local_cache",
+      "type": "git"
+    }
+  },
+  "generated_by": "pg_local_cache maintainers",
+  "meta-spec": {
+    "version": "1.0.0",
+    "url": "https://pgxn.org/meta/spec.txt"
+  },
+  "tags": [
+    "cache",
+    "performance",
+    "shared-memory",
+    "primary-key",
+    "custom-scan",
+    "transactions",
+    "sql",
+    "postgresql"
+  ],
+  "no_index": {
+    "directory": [
+      ".github",
+      "assets",
+      "benchmarks",
+      "docker",
+      "monitoring",
+      "scripts",
+      "tests"
+    ]
+  }
+}

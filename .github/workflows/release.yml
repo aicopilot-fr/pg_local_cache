@@ -33,6 +33,7 @@ jobs:
       contents: read
       actions: read
     outputs:
+      release_ready: ${{ steps.meta.outputs.release_ready }}
       version: ${{ steps.meta.outputs.version }}
       stable_tag: ${{ steps.meta.outputs.stable_tag }}
       commit_tag: ${{ steps.meta.outputs.commit_tag }}
@@ -67,10 +68,28 @@ jobs:
           sha="$(git rev-parse HEAD)"
           [[ "$sha" == "$TARGET_SHA" ]]
           master_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/master" --jq .sha)"
-          [[ "$sha" == "$master_sha" ]] || {
-            echo "::error::Release candidate is no longer the tip of master"
-            exit 1
-          }
+          if [[ "$sha" != "$master_sha" ]]; then
+            echo "::notice::Skipping ${sha}; master advanced to ${master_sha}"
+            {
+              echo "release_ready=false"
+              echo "sha=${sha}"
+              echo "workflow_run_id=${TRIGGER_RUN_ID}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          plan="$(python3 scripts/auto_version.py --json)"
+          action="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["action"])' <<<"$plan")"
+          reason="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["reason"])' <<<"$plan")"
+          if [[ "$action" != "release" ]]; then
+            echo "::notice::No release from ${sha}: ${reason}"
+            {
+              echo "release_ready=false"
+              echo "sha=${sha}"
+              echo "workflow_run_id=${TRIGGER_RUN_ID}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           mapfile -t versions < <(
             sed -n \
@@ -89,18 +108,14 @@ jobs:
           test -f "sql/pg_local_cache--${version}.sql"
           grep -Fq 'pg_local_cache--' Dockerfile
           grep -Fq "pg_local_cache_version:${version}" src/pg_local_cache_worker.c
+          python3 scripts/validate_pgxn_meta.py
 
-          stable_sha=""
-          if resolved_stable_sha="$(
+          if stable_sha="$(
             gh api "repos/${GITHUB_REPOSITORY}/commits/${stable_tag}" \
               --jq .sha 2>/dev/null
           )"; then
-            stable_sha="$resolved_stable_sha"
-          fi
-          stable_publishable=true
-          if [[ -n "$stable_sha" && "$stable_sha" != "$sha" ]]; then
-            stable_publishable=false
-            echo "::notice::${stable_tag} already belongs to ${stable_sha}; publishing only ${commit_tag}"
+            echo "::error::${stable_tag} already points to ${stable_sha}; refusing version reuse"
+            exit 1
           fi
 
           workflow_run_id="$TRIGGER_RUN_ID"
@@ -124,17 +139,19 @@ jobs:
           }
 
           {
+            echo "release_ready=true"
             echo "version=${version}"
             echo "stable_tag=${stable_tag}"
             echo "commit_tag=${commit_tag}"
             echo "sha=${sha}"
             echo "short_sha=${short_sha}"
-            echo "stable_publishable=${stable_publishable}"
+            echo "stable_publishable=true"
             echo "workflow_run_id=${workflow_run_id}"
           } >> "$GITHUB_OUTPUT"
 
   binary:
     needs: metadata
+    if: needs.metadata.outputs.release_ready == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:

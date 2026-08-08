@@ -8,7 +8,14 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SQL = (ROOT / "sql" / "pg_local_cache--1.1.0.sql").read_text()
+CONTROL = (ROOT / "pg_local_cache.control").read_text(encoding="utf-8")
+CURRENT_VERSION_MATCH = re.search(
+    r"^default_version = '([^']+)'$", CONTROL, flags=re.MULTILINE
+)
+if CURRENT_VERSION_MATCH is None:
+    raise RuntimeError("could not determine pg_local_cache version")
+CURRENT_VERSION = CURRENT_VERSION_MATCH.group(1)
+SQL = (ROOT / "sql" / f"pg_local_cache--{CURRENT_VERSION}.sql").read_text()
 
 
 def sql_function(name: str) -> str:

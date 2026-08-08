@@ -16,4 +16,5 @@ docs/superpowers
 .supergoal
 .codegraph
 benchmark-results/
+dist/
 *.dSYM/
