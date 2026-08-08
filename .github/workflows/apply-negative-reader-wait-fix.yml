@@ -1,0 +1,57 @@
+name: Apply stable negative MVCC reader collection
+
+on:
+  pull_request:
+    branches: ["agent/fix-sql-negative-mvcc-base"]
+    paths:
+      - ".github/workflows/apply-negative-reader-wait-fix.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-negative-reader-wait-fix
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: github.repository == 'aicopilot-fr/pg_local_cache'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out target branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: agent/fix-sql-negative-mvcc
+          fetch-depth: 0
+
+      - name: Update reader collection, validate, and push
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('tests/sql_fastpath_integration.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''        assert reader is not None
+        reader_output, _ = reader.communicate(timeout=10)
+        assert reader.returncode == 0, reader_output
+'''
+          new = '''        assert reader is not None
+        assert reader.wait(timeout=10) == 0
+        reader_output = reader.stdout.read() if reader.stdout is not None else ""
+'''
+          if text.count(old) != 1:
+              raise SystemExit('could not locate reader communicate block')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+
+          git diff --check
+          make verify-static source-test source-sanitize benchmark-test
+          git config user.name "OpenAI Codex"
+          git config user.email "noreply@openai.com"
+          git add tests/sql_fastpath_integration.py
+          git diff --cached --check
+          git commit -m "test: collect blocked MVCC reader without communicate"
+          git push origin HEAD:agent/fix-sql-negative-mvcc
