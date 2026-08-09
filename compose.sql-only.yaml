@@ -8,7 +8,7 @@ services:
       args:
         POSTGRES_MAJOR: ${POSTGRES_MAJOR:-16}
         POSTGRES_VARIANT: ${POSTGRES_VARIANT:-bookworm}
-    image: pg_local_cache:1.2.0
+    image: pg_local_cache:1.2.1
     restart: unless-stopped
     stop_grace_period: 60s
     shm_size: 512mb

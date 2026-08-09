@@ -1114,7 +1114,7 @@ execute_command_inner(PgLocalCacheClient *client, PgLocalCacheRespArg *args, int
 		return raw_response(
 			"*14\r\n"
 			"$6\r\nserver\r\n$14\r\npg_local_cache\r\n"
-			"$7\r\nversion\r\n$5\r\n1.2.0\r\n"
+			"$7\r\nversion\r\n$5\r\n1.2.1\r\n"
 			"$5\r\nproto\r\n:2\r\n"
 			"$2\r\nid\r\n:0\r\n"
 			"$4\r\nmode\r\n$10\r\nstandalone\r\n"
@@ -1127,7 +1127,7 @@ execute_command_inner(PgLocalCacheClient *client, PgLocalCacheRespArg *args, int
 		const char *info =
 			"# Server\r\n"
 			"server:pg_local_cache\r\n"
-			"pg_local_cache_version:1.2.0\r\n"
+			"pg_local_cache_version:1.2.1\r\n"
 			"redis_mode:standalone\r\n";
 
 		if (argc != 1 && argc != 2)
