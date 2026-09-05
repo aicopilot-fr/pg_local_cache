@@ -18,3 +18,9 @@ docs/superpowers
 .supergoal
 .codegraph
 *.dSYM/
+examples/node-postgres/node_modules/
+/benchmark.json
+/benchmark.md
+/benchmark-artifact/
+
+/qa-artifacts/
